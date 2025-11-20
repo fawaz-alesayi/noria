@@ -740,6 +740,7 @@ impl From<Vec<DataType>> for TableOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Datelike, Timelike, Utc};
 
     #[test]
     fn mysql_value_to_datatype() {
@@ -793,8 +794,18 @@ mod tests {
         assert_approx_eq!(converted_float, initial_float as f64);
 
         // Test Value::Date.
-        let ts = NaiveDate::from_ymd(1111, 1, 11).and_hms_micro(2, 3, 4, 5);
-        let a = Value::from(ts.clone());
+        let ts = NaiveDate::from_ymd_opt(1111, 1, 11)
+            .and_then(|d| d.and_hms_micro_opt(2, 3, 4, 5))
+            .expect("valid datetime");
+        let a = Value::Date(
+            ts.year() as u16,
+            ts.month() as u8,
+            ts.day() as u8,
+            ts.hour() as u8,
+            ts.minute() as u8,
+            ts.second() as u8,
+            ts.and_utc().timestamp_subsec_micros(),
+        );
         let a_dt = DataType::try_from(a);
         assert!(a_dt.is_ok());
         assert_eq!(a_dt.unwrap(), DataType::Timestamp(ts));
@@ -882,11 +893,15 @@ mod tests {
         let tiny_text: DataType = "hi".into();
         let text: DataType = "I contain ' and \"".into();
         let real: DataType = (-0.05).into();
-        let timestamp = DataType::Timestamp(NaiveDateTime::from_timestamp(0, 42_000_000));
+        let timestamp = DataType::Timestamp(
+            chrono::DateTime::<Utc>::from_timestamp(0, 42_000_000)
+                .unwrap()
+                .naive_utc(),
+        );
         let int = DataType::Int(5);
         let big_int = DataType::BigInt(5);
         assert_eq!(format!("{:?}", tiny_text), "TinyText(\"hi\")");
-        assert_eq!(format!("{:?}", text), "Text(\"I contain \\' and \\\"\")");
+        assert_eq!(format!("{:?}", text), "Text(\"I contain ' and \\\"\")");
         assert_eq!(format!("{:?}", real), "Real(-0.050000000)");
         assert_eq!(
             format!("{:?}", timestamp),
@@ -901,7 +916,11 @@ mod tests {
         let tiny_text: DataType = "hi".into();
         let text: DataType = "this is a very long text indeed".into();
         let real: DataType = (-0.05).into();
-        let timestamp = DataType::Timestamp(NaiveDateTime::from_timestamp(0, 42_000_000));
+        let timestamp = DataType::Timestamp(
+            chrono::DateTime::<Utc>::from_timestamp(0, 42_000_000)
+                .unwrap()
+                .naive_utc(),
+        );
         let int = DataType::Int(5);
         let big_int = DataType::BigInt(5);
         assert_eq!(format!("{}", tiny_text), "\"hi\"");
@@ -924,8 +943,16 @@ mod tests {
         let text2: DataType = "this is another long text".into();
         let real: DataType = (-0.05).into();
         let real2: DataType = (-0.06).into();
-        let time = DataType::Timestamp(NaiveDateTime::from_timestamp(0, 42_000_000));
-        let time2 = DataType::Timestamp(NaiveDateTime::from_timestamp(1, 42_000_000));
+        let time = DataType::Timestamp(
+            chrono::DateTime::<Utc>::from_timestamp(0, 42_000_000)
+                .unwrap()
+                .naive_utc(),
+        );
+        let time2 = DataType::Timestamp(
+            chrono::DateTime::<Utc>::from_timestamp(1, 42_000_000)
+                .unwrap()
+                .naive_utc(),
+        );
         let shrt = DataType::Int(5);
         let shrt6 = DataType::Int(6);
         let long = DataType::BigInt(5);

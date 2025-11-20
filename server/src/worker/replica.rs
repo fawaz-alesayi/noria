@@ -5,7 +5,6 @@ use super::ChannelCoordinator;
 use crate::coordination::CoordinationPayload;
 use ahash::{AHashMap, AHashSet};
 use async_bincode::AsyncDestination;
-use async_timer::Oneshot;
 use bincode;
 use dataflow::{
     payload::SourceChannelIdentifier,
@@ -33,6 +32,7 @@ use std::{
     task::{Context, Poll},
 };
 use strawpoll::Strawpoll;
+use super::timer::RestartableTimer;
 use stream_cancel::Valve;
 use streamunordered::{StreamUnordered, StreamYield};
 use tokio::io::{AsyncReadExt, BufReader, BufStream, BufWriter};
@@ -94,7 +94,7 @@ pub(super) struct Replica {
     >,
 
     #[pin]
-    timeout: Strawpoll<async_timer::oneshot::Timer>,
+    timeout: Strawpoll<RestartableTimer>,
     timed_out: bool,
 
     out: Outboxes,
@@ -125,7 +125,7 @@ impl Replica {
             inputs: Default::default(),
             outputs: Default::default(),
             out: Outboxes::new(ctrl_tx),
-            timeout: Strawpoll::from(async_timer::oneshot::Timer::new(time::Duration::from_secs(
+            timeout: Strawpoll::from(RestartableTimer::new(time::Duration::from_secs(
                 3600,
             ))),
             refresh_sizes: tokio::time::interval(time::Duration::from_millis(500)),
