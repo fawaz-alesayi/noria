@@ -572,14 +572,17 @@ impl TryFrom<mysql_common::value::Value> for DataType {
             Value::Float(v) => Ok(v.into()),
             Value::Double(v) => Ok(v.into()),
             Value::Date(year, month, day, hour, minutes, seconds, micros) => {
-                Ok(DataType::Timestamp(
-                    NaiveDate::from_ymd(year.into(), month.into(), day.into()).and_hms_micro(
+                let date = NaiveDate::from_ymd_opt(year.into(), month.into(), day.into())
+                    .ok_or("Invalid date components")?;
+                let ts = date
+                    .and_hms_micro_opt(
                         hour.into(),
                         minutes.into(),
                         seconds.into(),
                         micros.into(),
-                    ),
-                ))
+                    )
+                    .ok_or("Invalid time components")?;
+                Ok(DataType::Timestamp(ts))
             }
             Value::Time(..) => Err("`mysql_common::value::Value::time` is not supported in Noria"),
         }
@@ -620,12 +623,10 @@ macro_rules! arithmetic_operation (
                 (a $op b).into()
             }
             (first, second) => panic!(
-                format!(
-                    "can't {} a {:?} and {:?}",
-                    stringify!($op),
-                    first,
-                    second,
-                )
+                "can't {} a {:?} and {:?}",
+                stringify!($op),
+                first,
+                second,
             ),
         }
     );

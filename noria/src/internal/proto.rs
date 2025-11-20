@@ -9,11 +9,11 @@ impl<T> LocalBypass<T> {
     }
 
     pub unsafe fn deref(&self) -> &T {
-        &*self.0
+        unsafe { &*self.0 }
     }
 
     pub unsafe fn take(self) -> Box<T> {
-        Box::from_raw(self.0)
+        unsafe { Box::from_raw(self.0) }
     }
 }
 
@@ -49,14 +49,14 @@ enum LocalOrNotInner<T> {
 impl<T> LocalOrNotInner<T> {
     pub unsafe fn deref(&self) -> &T {
         match self {
-            LocalOrNotInner::Local(ref l) => l.deref(),
-            LocalOrNotInner::Not(ref t) => t,
+            LocalOrNotInner::Local(l) => unsafe { l.deref() },
+            LocalOrNotInner::Not(t) => t,
         }
     }
 
     pub unsafe fn take(self) -> T {
         match self {
-            LocalOrNotInner::Local(l) => *l.take(),
+            LocalOrNotInner::Local(l) => *unsafe { l.take() },
             LocalOrNotInner::Not(t) => t,
         }
     }
@@ -114,12 +114,12 @@ impl<T> LocalOrNot<T> {
     #[doc(hidden)]
     #[allow(clippy::should_implement_trait)]
     pub unsafe fn deref(&self) -> &T {
-        self.0.deref()
+        unsafe { self.0.deref() }
     }
 
     #[doc(hidden)]
     pub unsafe fn take(self) -> T {
-        self.0.take()
+        unsafe { self.0.take() }
     }
 }
 
