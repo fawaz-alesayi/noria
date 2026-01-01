@@ -78,6 +78,23 @@ impl LocalExecutor {
         idx
     }
 
+    /// Get an existing base table node by name, if it exists.
+    pub fn get_base_table(&self, name: &str) -> Option<NodeIndex> {
+        self.base_tables.get(name).copied()
+    }
+
+    /// Get or create a base table node.
+    ///
+    /// If a base table with this name already exists, returns its index.
+    /// Otherwise, creates a new base table node.
+    pub fn get_or_add_base_table(&mut self, name: &str, columns: Vec<String>) -> NodeIndex {
+        if let Some(idx) = self.base_tables.get(name).copied() {
+            idx
+        } else {
+            self.add_base_table(name, columns)
+        }
+    }
+
     /// Add an operator node.
     pub fn add_operator(
         &mut self,

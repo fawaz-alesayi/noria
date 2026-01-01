@@ -738,6 +738,54 @@ mod tests {
     }
 
     #[test]
+    fn test_multiple_views_same_table() {
+        // Test that multiple views on the same table all update correctly
+        let conn = setup_test_db();
+        let engine = NoriaEngine::new(conn.clone());
+        engine.register_table("users").unwrap();
+
+        // Create two different filtered views on the same table
+        let view_age_30 = engine
+            .create_view("SELECT id, name FROM users WHERE age = 30")
+            .unwrap();
+
+        let view_age_25 = engine
+            .create_view("SELECT id, name FROM users WHERE age = 25")
+            .unwrap();
+
+        // Insert a user with age 30
+        {
+            let c = conn.write();
+            c.execute("INSERT INTO users VALUES (1, 'Alice', 30)", []).unwrap();
+        }
+        engine.apply_insert("users", 1);
+
+        // view_age_30 should have Alice, view_age_25 should be empty
+        let result_30 = engine.lookup(&view_age_30, &[DataType::Int(1)]);
+        assert!(result_30.is_some());
+        assert_eq!(result_30.unwrap().len(), 1);
+
+        let result_25 = engine.lookup(&view_age_25, &[DataType::Int(1)]);
+        assert!(result_25.is_none() || result_25.unwrap().is_empty());
+
+        // Insert a user with age 25
+        {
+            let c = conn.write();
+            c.execute("INSERT INTO users VALUES (2, 'Bob', 25)", []).unwrap();
+        }
+        engine.apply_insert("users", 2);
+
+        // Now both views should have their respective users
+        let result_30_after = engine.lookup(&view_age_30, &[DataType::Int(1)]);
+        assert!(result_30_after.is_some());
+        assert_eq!(result_30_after.unwrap()[0][1], DataType::from("Alice"));
+
+        let result_25_after = engine.lookup(&view_age_25, &[DataType::Int(2)]);
+        assert!(result_25_after.is_some());
+        assert_eq!(result_25_after.unwrap()[0][1], DataType::from("Bob"));
+    }
+
+    #[test]
     fn test_aggregate_incremental_update() {
         // Test that COUNT aggregate updates incrementally
         let conn = setup_test_db();

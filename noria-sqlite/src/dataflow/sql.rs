@@ -316,7 +316,9 @@ impl SqlConverter {
                     .get_schema(&table_name_str)
                     .ok_or_else(|| SqlError::TableNotFound(table_name_str.clone()))?;
 
-                let node = executor.add_base_table(&table_name_str, schema.columns.clone());
+                // Use get_or_add to reuse existing base table if it exists
+                // This ensures multiple views on the same table share the same base node
+                let node = executor.get_or_add_base_table(&table_name_str, schema.columns.clone());
 
                 // Use alias if present for column prefixing
                 let prefix = alias
