@@ -36,6 +36,7 @@
 //!    from SQLite, populates the cache, and returns the result.
 
 mod database;
+pub mod dataflow;
 mod error;
 mod statement;
 mod view_cache;
