@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
 	"noria",
+	"noria-sqlite",
 ]
 
 [profile.release]
