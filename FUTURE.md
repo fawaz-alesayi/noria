@@ -99,7 +99,177 @@ Therefore, `noria-sqlite` will use a **Bundled Strategy**:
 *   We will compile it during the build process (via `cc` crate in Rust) with specific flags: `-DSQLITE_ENABLE_SESSION`, `-DSQLITE_ENABLE_PREUPDATE_HOOK`.
 *   This ensures that every user, regardless of OS, has the exact capabilities required for the Ingestor to function. This mirrors the approach taken by robust libraries like `better-sqlite3`.
 
-8. Conclusion
+8. Implementation Status (January 2026)
+
+### 8.1 What Has Been Implemented
+
+1. **Session-Based CDC (Change Data Capture)**
+   - `SessionTracker` captures INSERT/UPDATE/DELETE operations with old values
+   - Changesets properly track both positive (insert) and negative (retraction) records
+   - Integration with rusqlite for SQLite Session Extension
+
+2. **Node.js Bindings (noria-sqlite-node)**
+   - Complete better-sqlite3 API compatibility via napi-rs
+   - 46 tests passing, matching better-sqlite3 behavior exactly
+   - JavaScript wrapper providing: Database, Statement, SqliteError, transaction(), pragma()
+
+3. **Core Database Layer (noria-sqlite)**
+   - Database and Statement abstractions
+   - Connection management with `Arc<RwLock<Connection>>`
+   - Basic dataflow infrastructure (operators, records, state)
+
+### 8.2 What Is NOT Yet Implemented (Critical Gaps)
+
+1. **Incremental Update Propagation** - The core Noria value proposition
+   - Changes are captured but NOT propagated through the dataflow graph
+   - Views are created but NOT incrementally maintained
+   - Cache becomes stale immediately after writes
+
+2. **Partial Materialization**
+   - Views are not partially materialized
+   - No upquery mechanism to fill cache misses from SQLite
+   - No eviction strategy
+
+3. **Dynamic View Synthesis**
+   - Prepared statements are not automatically converted to Noria views
+   - No "Cache-on-First-Sight" behavior
+
+### 8.3 Impact Assessment
+
+**Current Score: 4/10**
+
+The library currently provides:
+- A working better-sqlite3 drop-in replacement (good for adoption)
+- Session-based CDC infrastructure (foundation for Noria)
+- Basic dataflow primitives (operators, records)
+
+But it does NOT provide:
+- The actual performance benefits of Noria
+- Incremental view maintenance
+- O(1) lookups from materialized views
+
+**In essence**: The library "looks like Noria" but doesn't "work like Noria" yet.
+
+---
+
+9. Hybrid Storage Backend: Architecture Clarification
+
+### 9.1 The Design Decision
+
+Original Noria uses:
+- **evmap** (lock-free concurrent hashmap) for materialized view storage
+- **RocksDB** for base table persistence
+
+Our integration uses:
+- **evmap** for materialized view storage (same as Noria)
+- **SQLite** for base table persistence (replaces RocksDB)
+
+This is NOT redundant storage—it eliminates the need for RocksDB entirely.
+
+### 9.2 StateStore Trait Implementation
+
+The `StateStore` trait in Noria abstracts storage access. Our implementation:
+
+```rust
+impl StateStore for SqliteState {
+    // Base table reads go to SQLite
+    fn lookup(&self, key: &KeyType) -> LookupResult {
+        // SELECT * FROM table WHERE pk = ?
+        self.sqlite_conn.query(...)
+    }
+
+    // Base table writes are no-ops (SQLite already has the data)
+    fn process_records(&mut self, records: &mut Records) {
+        // No-op: SQLite is the source of truth
+    }
+}
+```
+
+### 9.3 Resource Contention Analysis
+
+**Question**: Does SQLite contention (single-writer) conflict with Noria's concurrent reads?
+
+**Answer**: No, for two reasons:
+
+1. **WAL Mode**: SQLite in WAL mode allows concurrent readers with a single writer. Readers don't block writers and vice versa.
+
+2. **Read-Heavy Workloads**: Noria is designed for read-heavy workloads. Most reads hit the evmap cache (O(1)), and only cache misses (upqueries) hit SQLite.
+
+### 9.4 Thread Safety
+
+Current implementation uses `Arc<RwLock<Connection>>`:
+- Multiple readers can query SQLite concurrently
+- Writers acquire exclusive lock briefly
+- This matches rusqlite's thread safety model
+
+---
+
+10. Eviction Strategy
+
+### 10.1 Noria's Approach: Random Eviction
+
+The original Noria paper uses **random eviction**—not LRU, not LFU. This is intentional:
+- Simple to implement with minimal overhead
+- Works well for partial materialization (evicted entries become "holes")
+- Upqueries refill holes on demand
+
+### 10.2 Implementation Plan
+
+**Phase 1**: Prove the core works without eviction
+- Implement incremental update propagation
+- Implement upquery mechanism
+- Validate correctness with tests
+
+**Phase 2**: Add eviction after core is validated
+- Implement random eviction
+- Add memory limit configuration
+- Test under memory pressure
+
+This phased approach ensures we don't debug eviction issues while the core dataflow is broken.
+
+---
+
+11. Configuration Parameters to Expose
+
+Once the core is working, users should be able to configure:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_memory_mb` | 100 | Maximum memory for cached views |
+| `consistency_window_ms` | 50 | Bypass cache for writes within this window |
+| `enable_noria` | true | Toggle acceleration on/off |
+| `fallback_on_error` | true | Fall back to SQLite on Noria errors |
+
+---
+
+12. Introspection API
+
+For debugging and monitoring, expose:
+
+```javascript
+const stats = db.noriaStats();
+// Returns:
+// {
+//   views: 5,                    // Number of materialized views
+//   cacheHits: 1000,            // Reads served from cache
+//   cacheMisses: 50,            // Upqueries triggered
+//   memoryUsedMb: 45,           // Current memory usage
+//   pendingPropagation: 0,      // Changes waiting to propagate
+//   avgPropagationMs: 2.3       // Average propagation latency
+// }
+```
+
+---
+
+13. Conclusion
 
 The integration of Noria with SQLite transforms the latter from a passive storage engine into an active, reactive query processor. By engineering an Embedded Ingestor based on the SQLite Session extension, a Hybrid Storage Backend that eliminates data duplication, and a Drop-in Driver Adapter, we can achieve the holy grail of web data infrastructure: the convenience of a SQL database with the performance of a hand-tuned in-memory cache.
+
 The user's assumption regarding views is technically correct but practically solvable via Dynamic View Synthesis. By leveraging the stable nature of Prepared Statements generated by ORMs, we can automate the graph construction, making the acceleration transparent and "zero-config."
+
+**Next Steps** (in priority order):
+1. Implement incremental update propagation through dataflow operators
+2. Implement upquery mechanism for cache misses
+3. Wire CDC changesets to dataflow graph injection
+4. Add random eviction with memory limits
+5. Implement dynamic view synthesis for prepared statements
