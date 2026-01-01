@@ -153,6 +153,13 @@ impl<'conn> SessionTracker<'conn> {
                         old_row.push(old_val);
                         new_row.push(new_val);
                     }
+                    // For unchanged columns (None in new_row), copy from old_row
+                    // This ensures we have complete row data for dataflow processing
+                    for i in 0..num_cols {
+                        if new_row[i] == DataType::None && old_row[i] != DataType::None {
+                            new_row[i] = old_row[i].clone();
+                        }
+                    }
                     events.push(CdcEvent::Update {
                         table,
                         old_row,

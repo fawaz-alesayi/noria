@@ -186,15 +186,38 @@ impl SqlConverter {
             }
         }
 
+        // Extract key columns from WHERE clause BEFORE projection
+        // so we can ensure they're included in the output
+        let pre_projection_key_columns = self.extract_key_columns(
+            where_clause.as_ref().map(|b| b.as_ref()),
+            &current_columns,
+        );
+
         // Apply projection if columns are explicitly selected (not *)
         let needs_projection = !columns.iter().any(|c| matches!(c, ResultColumn::Star));
 
-        if needs_projection && group_by.is_none() {
-            if let Some((emit_indices, new_columns)) =
+        let key_columns = if needs_projection && group_by.is_none() {
+            if let Some((mut emit_indices, mut new_columns)) =
                 self.get_projection(columns, &current_columns)?
             {
+                // Ensure key columns are included in the projection
+                // Track where each original key column ends up in the new projection
+                let mut final_key_columns = Vec::new();
+                for &key_idx in &pre_projection_key_columns {
+                    // Check if this key column is already in the projection
+                    if let Some(pos) = emit_indices.iter().position(|&i| i == key_idx) {
+                        final_key_columns.push(pos);
+                    } else {
+                        // Key column not in projection - add it
+                        let new_pos = emit_indices.len();
+                        emit_indices.push(key_idx);
+                        new_columns.push(current_columns[key_idx].clone());
+                        final_key_columns.push(new_pos);
+                    }
+                }
+
                 if emit_indices != (0..current_columns.len()).collect::<Vec<_>>() {
-                    let project_op = ProjectOp::new(emit_indices, vec![0]);
+                    let project_op = ProjectOp::new(emit_indices, final_key_columns.clone());
 
                     current_node = executor.add_operator(
                         &format!("{}_project", primary_table),
@@ -204,14 +227,16 @@ impl SqlConverter {
                     );
                     current_columns = new_columns;
                 }
+
+                final_key_columns
+            } else {
+                pre_projection_key_columns
             }
-        }
+        } else {
+            pre_projection_key_columns
+        };
 
         // Materialize the final node
-        let key_columns = self.extract_key_columns(
-            where_clause.as_ref().map(|b| b.as_ref()),
-            &current_columns,
-        );
         let view = executor.materialize(current_node, key_columns);
 
         Ok(view)

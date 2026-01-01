@@ -146,12 +146,26 @@ impl State for MemoryState {
                 self.row_count += 1;
             } else {
                 if let Some(rows) = self.data.get_mut(&key) {
+                    // Try exact match first
                     if let Some(pos) = rows.iter().position(|r| r == &row) {
                         rows.remove(pos);
                         self.row_count -= 1;
-                        if rows.is_empty() {
-                            self.data.remove(&key);
+                    } else {
+                        // For UPDATE events, the session extension may provide partial rows
+                        // with None values for unchanged columns. Try matching with None wildcards.
+                        let pos = rows.iter().position(|r| {
+                            r.len() == row.len() && r.iter().zip(row.iter()).all(|(stored, new)| {
+                                // Match if: values equal, OR the new value is None (wildcard)
+                                stored == new || *new == DataType::None
+                            })
+                        });
+                        if let Some(pos) = pos {
+                            rows.remove(pos);
+                            self.row_count -= 1;
                         }
+                    }
+                    if rows.is_empty() {
+                        self.data.remove(&key);
                     }
                 }
             }

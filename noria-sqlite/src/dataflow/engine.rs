@@ -234,7 +234,15 @@ impl NoriaEngine {
                 row_data.push(val);
             }
             result.push(row_data.clone());
-            records_to_inject.push(Record::Positive(row_data));
+
+            // For cache injection, we need to append the key columns to match
+            // the projected output format (which includes key columns at the end)
+            // The view was projected to include key columns for proper cache lookups
+            let mut row_for_cache = row_data;
+            for key_val in key {
+                row_for_cache.push(key_val.clone());
+            }
+            records_to_inject.push(Record::Positive(row_for_cache));
         }
 
         // Drop the query to release the connection read lock
@@ -599,12 +607,14 @@ mod tests {
         engine.register_table("users").unwrap();
 
         // Create a filtered view on age = 30
+        // The key column is extracted from WHERE clause (age)
         let view = engine
             .create_view("SELECT id, name FROM users WHERE age = 30")
             .unwrap();
 
         // Before insert, view should be empty or missing
-        let result_before = engine.lookup(&view, &[DataType::Int(1)]);
+        // Key is age (=30), not id
+        let result_before = engine.lookup(&view, &[DataType::BigInt(30)]);
         assert!(result_before.is_none() || result_before.as_ref().map(|r| r.is_empty()).unwrap_or(true),
             "View should be empty before insert");
 
@@ -616,8 +626,8 @@ mod tests {
         };
         engine.apply_insert("users", rowid);
 
-        // Lookup by the key column (id)
-        let result = engine.lookup(&view, &[DataType::Int(1)]);
+        // Lookup by the key column (age from WHERE clause)
+        let result = engine.lookup(&view, &[DataType::BigInt(30)]);
         assert!(result.is_some(), "View should have results after insert");
         let rows = result.unwrap();
         assert_eq!(rows.len(), 1);
@@ -761,11 +771,12 @@ mod tests {
         engine.apply_insert("users", 1);
 
         // view_age_30 should have Alice, view_age_25 should be empty
-        let result_30 = engine.lookup(&view_age_30, &[DataType::Int(1)]);
+        // Lookup is by the key column from WHERE clause (age), not id
+        let result_30 = engine.lookup(&view_age_30, &[DataType::BigInt(30)]);
         assert!(result_30.is_some());
         assert_eq!(result_30.unwrap().len(), 1);
 
-        let result_25 = engine.lookup(&view_age_25, &[DataType::Int(1)]);
+        let result_25 = engine.lookup(&view_age_25, &[DataType::BigInt(25)]);
         assert!(result_25.is_none() || result_25.unwrap().is_empty());
 
         // Insert a user with age 25
@@ -776,11 +787,11 @@ mod tests {
         engine.apply_insert("users", 2);
 
         // Now both views should have their respective users
-        let result_30_after = engine.lookup(&view_age_30, &[DataType::Int(1)]);
+        let result_30_after = engine.lookup(&view_age_30, &[DataType::BigInt(30)]);
         assert!(result_30_after.is_some());
         assert_eq!(result_30_after.unwrap()[0][1], DataType::from("Alice"));
 
-        let result_25_after = engine.lookup(&view_age_25, &[DataType::Int(2)]);
+        let result_25_after = engine.lookup(&view_age_25, &[DataType::BigInt(25)]);
         assert!(result_25_after.is_some());
         assert_eq!(result_25_after.unwrap()[0][1], DataType::from("Bob"));
     }
