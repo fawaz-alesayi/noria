@@ -1,11 +1,11 @@
 //! Background worker for dataflow processing and CDC
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::view_cache::{ViewCache, ViewHandle};
 use crate::Config;
 use parking_lot::RwLock;
 use rusqlite::Connection;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,9 +15,11 @@ use std::time::Instant;
 /// - View synthesis
 pub struct Worker {
     /// Reference to the SQLite connection
+    #[allow(dead_code)]
     conn: Arc<RwLock<Connection>>,
 
     /// Reference to the view cache
+    #[allow(dead_code)]
     view_cache: Arc<ViewCache>,
 
     /// Track recently modified tables for consistency guard
@@ -28,6 +30,7 @@ pub struct Worker {
 }
 
 /// Metadata about a synthesized view
+#[derive(Clone)]
 struct ViewMetadata {
     /// Tables this view depends on
     tables: Vec<String>,
@@ -35,7 +38,11 @@ struct ViewMetadata {
     /// Columns used as the lookup key
     key_columns: Vec<usize>,
 
+    /// Column names in the result
+    result_columns: Vec<String>,
+
     /// The SQL used to create this view
+    #[allow(dead_code)]
     sql: String,
 }
 
@@ -69,8 +76,12 @@ impl Worker {
             views.insert(normalized_sql.to_string(), metadata.clone());
         }
 
-        // Create the view handle
-        let handle = ViewHandle::new(metadata.tables, metadata.key_columns);
+        // Create the view handle with evmap backing
+        let handle = ViewHandle::new(
+            metadata.tables,
+            metadata.key_columns,
+            metadata.result_columns,
+        );
 
         // TODO: In full implementation:
         // 1. Convert SQL to Noria dataflow graph segment
@@ -86,10 +97,12 @@ impl Worker {
         // Simple parsing - in production this would use nom-sql
         let tables = self.extract_tables(sql)?;
         let key_columns = self.extract_key_columns(sql)?;
+        let result_columns = self.extract_result_columns(sql)?;
 
         Ok(ViewMetadata {
             tables,
             key_columns,
+            result_columns,
             sql: sql.to_string(),
         })
     }
@@ -154,6 +167,45 @@ impl Worker {
         Ok((0..param_count).collect())
     }
 
+    /// Extract result column names from SELECT clause.
+    fn extract_result_columns(&self, sql: &str) -> Result<Vec<String>> {
+        let upper = sql.to_uppercase();
+
+        // Find SELECT ... FROM portion
+        let select_pos = upper.find("SELECT").unwrap_or(0) + 6;
+        let from_pos = upper.find("FROM").unwrap_or(sql.len());
+
+        if select_pos >= from_pos {
+            return Ok(vec![]);
+        }
+
+        let select_clause = &sql[select_pos..from_pos];
+
+        // Parse column names (simplified - doesn't handle all cases)
+        let columns: Vec<String> = select_clause
+            .split(',')
+            .map(|col| {
+                let col = col.trim();
+                // Handle aliases (AS name)
+                if let Some(as_pos) = col.to_uppercase().find(" AS ") {
+                    col[as_pos + 4..].trim().to_string()
+                } else {
+                    // Get last part after any dots (table.column -> column)
+                    col.split('.')
+                        .last()
+                        .unwrap_or(col)
+                        .trim()
+                        .trim_matches('`')
+                        .trim_matches('"')
+                        .to_string()
+                }
+            })
+            .filter(|s| !s.is_empty() && s != "*")
+            .collect();
+
+        Ok(columns)
+    }
+
     /// Check if any of the given tables were recently modified.
     pub fn is_recently_modified(&self, tables: &[String], window_ms: u64) -> bool {
         let recent = self.recent_writes.read();
@@ -171,6 +223,7 @@ impl Worker {
     }
 
     /// Record a write to a table.
+    #[allow(dead_code)]
     pub fn record_write(&self, table: &str) {
         let mut recent = self.recent_writes.write();
         recent.insert(table.to_string(), Instant::now());
@@ -181,6 +234,7 @@ impl Worker {
     }
 
     /// Process a CDC changeset and update views.
+    #[allow(dead_code)]
     pub fn process_changeset(&self, _changeset: &[u8]) -> Result<()> {
         // TODO: Implement changeset parsing and propagation
         // 1. Parse the binary changeset from sqlite3session
@@ -188,15 +242,5 @@ impl Worker {
         // 3. Inject into the dataflow graph
         // 4. Let propagation update the evmap views
         Ok(())
-    }
-}
-
-impl Clone for ViewMetadata {
-    fn clone(&self) -> Self {
-        Self {
-            tables: self.tables.clone(),
-            key_columns: self.key_columns.clone(),
-            sql: self.sql.clone(),
-        }
     }
 }

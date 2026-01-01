@@ -1,7 +1,7 @@
 //! Prepared statement wrapper with automatic view acceleration
 
 use crate::error::{Error, Result};
-use crate::view_cache::{ViewCache, ViewHandle};
+use crate::view_cache::{CachedRow, ViewCache, ViewHandle};
 use crate::worker::Worker;
 use crate::Config;
 use parking_lot::RwLock;
@@ -14,6 +14,7 @@ pub struct Statement {
     sql: String,
 
     /// Normalized SQL (for cache key)
+    #[allow(dead_code)]
     normalized_sql: String,
 
     /// View handle if this query is cached
@@ -82,7 +83,7 @@ impl Statement {
 
         // Try cache first if we have a view
         if let Some(ref view_handle) = self.view_handle {
-            if let Some(row) = self.try_cache_lookup(view_handle, &params)? {
+            if let Some(row) = self.try_cache_lookup(view_handle, &params) {
                 self.view_cache.record_hit();
                 return row_to_result(row, f);
             }
@@ -104,7 +105,7 @@ impl Statement {
 
         // Try cache first if we have a view
         if let Some(ref view_handle) = self.view_handle {
-            if let Some(rows) = self.try_cache_lookup_multi(view_handle, &params)? {
+            if let Some(rows) = self.try_cache_lookup_multi(view_handle, &params) {
                 self.view_cache.record_hit();
                 return rows_to_results(rows, f);
             }
@@ -115,25 +116,27 @@ impl Statement {
         self.sqlite_query_map(&params, f)
     }
 
-    /// Attempt to read from the cache.
+    /// Attempt to read from the cache (single row).
     fn try_cache_lookup<T: rusqlite::ToSql>(
         &self,
         view_handle: &ViewHandle,
         params: &[T],
-    ) -> Result<Option<CachedRow>> {
+    ) -> Option<CachedRow> {
         // Check consistency guard - if we recently wrote to related tables,
         // bypass the cache to ensure read-your-writes
-        if self.config.enable_consistency_guard {
-            if self.worker.is_recently_modified(&view_handle.tables, self.config.consistency_window_ms) {
-                return Ok(None);
-            }
+        if self.config.enable_consistency_guard
+            && self
+                .worker
+                .is_recently_modified(&view_handle.tables, self.config.consistency_window_ms)
+        {
+            return None;
         }
 
         // Build the lookup key from parameters
         let key = params_to_key(params);
 
-        // Look up in evmap
-        view_handle.lookup(&key)
+        // Look up in evmap - returns first row if found
+        view_handle.lookup_one(&key)
     }
 
     /// Attempt multi-row cache lookup.
@@ -141,15 +144,17 @@ impl Statement {
         &self,
         view_handle: &ViewHandle,
         params: &[T],
-    ) -> Result<Option<Vec<CachedRow>>> {
-        if self.config.enable_consistency_guard {
-            if self.worker.is_recently_modified(&view_handle.tables, self.config.consistency_window_ms) {
-                return Ok(None);
-            }
+    ) -> Option<Vec<CachedRow>> {
+        if self.config.enable_consistency_guard
+            && self
+                .worker
+                .is_recently_modified(&view_handle.tables, self.config.consistency_window_ms)
+        {
+            return None;
         }
 
         let key = params_to_key(params);
-        view_handle.lookup_multi(&key)
+        view_handle.lookup(&key)
     }
 
     /// Execute query directly against SQLite.
@@ -189,12 +194,6 @@ impl Statement {
     pub fn sql(&self) -> &str {
         &self.sql
     }
-}
-
-/// Cached row data (placeholder - will use Noria's DataType)
-#[derive(Debug, Clone)]
-pub struct CachedRow {
-    pub values: Vec<noria::DataType>,
 }
 
 /// Normalize SQL for cache key generation.

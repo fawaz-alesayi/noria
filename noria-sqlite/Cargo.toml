@@ -22,7 +22,7 @@ rusqlite = { version = "0.32.1", features = ["session", "bundled"] }
 noria = { path = "../noria" }
 
 # Lock-free concurrent map for view storage
-evmap = "10.0"
+evmap = "11.0"
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
@@ -38,6 +38,9 @@ tracing = "0.1"
 
 # Parking lot for efficient synchronization primitives
 parking_lot = "0.12"
+
+# Date/time (same version as noria uses)
+chrono = "0.4"
 
 [dev-dependencies]
 # Testing utilities

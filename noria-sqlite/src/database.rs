@@ -1,6 +1,6 @@
 //! Database connection wrapper
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::statement::Statement;
 use crate::view_cache::ViewCache;
 use crate::worker::Worker;
