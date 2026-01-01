@@ -26,6 +26,9 @@ rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = "1.0"
 serde_json = "1.0"
 
+# Synchronization
+parking_lot = "0.12"
+
 [build-dependencies]
 napi-build = "2"
 
