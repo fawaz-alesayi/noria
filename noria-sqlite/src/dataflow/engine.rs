@@ -110,6 +110,24 @@ impl NoriaEngine {
 
     /// Create a materialized view for the given SELECT query.
     pub fn create_view(&self, sql: &str) -> SqlResult<NoriaView> {
+        // Auto-discover any tables referenced in the query
+        let tables = self.extract_tables(sql);
+        for table in &tables {
+            // Try to register the table if not already registered
+            let conn = self.conn.read();
+            let mut adapter = self.adapter.write();
+            if adapter.get_schema(table).is_none() {
+                if let Err(e) = adapter.discover_table(&conn, table) {
+                    tracing::debug!("Failed to discover table {}: {}", table, e);
+                }
+                // Also register with SQL converter
+                if let Some(schema) = adapter.get_schema(table) {
+                    let mut converter = self.sql_converter.write();
+                    converter.register_table(table, schema.columns.clone());
+                }
+            }
+        }
+
         let mut adapter = self.adapter.write();
         let converter = self.sql_converter.read();
 
@@ -303,6 +321,7 @@ impl NoriaEngine {
         let upper = sql.to_uppercase();
         let mut tables = Vec::new();
 
+        // Extract FROM table
         if let Some(from_pos) = upper.find("FROM") {
             let after_from = &sql[from_pos + 4..];
             if let Some(table) = after_from.split_whitespace().next() {
@@ -311,9 +330,33 @@ impl NoriaEngine {
                     .trim_matches('"')
                     .trim_matches(',')
                     .to_string();
-                if !clean.is_empty() {
+                if !clean.is_empty() && !clean.eq_ignore_ascii_case("(") {
                     tables.push(clean);
                 }
+            }
+        }
+
+        // Extract JOIN tables
+        for keyword in ["JOIN ", "INNER JOIN ", "LEFT JOIN ", "RIGHT JOIN ", "CROSS JOIN "] {
+            let mut search_pos = 0;
+            while let Some(pos) = upper[search_pos..].find(keyword) {
+                let abs_pos = search_pos + pos + keyword.len();
+                if abs_pos < sql.len() {
+                    let after_join = &sql[abs_pos..];
+                    if let Some(table) = after_join.split_whitespace().next() {
+                        let clean = table
+                            .trim_matches('`')
+                            .trim_matches('"')
+                            .to_string();
+                        if !clean.is_empty()
+                            && !clean.eq_ignore_ascii_case("ON")
+                            && !tables.iter().any(|t| t.eq_ignore_ascii_case(&clean))
+                        {
+                            tables.push(clean);
+                        }
+                    }
+                }
+                search_pos = abs_pos;
             }
         }
 

@@ -3,7 +3,6 @@
 //! This module provides the core caching infrastructure using evmap,
 //! a lock-free, eventually consistent concurrent map.
 
-use crate::database::CacheStats;
 use crate::error::Result;
 use crate::worker::Worker;
 use crate::Config;
@@ -13,6 +12,19 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Statistics about the evmap-based view cache.
+#[derive(Debug, Clone, Default)]
+pub struct ViewCacheStats {
+    /// Number of cache hits
+    pub hits: u64,
+    /// Number of cache misses
+    pub misses: u64,
+    /// Number of views currently cached
+    pub view_count: usize,
+    /// Approximate memory usage in bytes
+    pub memory_bytes: usize,
+}
 
 /// A cached row stored in evmap.
 ///
@@ -125,11 +137,11 @@ impl ViewCache {
     }
 
     /// Get cache statistics.
-    pub fn stats(&self) -> CacheStats {
+    pub fn stats(&self) -> ViewCacheStats {
         let views = self.views.read();
         let memory_bytes = views.values().map(|h| h.memory_estimate()).sum();
 
-        CacheStats {
+        ViewCacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             view_count: views.len(),

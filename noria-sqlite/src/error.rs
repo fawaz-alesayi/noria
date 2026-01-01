@@ -35,4 +35,8 @@ pub enum Error {
     /// Configuration error
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// Dataflow engine error
+    #[error("Dataflow error: {0}")]
+    Dataflow(String),
 }
