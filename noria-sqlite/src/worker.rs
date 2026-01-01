@@ -9,8 +9,60 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Thread-safe tracker for recently written tables.
+///
+/// This is separated from Worker to allow sharing with the update hook
+/// without requiring the full Worker to be Send+Sync.
+pub struct WriteTracker {
+    /// Map from table name to last write time
+    recent_writes: RwLock<HashMap<String, Instant>>,
+}
+
+impl WriteTracker {
+    /// Create a new write tracker.
+    pub fn new() -> Self {
+        Self {
+            recent_writes: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Record a write to a table.
+    ///
+    /// Called by the update hook when any INSERT/UPDATE/DELETE occurs.
+    pub fn record_write(&self, table: &str) {
+        let mut recent = self.recent_writes.write();
+        recent.insert(table.to_string(), Instant::now());
+
+        // Clean up old entries (older than 60 seconds)
+        let cutoff = Instant::now() - std::time::Duration::from_secs(60);
+        recent.retain(|_, &mut v| v > cutoff);
+    }
+
+    /// Check if any of the given tables were recently modified.
+    pub fn is_recently_modified(&self, tables: &[String], window_ms: u64) -> bool {
+        let recent = self.recent_writes.read();
+        let cutoff = Instant::now() - std::time::Duration::from_millis(window_ms);
+
+        for table in tables {
+            if let Some(&write_time) = recent.get(table) {
+                if write_time > cutoff {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
+impl Default for WriteTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Background worker that manages:
-/// - CDC observation via SQLite Session Extension
+/// - CDC observation via SQLite update hooks
 /// - Dataflow propagation
 /// - View synthesis
 pub struct Worker {
@@ -22,8 +74,8 @@ pub struct Worker {
     #[allow(dead_code)]
     view_cache: Arc<ViewCache>,
 
-    /// Track recently modified tables for consistency guard
-    recent_writes: RwLock<HashMap<String, Instant>>,
+    /// Shared write tracker (also used by update hook)
+    write_tracker: Arc<WriteTracker>,
 
     /// Synthesized views and their metadata
     views: RwLock<HashMap<String, ViewMetadata>>,
@@ -49,15 +101,23 @@ struct ViewMetadata {
 impl Worker {
     /// Create a new background worker.
     pub fn new(conn: Arc<RwLock<Connection>>, view_cache: Arc<ViewCache>) -> Result<Self> {
+        Self::new_with_tracker(conn, view_cache, Arc::new(WriteTracker::new()))
+    }
+
+    /// Create a new background worker with an existing write tracker.
+    ///
+    /// This is used when the write tracker is shared with an update hook.
+    pub fn new_with_tracker(
+        conn: Arc<RwLock<Connection>>,
+        view_cache: Arc<ViewCache>,
+        write_tracker: Arc<WriteTracker>,
+    ) -> Result<Self> {
         let worker = Self {
             conn,
             view_cache,
-            recent_writes: RwLock::new(HashMap::new()),
+            write_tracker,
             views: RwLock::new(HashMap::new()),
         };
-
-        // TODO: Initialize CDC session observer
-        // This requires FFI bindings to sqlite3session_create, etc.
 
         Ok(worker)
     }
@@ -207,30 +267,17 @@ impl Worker {
     }
 
     /// Check if any of the given tables were recently modified.
+    ///
+    /// Delegates to the shared WriteTracker.
     pub fn is_recently_modified(&self, tables: &[String], window_ms: u64) -> bool {
-        let recent = self.recent_writes.read();
-        let cutoff = Instant::now() - std::time::Duration::from_millis(window_ms);
-
-        for table in tables {
-            if let Some(&write_time) = recent.get(table) {
-                if write_time > cutoff {
-                    return true;
-                }
-            }
-        }
-
-        false
+        self.write_tracker.is_recently_modified(tables, window_ms)
     }
 
     /// Record a write to a table.
-    #[allow(dead_code)]
+    ///
+    /// Delegates to the shared WriteTracker.
     pub fn record_write(&self, table: &str) {
-        let mut recent = self.recent_writes.write();
-        recent.insert(table.to_string(), Instant::now());
-
-        // Clean up old entries
-        let cutoff = Instant::now() - std::time::Duration::from_secs(60);
-        recent.retain(|_, &mut v| v > cutoff);
+        self.write_tracker.record_write(table);
     }
 
     /// Process a CDC changeset and update views.

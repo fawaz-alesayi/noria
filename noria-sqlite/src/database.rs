@@ -3,9 +3,10 @@
 use crate::error::Result;
 use crate::statement::Statement;
 use crate::view_cache::ViewCache;
-use crate::worker::Worker;
+use crate::worker::{Worker, WriteTracker};
 use crate::Config;
 use parking_lot::RwLock;
+use rusqlite::hooks::Action;
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 use std::sync::Arc;
@@ -68,9 +69,33 @@ impl Database {
 
     /// Wrap an existing rusqlite connection.
     fn from_connection(conn: Connection, config: Config) -> Result<Self> {
-        let conn = Arc::new(RwLock::new(conn));
         let view_cache = Arc::new(ViewCache::new(config.max_cache_memory));
-        let worker = Arc::new(Worker::new(conn.clone(), view_cache.clone())?);
+
+        // Create a shared write tracker for CDC notifications
+        let write_tracker = Arc::new(WriteTracker::new());
+
+        // Set up update hook for CDC
+        // This hook is called synchronously for each INSERT/UPDATE/DELETE
+        let tracker_for_hook = write_tracker.clone();
+        conn.update_hook(Some(move |action: Action, _db: &str, table: &str, _rowid: i64| {
+            // Record the write for consistency guard
+            match action {
+                Action::SQLITE_INSERT | Action::SQLITE_UPDATE | Action::SQLITE_DELETE => {
+                    tracker_for_hook.record_write(table);
+                }
+                _ => {}
+            }
+        }));
+
+        // Now wrap the connection with the hook installed
+        let conn = Arc::new(RwLock::new(conn));
+
+        // Create worker with the shared write tracker
+        let worker = Arc::new(Worker::new_with_tracker(
+            conn.clone(),
+            view_cache.clone(),
+            write_tracker,
+        )?);
 
         Ok(Self {
             conn,
@@ -121,7 +146,7 @@ impl Database {
     pub fn execute<P: rusqlite::Params>(&self, sql: &str, params: P) -> Result<usize> {
         let conn = self.conn.write();
         let rows_changed = conn.execute(sql, params)?;
-        // CDC will capture the change automatically via session extension
+        // CDC hook automatically records the change
         Ok(rows_changed)
     }
 
