@@ -115,23 +115,40 @@ impl Database {
             ));
         }
 
+        // Validate SQL at prepare time by calling SQLite's prepare
+        // This matches better-sqlite3 behavior of catching syntax errors early
+        {
+            let conn = self.inner.connection().read();
+            conn.prepare(&sql)
+                .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+        }
+
         let stmt = self
             .inner
             .prepare(&sql)
             .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
 
-        // Determine if this is a reader (SELECT/PRAGMA) statement
+        // Determine statement type
         let sql_upper = sql.trim().to_uppercase();
         let is_reader = sql_upper.starts_with("SELECT")
             || sql_upper.starts_with("WITH")
             || sql_upper.starts_with("PRAGMA")
             || sql_upper.contains(" RETURNING ");
 
+        // Check if this is a DDL statement (returns 0 changes)
+        let is_ddl = sql_upper.starts_with("CREATE")
+            || sql_upper.starts_with("DROP")
+            || sql_upper.starts_with("ALTER")
+            || sql_upper.starts_with("VACUUM")
+            || sql_upper.starts_with("REINDEX")
+            || sql_upper.starts_with("ANALYZE");
+
         Ok(Statement {
             inner: Arc::new(Mutex::new(stmt)),
             db: self.inner.clone(),
             sql,
             is_reader,
+            is_ddl,
             pluck_mode: false,
             expand_mode: false,
             raw_mode: false,
@@ -180,6 +197,7 @@ pub struct Statement {
     db: Arc<NoriaDatabase>,
     sql: String,
     is_reader: bool,
+    is_ddl: bool,
     pluck_mode: bool,
     expand_mode: bool,
     raw_mode: bool,
@@ -304,9 +322,14 @@ impl Statement {
             conn.last_insert_rowid()
         };
 
+        // DDL statements (CREATE, DROP, ALTER, etc.) return 0 changes
+        // to match better-sqlite3 behavior
+        let final_changes = if self.is_ddl { 0 } else { changes as i64 };
+        let final_rowid = if self.is_ddl { 0 } else { last_rowid };
+
         Ok(RunResult {
-            changes: changes as i64,
-            last_insert_rowid: last_rowid,
+            changes: final_changes,
+            last_insert_rowid: final_rowid,
         })
     }
 

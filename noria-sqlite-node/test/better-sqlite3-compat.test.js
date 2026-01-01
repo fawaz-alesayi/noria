@@ -205,9 +205,7 @@ describe('Database#prepare()', function () {
 		expect(() => this.db.prepare(new String('CREATE TABLE entries (a TEXT, b INTEGER)'))).to.throw(TypeError);
 	});
 	it('should throw an exception if invalid SQL is provided', function () {
-		// Note: noria-sqlite validates at execution time, so we verify run() throws
-		const stmt = this.db.prepare('CREATE TABLE entries (a TEXT, b INTEGER');
-		expect(() => stmt.run()).to.throw(Database.SqliteError).with.property('code', 'SQLITE_ERROR');
+		expect(() => this.db.prepare('CREATE TABLE entries (a TEXT, b INTEGER')).to.throw(Database.SqliteError).with.property('code', 'SQLITE_ERROR');
 	});
 	it('should return a prepared Statement object', function () {
 		const stmt = this.db.prepare('CREATE TABLE entries (a TEXT, b INTEGER)');
@@ -273,10 +271,7 @@ describe('Statement#run()', function () {
 	});
 	it('should work with DROP TABLE', function () {
 		const stmt = this.db.init(true).prepare("DROP TABLE entries");
-		// Note: changes count may vary due to CDC tracking deleted rows
-		const info = stmt.run();
-		expect(info.changes).to.be.a('number');
-		expect(info.lastInsertRowid).to.be.a('number');
+		expect(stmt.run().changes).to.equal(0);
 	});
 	it('should accept positional bind parameters', function () {
 		this.db.prepare("CREATE TABLE entries (a TEXT, b INTEGER, c REAL)").run();
