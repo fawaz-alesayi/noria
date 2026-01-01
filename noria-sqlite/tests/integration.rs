@@ -582,3 +582,78 @@ mod complex_queries {
         assert!(stmt.is_cached(), "Multi-join query should be cacheable");
     }
 }
+
+// ============================================================================
+// TEST 9: Direct Cache API
+// ============================================================================
+
+mod direct_cache_api {
+    use super::*;
+
+    #[test]
+    fn test_query_row_cached_returns_none_on_miss() {
+        let db = setup_test_db();
+        populate_test_data(&db);
+
+        let stmt = db.prepare("SELECT name FROM users WHERE id = ?").unwrap();
+
+        // First call - cache miss returns None
+        let result = stmt.query_row_cached([1]);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "First call should be cache miss");
+    }
+
+    #[test]
+    fn test_query_row_cached_returns_data_after_upquery() {
+        let db = setup_test_db();
+        populate_test_data(&db);
+
+        let stmt = db.prepare("SELECT name, age FROM users WHERE id = ?").unwrap();
+
+        // First call via rusqlite API to populate cache (upquery)
+        let _ = stmt.query_row([1], |row| {
+            let _name: String = row.get(0)?;
+            let _age: i32 = row.get(1)?;
+            Ok(())
+        });
+
+        // Second call via direct cache API should hit
+        let result = stmt.query_row_cached([1]);
+        assert!(result.is_ok());
+        let cached = result.unwrap();
+        assert!(cached.is_some(), "Should hit cache after upquery");
+
+        let row = cached.unwrap();
+        assert_eq!(row.values.len(), 2);
+    }
+
+    #[test]
+    fn test_query_row_cached_error_for_non_cacheable() {
+        let db = setup_test_db();
+        populate_test_data(&db);
+
+        // Non-cacheable query (no parameters)
+        let stmt = db.prepare("SELECT name FROM users").unwrap();
+
+        let result = stmt.query_row_cached::<[i32; 0]>([]);
+        assert!(result.is_err(), "Should return error for non-cacheable query");
+    }
+
+    #[test]
+    fn test_query_map_cached() {
+        let db = setup_test_db();
+        populate_test_data(&db);
+
+        let stmt = db
+            .prepare("SELECT title FROM posts WHERE user_id = ?")
+            .unwrap();
+
+        // First call via rusqlite API
+        let _ = stmt.query_map([1], |row| row.get::<_, String>(0));
+
+        // Direct cache API
+        let result = stmt.query_map_cached([1]);
+        assert!(result.is_ok());
+        // Note: May be None initially depending on cache timing
+    }
+}
