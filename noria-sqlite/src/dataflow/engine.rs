@@ -213,6 +213,7 @@ impl NoriaEngine {
         let column_count = stmt.column_count();
         let mut rows = stmt.raw_query();
         let mut result = Vec::new();
+        let mut records_to_inject = Vec::new();
 
         while let Some(row) = rows.next()? {
             let mut row_data = Vec::with_capacity(column_count);
@@ -233,14 +234,19 @@ impl NoriaEngine {
                 row_data.push(val);
             }
             result.push(row_data.clone());
+            records_to_inject.push(Record::Positive(row_data));
+        }
 
-            // Also populate the cache
+        // Drop the query to release the connection read lock
+        drop(rows);
+        drop(stmt);
+        drop(conn);
+
+        // Populate the cache by injecting records directly into the view's state
+        if !records_to_inject.is_empty() {
             let mut adapter = self.adapter.write();
-            let records = Records::from(vec![Record::Positive(row_data)]);
-            // We need to get the base table and feed into it
-            // For now, we'll inject directly at the view level
-            // This is a simplification - proper upquery would feed through dataflow
-            drop(adapter);
+            let records = Records::from(records_to_inject);
+            adapter.executor_mut().inject_into_view(&view.handle, records);
         }
 
         Ok(result)
@@ -519,6 +525,41 @@ mod tests {
 
         assert!(!result.is_empty());
         assert_eq!(result[0][1], DataType::from("Alice"));
+    }
+
+    #[test]
+    fn test_upquery_populates_cache() {
+        let conn = setup_test_db();
+
+        // Insert data before creating engine
+        {
+            let c = conn.write();
+            c.execute("INSERT INTO users VALUES (1, 'Alice', 30)", []).unwrap();
+            c.execute("INSERT INTO users VALUES (2, 'Bob', 25)", []).unwrap();
+        }
+
+        let engine = NoriaEngine::new(conn.clone());
+        engine.register_table("users").unwrap();
+
+        // Create view (don't load table - simulates empty cache)
+        let view = engine
+            .create_view("SELECT id, name FROM users WHERE id = ?")
+            .unwrap();
+
+        // First lookup: cache miss, should trigger upquery
+        let result1 = engine.lookup_or_upquery(&view, &[DataType::Int(1)]).unwrap();
+        assert_eq!(result1.len(), 1);
+        assert_eq!(result1[0][1], DataType::from("Alice"));
+
+        // Second lookup: should hit cache (use lookup instead of lookup_or_upquery)
+        // If cache was populated, lookup should return Some
+        let result2 = engine.lookup(&view, &[DataType::Int(1)]);
+        assert!(result2.is_some(), "Cache should be populated after upquery");
+        assert_eq!(result2.unwrap().len(), 1);
+
+        // Key 2 was never queried, so cache should miss
+        let result3 = engine.lookup(&view, &[DataType::Int(2)]);
+        assert!(result3.is_none(), "Unqueried key should not be in cache");
     }
 
     #[test]

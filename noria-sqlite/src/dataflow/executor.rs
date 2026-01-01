@@ -142,6 +142,17 @@ impl LocalExecutor {
         self.propagate(base_node, records);
     }
 
+    /// Inject records directly into a view's state.
+    ///
+    /// Used for upquery results - bypasses the dataflow graph and directly
+    /// populates the view's materialized state. Only valid for simple views
+    /// where the upquery result matches the view's output format.
+    pub fn inject_into_view(&mut self, view: &ViewHandle, mut records: Records) {
+        if let Some(ref mut state) = self.nodes[view.node].state {
+            state.process_records(&mut records);
+        }
+    }
+
     /// Propagate records from a node to its children.
     fn propagate(&mut self, from: NodeIndex, records: Records) {
         if records.is_empty() {
