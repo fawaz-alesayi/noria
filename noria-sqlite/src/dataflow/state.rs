@@ -39,6 +39,10 @@ pub trait State: Send {
 
     /// Clear all state.
     fn clear(&mut self);
+
+    /// Create a read-only snapshot of this state.
+    /// Used for join lookups where we need to avoid borrow conflicts.
+    fn snapshot(&self) -> Box<dyn State>;
 }
 
 /// In-memory state with hash-based indexing.
@@ -51,6 +55,53 @@ pub struct MemoryState {
     row_count: usize,
 }
 
+/// A read-only snapshot of state data, used for join lookups.
+/// This owns its data so it can be passed across borrow boundaries.
+pub struct StateSnapshot {
+    data: HashMap<Vec<DataType>, Vec<Vec<DataType>>>,
+}
+
+impl StateSnapshot {
+    /// Create an empty snapshot.
+    pub fn empty() -> Self {
+        Self {
+            data: HashMap::new(),
+        }
+    }
+}
+
+impl State for StateSnapshot {
+    fn add_key(&mut self, _columns: Vec<usize>) {
+        // No-op for snapshots
+    }
+
+    fn process_records(&mut self, _records: &mut Records) {
+        // Snapshots are read-only
+    }
+
+    fn lookup(&self, key: &[DataType]) -> LookupResult {
+        match self.data.get(key) {
+            Some(rows) if rows.is_empty() => LookupResult::Empty,
+            Some(rows) => LookupResult::Some(rows.iter().map(|r| r.as_slice()).collect()),
+            None => LookupResult::Missing,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.data.values().map(|v| v.len()).sum()
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+    }
+
+    fn snapshot(&self) -> Box<dyn State> {
+        Box::new(StateSnapshot {
+            data: self.data.clone(),
+        })
+    }
+}
+
 impl MemoryState {
     /// Create a new MemoryState with the given key columns.
     pub fn new(key_columns: Vec<usize>) -> Self {
@@ -58,6 +109,13 @@ impl MemoryState {
             key_columns,
             data: HashMap::new(),
             row_count: 0,
+        }
+    }
+
+    /// Create a read-only snapshot of this state.
+    pub fn snapshot(&self) -> StateSnapshot {
+        StateSnapshot {
+            data: self.data.clone(),
         }
     }
 
@@ -115,6 +173,12 @@ impl State for MemoryState {
     fn clear(&mut self) {
         self.data.clear();
         self.row_count = 0;
+    }
+
+    fn snapshot(&self) -> Box<dyn State> {
+        Box::new(StateSnapshot {
+            data: self.data.clone(),
+        })
     }
 }
 

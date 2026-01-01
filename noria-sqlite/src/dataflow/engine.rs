@@ -549,4 +549,207 @@ mod tests {
         // Should have base table + filter node
         assert!(stats.node_count >= 2);
     }
+
+    #[test]
+    fn test_incremental_insert_propagation() {
+        // Test that INSERT propagates to filtered view
+        let conn = setup_test_db();
+        let engine = NoriaEngine::new(conn.clone());
+        engine.register_table("users").unwrap();
+
+        // Create a filtered view on age = 30
+        let view = engine
+            .create_view("SELECT id, name FROM users WHERE age = 30")
+            .unwrap();
+
+        // Before insert, view should be empty or missing
+        let result_before = engine.lookup(&view, &[DataType::Int(1)]);
+        assert!(result_before.is_none() || result_before.as_ref().map(|r| r.is_empty()).unwrap_or(true),
+            "View should be empty before insert");
+
+        // Insert via SQLite and propagate through dataflow
+        let rowid = {
+            let c = conn.write();
+            c.execute("INSERT INTO users VALUES (1, 'Alice', 30)", []).unwrap();
+            c.last_insert_rowid()
+        };
+        engine.apply_insert("users", rowid);
+
+        // Lookup by the key column (id)
+        let result = engine.lookup(&view, &[DataType::Int(1)]);
+        assert!(result.is_some(), "View should have results after insert");
+        let rows = result.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], DataType::BigInt(1)); // id
+        assert_eq!(rows[0][1], DataType::from("Alice")); // name
+    }
+
+    #[test]
+    fn test_incremental_insert_filter_rejects() {
+        // Test that INSERT to non-matching filter does NOT propagate
+        let conn = setup_test_db();
+        let engine = NoriaEngine::new(conn.clone());
+        engine.register_table("users").unwrap();
+
+        // Create a filtered view on age = 30
+        let _view = engine
+            .create_view("SELECT id, name FROM users WHERE age = 30")
+            .unwrap();
+
+        // Insert a user with age = 25 (doesn't match filter)
+        let rowid = {
+            let c = conn.write();
+            c.execute("INSERT INTO users VALUES (1, 'Bob', 25)", []).unwrap();
+            c.last_insert_rowid()
+        };
+        engine.apply_insert("users", rowid);
+
+        // View should NOT have this row
+        let stats = engine.stats();
+        // The view should have 0 rows (only the non-matching row was inserted)
+        assert!(stats.total_rows <= 1, "Filtered-out row should not be in view, got {} rows", stats.total_rows);
+    }
+
+    #[test]
+    fn test_incremental_update_propagation() {
+        // Test that UPDATE triggers retraction + insertion
+        let conn = setup_test_db();
+        let engine = NoriaEngine::new(conn.clone());
+        engine.register_table("users").unwrap();
+
+        // Create a simple view
+        let view = engine
+            .create_view("SELECT id, name FROM users WHERE id = ?")
+            .unwrap();
+
+        // Insert initial data
+        let rowid = {
+            let c = conn.write();
+            c.execute("INSERT INTO users VALUES (1, 'Alice', 30)", []).unwrap();
+            c.last_insert_rowid()
+        };
+        engine.apply_insert("users", rowid);
+
+        // Verify initial data
+        let result = engine.lookup(&view, &[DataType::Int(1)]);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()[0][1], DataType::from("Alice"));
+
+        // Update the name: Alice -> Alicia
+        // This requires old and new values
+        let old_row = vec![
+            DataType::BigInt(1),
+            DataType::from("Alice"),
+            DataType::BigInt(30),
+        ];
+        let new_row = vec![
+            DataType::BigInt(1),
+            DataType::from("Alicia"),
+            DataType::BigInt(30),
+        ];
+        engine.apply_update_rows("users", old_row, new_row);
+
+        // Verify the update propagated
+        let result_after = engine.lookup(&view, &[DataType::Int(1)]);
+        assert!(result_after.is_some());
+        let rows = result_after.unwrap();
+        assert_eq!(rows.len(), 1, "Should still have exactly 1 row");
+        assert_eq!(rows[0][1], DataType::from("Alicia"), "Name should be updated");
+    }
+
+    #[test]
+    fn test_incremental_delete_propagation() {
+        // Test that DELETE removes row from view
+        let conn = setup_test_db();
+        let engine = NoriaEngine::new(conn.clone());
+        engine.register_table("users").unwrap();
+
+        // Create a simple view
+        let view = engine
+            .create_view("SELECT id, name FROM users WHERE id = ?")
+            .unwrap();
+
+        // Insert data
+        let rowid = {
+            let c = conn.write();
+            c.execute("INSERT INTO users VALUES (1, 'Alice', 30)", []).unwrap();
+            c.last_insert_rowid()
+        };
+        engine.apply_insert("users", rowid);
+
+        // Verify row exists
+        let result = engine.lookup(&view, &[DataType::Int(1)]);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 1);
+
+        // Delete the row
+        let deleted_row = vec![
+            DataType::BigInt(1),
+            DataType::from("Alice"),
+            DataType::BigInt(30),
+        ];
+        engine.apply_delete("users", deleted_row);
+
+        // Verify row is gone
+        let result_after = engine.lookup(&view, &[DataType::Int(1)]);
+        assert!(result_after.is_none() || result_after.unwrap().is_empty(),
+            "Row should be deleted from view");
+    }
+
+    #[test]
+    fn test_aggregate_incremental_update() {
+        // Test that COUNT aggregate updates incrementally
+        let conn = setup_test_db();
+        let engine = NoriaEngine::new(conn.clone());
+        engine.register_table("users").unwrap();
+
+        // Create aggregate view: COUNT users by age
+        let view = engine
+            .create_view("SELECT age, COUNT(*) FROM users GROUP BY age")
+            .unwrap();
+
+        // Insert first user with age 30
+        {
+            let c = conn.write();
+            c.execute("INSERT INTO users VALUES (1, 'Alice', 30)", []).unwrap();
+        }
+        engine.apply_insert("users", 1);
+
+        // Check count for age 30 = 1
+        let result = engine.lookup(&view, &[DataType::BigInt(30)]);
+        assert!(result.is_some(), "Should have result for age 30");
+        let rows = result.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], DataType::BigInt(1), "Count should be 1");
+
+        // Insert second user with age 30
+        {
+            let c = conn.write();
+            c.execute("INSERT INTO users VALUES (2, 'Bob', 30)", []).unwrap();
+        }
+        engine.apply_insert("users", 2);
+
+        // Check count for age 30 = 2 (incremental update!)
+        let result2 = engine.lookup(&view, &[DataType::BigInt(30)]);
+        assert!(result2.is_some());
+        let rows2 = result2.unwrap();
+        assert_eq!(rows2.len(), 1);
+        assert_eq!(rows2[0][1], DataType::BigInt(2), "Count should be 2 after second insert");
+
+        // Insert user with different age
+        {
+            let c = conn.write();
+            c.execute("INSERT INTO users VALUES (3, 'Charlie', 25)", []).unwrap();
+        }
+        engine.apply_insert("users", 3);
+
+        // Age 30 count should still be 2
+        let result3 = engine.lookup(&view, &[DataType::BigInt(30)]);
+        assert_eq!(result3.unwrap()[0][1], DataType::BigInt(2));
+
+        // Age 25 count should be 1
+        let result_25 = engine.lookup(&view, &[DataType::BigInt(25)]);
+        assert!(result_25.is_some());
+        assert_eq!(result_25.unwrap()[0][1], DataType::BigInt(1));
+    }
 }

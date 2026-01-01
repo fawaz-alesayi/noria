@@ -166,28 +166,31 @@ impl LocalExecutor {
                 .position(|&p| p == from)
                 .unwrap_or(0);
 
-            // For joins, we need to look up the other parent's state
-            // Get the other parent index first (if any)
-            let other_parent_idx = if self.nodes[child].parents.len() > 1 {
-                Some(self.nodes[child].parents[1 - parent_idx])
+            // Determine what state to pass to the operator:
+            // - For joins (2 parents): pass the OTHER parent's state for lookups
+            // - For aggregates and others (1 parent): pass the child's OWN state for reading current values
+            let state_for_op: Option<Box<dyn State>> = if self.nodes[child].parents.len() > 1 {
+                // Join: need the other parent's state
+                let other_parent_idx = self.nodes[child].parents[1 - parent_idx];
+                self.nodes[other_parent_idx]
+                    .state
+                    .as_ref()
+                    .map(|s| s.snapshot())
             } else {
-                None
+                // Single parent: operators like Aggregate need their own state
+                // to look up the current value for computing retractions
+                self.nodes[child]
+                    .state
+                    .as_ref()
+                    .map(|s| s.snapshot())
             };
 
             // Process through the operator
-            // We need to be careful about borrows here
             let output = if self.nodes[child].operator.is_some() {
-                // For joins, we need state from the other parent
-                // Since we can't hold mutable and immutable borrows simultaneously,
-                // we'll pass None for now and handle joins specially later
-                // TODO: Implement proper join state lookup
                 let node = &mut self.nodes[child];
                 let op = node.operator.as_mut().unwrap();
 
-                // For non-join operators, pass None as state
-                // Joins will need special handling
-                let _ = other_parent_idx; // silence warning for now
-                op.process(parent_idx, records.clone(), None)
+                op.process(parent_idx, records.clone(), state_for_op.as_deref())
             } else {
                 ProcessingResult { results: records.clone(), lookups_needed: vec![] }
             };
@@ -256,7 +259,7 @@ pub struct ExecutorStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::ops::{FilterOp, FilterCondition, ProjectOp, AggregateOp, AggregateFunc};
+    use super::super::ops::{FilterOp, FilterCondition, ProjectOp, AggregateOp, AggregateFunc, JoinOp, JoinType};
 
     #[test]
     fn test_simple_base_table() {
@@ -413,5 +416,110 @@ mod tests {
         assert_eq!(stats.node_count, 1);
         assert_eq!(stats.materialized_nodes, 1);
         assert_eq!(stats.total_rows, 2);
+    }
+
+    #[test]
+    fn test_join_two_tables() {
+        let mut executor = LocalExecutor::new();
+
+        // Base tables: users(id, name) and posts(id, user_id, title)
+        let users = executor.add_base_table("users", vec!["id".into(), "name".into()]);
+        let posts = executor.add_base_table("posts", vec!["id".into(), "user_id".into(), "title".into()]);
+
+        // Materialize base tables (required for join lookups)
+        let _ = executor.materialize(users, vec![0]); // users keyed by id
+        let _ = executor.materialize(posts, vec![1]); // posts keyed by user_id
+
+        // Join: users.id = posts.user_id
+        // Output: user_id, user_name, post_title
+        let join = executor.add_operator(
+            "user_posts",
+            OperatorType::Join(JoinOp::new(
+                JoinType::Inner,
+                0,  // left key: users.id
+                1,  // right key: posts.user_id
+                vec![
+                    (true, 0),   // users.id
+                    (true, 1),   // users.name
+                    (false, 2),  // posts.title
+                ],
+                vec![0],  // key columns in output
+                2,  // left_cols
+                3,  // right_cols
+            )),
+            vec![users, posts],
+            vec!["user_id".into(), "user_name".into(), "post_title".into()],
+        );
+
+        let view = executor.materialize(join, vec![0]);
+
+        // First, insert a user
+        let user_records: Records = vec![
+            vec![DataType::Int(1), DataType::from("Alice")],
+        ].into();
+        executor.apply_write("users", user_records);
+
+        // Then insert a post by that user
+        let post_records: Records = vec![
+            vec![DataType::Int(100), DataType::Int(1), DataType::from("Hello World")],
+        ].into();
+        executor.apply_write("posts", post_records);
+
+        // The join view should have the combined row
+        let result = executor.lookup(&view, &[DataType::Int(1)]);
+        assert!(result.is_some(), "Join view should have results");
+        let rows = result.unwrap();
+        assert_eq!(rows.len(), 1, "Should have exactly one joined row");
+        assert_eq!(rows[0][0], DataType::Int(1)); // user_id
+        assert_eq!(rows[0][1], DataType::from("Alice")); // user_name
+        assert_eq!(rows[0][2], DataType::from("Hello World")); // post_title
+    }
+
+    #[test]
+    fn test_join_insert_to_left_updates_view() {
+        let mut executor = LocalExecutor::new();
+
+        let users = executor.add_base_table("users", vec!["id".into(), "name".into()]);
+        let posts = executor.add_base_table("posts", vec!["id".into(), "user_id".into(), "title".into()]);
+
+        let _ = executor.materialize(users, vec![0]);
+        let _ = executor.materialize(posts, vec![1]);
+
+        let join = executor.add_operator(
+            "user_posts",
+            OperatorType::Join(JoinOp::new(
+                JoinType::Inner,
+                0, 1,
+                vec![(true, 0), (true, 1), (false, 2)],
+                vec![0], 2, 3,
+            )),
+            vec![users, posts],
+            vec!["user_id".into(), "user_name".into(), "post_title".into()],
+        );
+
+        let view = executor.materialize(join, vec![0]);
+
+        // Insert post first (no matching user yet)
+        let post_records: Records = vec![
+            vec![DataType::Int(100), DataType::Int(1), DataType::from("Hello")],
+        ].into();
+        executor.apply_write("posts", post_records);
+
+        // Join view should be empty (no matching user)
+        let result = executor.lookup(&view, &[DataType::Int(1)]);
+        assert!(result.is_none() || result.as_ref().unwrap().is_empty(),
+            "Join should be empty without matching user");
+
+        // Now insert the user - this should trigger the join
+        let user_records: Records = vec![
+            vec![DataType::Int(1), DataType::from("Alice")],
+        ].into();
+        executor.apply_write("users", user_records);
+
+        // NOW the join view should have results
+        let result = executor.lookup(&view, &[DataType::Int(1)]);
+        assert!(result.is_some(), "Join view should have results after user insert");
+        let rows = result.unwrap();
+        assert_eq!(rows.len(), 1, "Should have one joined row");
     }
 }
