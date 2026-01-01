@@ -21,6 +21,9 @@ rusqlite = { version = "0.32.1", features = ["session", "bundled"] }
 # Noria core (for DataType, etc.)
 noria = { path = "../noria" }
 
+# SQL parser
+nom-sql = "0.0.11"
+
 # Lock-free concurrent map for view storage
 evmap = "11.0"
 
@@ -53,4 +56,8 @@ path = "tests/integration.rs"
 
 [[bench]]
 name = "cache_performance"
+harness = false
+
+[[bench]]
+name = "dataflow_performance"
 harness = false

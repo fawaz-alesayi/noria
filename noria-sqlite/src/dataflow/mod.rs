@@ -4,13 +4,19 @@
 //! that reuses Noria's operator concepts but runs entirely locally with SQLite
 //! as the base table storage.
 
-mod ops;
-mod state;
+mod adapter;
+mod engine;
 mod executor;
+mod ops;
+mod sql;
+mod state;
 
-pub use ops::{Operator, OperatorType};
-pub use state::{State, MemoryState, LookupResult};
+pub use adapter::SqliteAdapter;
+pub use engine::{EngineStats, NoriaEngine, NoriaView};
 pub use executor::{LocalExecutor, ViewHandle};
+pub use ops::{AggregateFunc, AggregateOp, FilterCondition, FilterOp, Operator, OperatorType, ProjectOp};
+pub use sql::{SqlConverter, SqlError, SqlResult, TableSchema};
+pub use state::{LookupResult, MemoryState, State};
 
 use noria::DataType;
 
