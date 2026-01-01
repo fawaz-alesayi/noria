@@ -1,6 +1,6 @@
 //! Database connection wrapper with Noria dataflow acceleration.
 
-use crate::dataflow::{NoriaEngine, NoriaView};
+use crate::dataflow::{CdcEvent, NoriaEngine, NoriaView, SessionTracker};
 use crate::error::{Error, Result};
 use crate::statement::Statement;
 use crate::Config;
@@ -137,8 +137,9 @@ impl Database {
 
     /// Execute a SQL statement that doesn't return rows.
     ///
-    /// This executes directly against SQLite. Changes are captured by the
-    /// update hook and automatically propagated through the dataflow graph.
+    /// This executes directly against SQLite. Changes are captured using
+    /// SQLite's session extension and automatically propagated through the
+    /// dataflow graph to update materialized views incrementally.
     ///
     /// # Example
     ///
@@ -151,9 +152,46 @@ impl Database {
     /// ```
     pub fn execute<P: rusqlite::Params>(&self, sql: &str, params: P) -> Result<usize> {
         let conn = self.conn.write();
+
+        // Create a session to track changes
+        let mut tracker = SessionTracker::new(&conn)?;
+        tracker.attach_all()?;
+
+        // Execute the statement
         let rows_changed = conn.execute(sql, params)?;
-        // Update hook automatically propagates changes through dataflow
+
+        // Get the changeset and apply to dataflow
+        if rows_changed > 0 {
+            if let Ok(changeset) = tracker.changeset() {
+                if let Ok(events) = SessionTracker::extract_events(&changeset) {
+                    self.apply_cdc_events(&events);
+                }
+            }
+        }
+
         Ok(rows_changed)
+    }
+
+    /// Apply CDC events to the dataflow engine.
+    fn apply_cdc_events(&self, events: &[CdcEvent]) {
+        for event in events {
+            match event {
+                CdcEvent::Insert { table, new_row } => {
+                    self.engine.apply_insert_row(table, new_row.clone());
+                }
+                CdcEvent::Delete { table, old_row } => {
+                    self.engine.apply_delete(table, old_row.clone());
+                }
+                CdcEvent::Update {
+                    table,
+                    old_row,
+                    new_row,
+                } => {
+                    self.engine
+                        .apply_update_rows(table, old_row.clone(), new_row.clone());
+                }
+            }
+        }
     }
 
     /// Execute multiple SQL statements.

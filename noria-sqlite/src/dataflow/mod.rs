@@ -8,6 +8,7 @@ mod adapter;
 mod engine;
 mod executor;
 mod ops;
+mod session;
 mod sql;
 mod state;
 
@@ -15,6 +16,7 @@ pub use adapter::SqliteAdapter;
 pub use engine::{EngineStats, NoriaEngine, NoriaView};
 pub use executor::{LocalExecutor, ViewHandle};
 pub use ops::{AggregateFunc, AggregateOp, FilterCondition, FilterOp, Operator, OperatorType, ProjectOp};
+pub use session::{CdcEvent, SessionTracker};
 pub use sql::{SqlConverter, SqlError, SqlResult, TableSchema};
 pub use state::{LookupResult, MemoryState, State};
 

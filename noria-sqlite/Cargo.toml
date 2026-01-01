@@ -24,6 +24,7 @@ noria = { path = "../noria" }
 # SQL parser (SQLite-specific, more complete than nom-sql)
 sqlite3-parser = "0.15"
 fallible-iterator = "0.3"
+fallible-streaming-iterator = "0.1"
 
 # Lock-free concurrent map for view storage
 evmap = "11.0"

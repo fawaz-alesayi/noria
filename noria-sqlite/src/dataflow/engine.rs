@@ -271,6 +271,17 @@ impl NoriaEngine {
         }
     }
 
+    /// Apply an insert with row data directly (from session extension).
+    pub fn apply_insert_row(&self, table: &str, new_row: Vec<DataType>) {
+        let mut adapter = self.adapter.write();
+        adapter.handle_change(
+            rusqlite::hooks::Action::SQLITE_INSERT,
+            table,
+            Some(new_row),
+            None,
+        );
+    }
+
     /// Apply a delete from SQLite to the dataflow.
     ///
     /// Note: For deletes, we need the old row values which are not available
@@ -300,6 +311,17 @@ impl NoriaEngine {
                 old_row,
             );
         }
+    }
+
+    /// Apply an update with row data directly (from session extension).
+    pub fn apply_update_rows(&self, table: &str, old_row: Vec<DataType>, new_row: Vec<DataType>) {
+        let mut adapter = self.adapter.write();
+        adapter.handle_change(
+            rusqlite::hooks::Action::SQLITE_UPDATE,
+            table,
+            Some(new_row),
+            Some(old_row),
+        );
     }
 
     /// Get executor statistics.
