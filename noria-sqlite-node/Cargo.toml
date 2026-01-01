@@ -1,0 +1,33 @@
+[package]
+name = "noria-sqlite-node"
+version = "0.1.0"
+edition = "2021"
+description = "Node.js bindings for noria-sqlite - transparent caching for SQLite"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Noria SQLite core library
+noria-sqlite = { path = "../noria-sqlite" }
+
+# Noria core (for DataType)
+noria = { path = "../noria" }
+
+# napi-rs for Node.js bindings
+napi = { version = "2", features = ["napi9", "serde-json"] }
+napi-derive = "2"
+
+# SQLite bindings (re-export for type conversions)
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+
+# JSON serialization
+serde = "1.0"
+serde_json = "1.0"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
