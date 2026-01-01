@@ -122,6 +122,9 @@ pub enum FilterCondition {
     And(Vec<FilterCondition>),
     /// OR of multiple conditions.
     Or(Vec<FilterCondition>),
+    /// Always true - used for placeholder conditions (WHERE col = ?).
+    /// These mark key columns but don't filter during dataflow.
+    AlwaysTrue,
 }
 
 impl FilterCondition {
@@ -136,6 +139,7 @@ impl FilterCondition {
             FilterCondition::IsNotNull(col) => row.get(*col).map(|v| *v != DataType::None).unwrap_or(false),
             FilterCondition::And(conds) => conds.iter().all(|c| c.evaluate(row)),
             FilterCondition::Or(conds) => conds.iter().any(|c| c.evaluate(row)),
+            FilterCondition::AlwaysTrue => true,
         }
     }
 }
@@ -248,6 +252,7 @@ impl Operator for ProjectOp {
 pub enum JoinType {
     Inner,
     Left,
+    Right,
 }
 
 #[derive(Debug, Clone)]
@@ -389,6 +394,7 @@ impl Operator for JoinOp {
         match self.join_type {
             JoinType::Inner => "⋈".to_string(),
             JoinType::Left => "⋉".to_string(),
+            JoinType::Right => "⋊".to_string(),
         }
     }
 }
