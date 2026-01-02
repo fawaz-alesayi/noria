@@ -279,6 +279,28 @@ Database.prototype.pragma = function pragma(source, options) {
 	}
 };
 
+// Load a SQLite extension
+Database.prototype.loadExtension = function loadExtension(path, entryPoint) {
+	if (typeof path !== 'string') {
+		throw new TypeError('Expected first argument to be a string');
+	}
+	if (path.trim() === '') {
+		throw new TypeError('Expected first argument to be a non-empty string');
+	}
+	try {
+		this[cppdb]._loadExtension(path, entryPoint);
+	} catch (e) {
+		if (e.message && e.message.startsWith('SQLITE_')) {
+			const match = e.message.match(/^(SQLITE_\w+):\s*(.*)/);
+			if (match) {
+				throw new SqliteError(match[2] || match[1], match[1]);
+			}
+		}
+		throw e;
+	}
+	return this;
+};
+
 // Statement wrapper
 function Statement(nativeStmt, db) {
 	this[cppdb] = nativeStmt;

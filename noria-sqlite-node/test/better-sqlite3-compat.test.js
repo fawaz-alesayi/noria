@@ -846,7 +846,6 @@ describe('Database#serialize()', function () {
 
 // ============================================================================
 // Database#loadExtension() tests (from 35.database.load-extension.js)
-// TODO: Implement extension loading
 // ============================================================================
 describe('Database#loadExtension()', function () {
 	beforeEach(function () {
@@ -856,12 +855,12 @@ describe('Database#loadExtension()', function () {
 		this.db.close();
 	});
 
-	it.skip('should throw if path is not a string', function () {
+	it('should throw if path is not a string', function () {
 		expect(() => this.db.loadExtension()).to.throw(TypeError);
 		expect(() => this.db.loadExtension(null)).to.throw(TypeError);
 		expect(() => this.db.loadExtension(123)).to.throw(TypeError);
 	});
-	it.skip('should throw if extension file does not exist', function () {
+	it('should throw if extension file does not exist', function () {
 		expect(() => this.db.loadExtension('/nonexistent/path.so')).to.throw(Database.SqliteError);
 	});
 });

@@ -57,6 +57,8 @@ export declare class Database {
   _exec(sql: string): void
   /** Close the database connection. */
   close(): void
+  /** Load a SQLite extension. */
+  _loadExtension(path: string, entryPoint?: string | undefined | null): void
 }
 /** A prepared SQL statement. */
 export declare class Statement {

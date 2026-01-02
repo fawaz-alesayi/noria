@@ -180,6 +180,40 @@ impl Database {
         self.is_open = false;
         Ok(())
     }
+
+    /// Load a SQLite extension.
+    #[napi(js_name = "_loadExtension")]
+    pub fn load_extension(&self, path: String, entry_point: Option<String>) -> Result<()> {
+        if !self.is_open {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "The database connection is not open",
+            ));
+        }
+
+        let conn = self.inner.connection().write();
+
+        // Enable extension loading
+        unsafe {
+            conn.load_extension_enable()
+                .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+        }
+
+        // Load the extension
+        let result = unsafe {
+            match entry_point {
+                Some(ep) => conn.load_extension(&path, Some(&ep)),
+                None => conn.load_extension(&path, None::<&str>),
+            }
+        };
+
+        // Disable extension loading for safety
+        unsafe {
+            let _ = conn.load_extension_disable();
+        }
+
+        result.map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))
+    }
 }
 
 /// Database constructor options
