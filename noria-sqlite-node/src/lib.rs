@@ -152,6 +152,7 @@ impl Database {
             pluck_mode: false,
             expand_mode: false,
             raw_mode: false,
+            bound_params: None,
         })
     }
 
@@ -201,6 +202,7 @@ pub struct Statement {
     pluck_mode: bool,
     expand_mode: bool,
     raw_mode: bool,
+    bound_params: Option<Vec<serde_json::Value>>,
 }
 
 #[napi]
@@ -228,7 +230,20 @@ impl Statement {
             ));
         }
 
-        let flat_params = flatten_params(&params)?;
+        // Check if params were provided when already bound
+        if self.bound_params.is_some() && !params.is_empty() {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "This statement already has bound parameters",
+            ));
+        }
+
+        // Use bound params or provided params
+        let flat_params = if let Some(ref bound) = self.bound_params {
+            bound.clone()
+        } else {
+            flatten_params(&params)?
+        };
         let param_values = convert_params(&flat_params);
         let param_refs: Vec<&dyn rusqlite::ToSql> =
             param_values.iter().map(|b| b.as_ref()).collect();
@@ -271,7 +286,20 @@ impl Statement {
     /// Execute the statement and return all rows.
     #[napi(ts_args_type = "...params: any[]")]
     pub fn all(&self, params: Vec<serde_json::Value>) -> Result<Vec<serde_json::Value>> {
-        let flat_params = flatten_params(&params)?;
+        // Check if params were provided when already bound
+        if self.bound_params.is_some() && !params.is_empty() {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "This statement already has bound parameters",
+            ));
+        }
+
+        // Use bound params or provided params
+        let flat_params = if let Some(ref bound) = self.bound_params {
+            bound.clone()
+        } else {
+            flatten_params(&params)?
+        };
         let param_values = convert_params(&flat_params);
         let param_refs: Vec<&dyn rusqlite::ToSql> =
             param_values.iter().map(|b| b.as_ref()).collect();
@@ -306,7 +334,20 @@ impl Statement {
     /// Execute the statement and return info about the execution.
     #[napi(ts_args_type = "...params: any[]")]
     pub fn run(&self, params: Vec<serde_json::Value>) -> Result<RunResult> {
-        let flat_params = flatten_params(&params)?;
+        // Check if params were provided when already bound
+        if self.bound_params.is_some() && !params.is_empty() {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "This statement already has bound parameters",
+            ));
+        }
+
+        // Use bound params or provided params
+        let flat_params = if let Some(ref bound) = self.bound_params {
+            bound.clone()
+        } else {
+            flatten_params(&params)?
+        };
 
         let changes = if has_named_params(&flat_params) {
             // Handle named parameters
@@ -388,10 +429,20 @@ impl Statement {
         self
     }
 
-    /// Bind parameters for reuse.
+    /// Bind parameters permanently for reuse.
     #[napi(ts_args_type = "...params: any[]")]
-    pub fn bind(&self, _params: Vec<serde_json::Value>) -> Result<&Self> {
-        // For now, just return self - actual binding happens at execution time
+    pub fn bind(&mut self, params: Vec<serde_json::Value>) -> Result<&Self> {
+        // Check if already bound
+        if self.bound_params.is_some() {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "The bind() method can only be invoked once per statement object",
+            ));
+        }
+
+        // Flatten the params
+        let flat_params = flatten_params(&params)?;
+        self.bound_params = Some(flat_params);
         Ok(self)
     }
 

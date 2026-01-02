@@ -79,7 +79,7 @@ export declare class Statement {
   expand(enabled?: boolean | undefined | null): this
   /** Enable raw mode - return rows as arrays. */
   raw(enabled?: boolean | undefined | null): this
-  /** Bind parameters for reuse. */
+  /** Bind parameters permanently for reuse. */
   bind(...params: any[]): this
   /**
    * Get column information for this statement.

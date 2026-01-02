@@ -306,6 +306,9 @@ Statement.prototype.run = function run(...params) {
 	try {
 		return this[cppdb].run(params);
 	} catch (e) {
+		if (e.message && e.message.includes('already has bound parameters')) {
+			throw new TypeError('This statement already has bound parameters');
+		}
 		if (e.message && e.message.startsWith('SQLITE_')) {
 			const match = e.message.match(/^(SQLITE_\w+):\s*(.*)/);
 			if (match) {
@@ -368,8 +371,29 @@ Statement.prototype.raw = function raw(enabled) {
 	return this;
 };
 
+// Convert params for native binding (handle Buffers specially)
+function convertParams(params) {
+	return params.map(p => {
+		if (Buffer.isBuffer(p)) {
+			return { type: 'Buffer', data: Array.from(p) };
+		}
+		return p;
+	});
+}
+
 Statement.prototype.bind = function bind(...params) {
-	this[cppdb].bind(params);
+	try {
+		this[cppdb].bind(convertParams(params));
+	} catch (e) {
+		// Convert to TypeError for better-sqlite3 compat
+		if (e.message && e.message.includes('already has bound parameters')) {
+			throw new TypeError('This statement already has bound parameters');
+		}
+		if (e.message && e.message.includes('can only be invoked once')) {
+			throw new TypeError('The bind() method can only be invoked once per statement object');
+		}
+		throw e;
+	}
 	return this;
 };
 

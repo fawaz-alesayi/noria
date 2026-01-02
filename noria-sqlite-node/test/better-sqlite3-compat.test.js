@@ -542,7 +542,6 @@ describe('Database#pragma()', function () {
 
 // ============================================================================
 // Statement#bind() tests (from 24.statement.bind.js)
-// TODO: Implement permanent parameter binding
 // ============================================================================
 describe('Statement#bind()', function () {
 	beforeEach(function () {
@@ -553,7 +552,7 @@ describe('Statement#bind()', function () {
 		this.db.close();
 	});
 
-	it.skip('should permanently bind parameters', function () {
+	it('should permanently bind parameters', function () {
 		const stmt = this.db.prepare("INSERT INTO entries VALUES (?, ?, ?)");
 		const buffer = Buffer.alloc(4).fill(0xdd);
 		stmt.bind('foobar', 25, buffer);
@@ -567,17 +566,18 @@ describe('Statement#bind()', function () {
 		expect(rows[1].a).to.equal('foobar');
 		expect(rows[1].b).to.equal(25);
 	});
-	it.skip('should not allow parameters after binding', function () {
+	it('should not allow parameters after binding', function () {
 		const stmt = this.db.prepare("INSERT INTO entries VALUES (?, ?, ?)");
 		stmt.bind('foobar', 25, null);
 		expect(() => stmt.run('foobar', 25, null)).to.throw(TypeError);
 	});
-	it.skip('should throw if binding twice', function () {
+	it('should throw if binding twice', function () {
 		const stmt = this.db.prepare("INSERT INTO entries VALUES (?, ?, ?)");
 		stmt.bind('foobar', 25, null);
 		expect(() => stmt.bind('foobar', 25, null)).to.throw(TypeError);
 	});
 	it.skip('should throw with incorrect parameter count', function () {
+		// This requires parameter count validation which we don't have yet
 		const stmt = this.db.prepare("INSERT INTO entries VALUES (?, ?, ?)");
 		expect(() => stmt.bind('foobar', 25)).to.throw(RangeError);
 		expect(() => stmt.bind('foobar', 25, null, null)).to.throw(RangeError);
