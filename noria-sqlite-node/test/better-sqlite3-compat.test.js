@@ -780,21 +780,46 @@ describe('Database#backup()', function () {
 		this.db.close();
 	});
 
-	it.skip('should throw if destination is not a string', function () {
-		expect(() => this.db.backup()).to.throw(TypeError);
-		expect(() => this.db.backup(null)).to.throw(TypeError);
-		expect(() => this.db.backup(123)).to.throw(TypeError);
+	it('should throw if destination is not a string', async function () {
+		try {
+			await this.db.backup();
+			expect.fail('should have thrown');
+		} catch (e) {
+			expect(e).to.be.instanceOf(TypeError);
+		}
+		try {
+			await this.db.backup(null);
+			expect.fail('should have thrown');
+		} catch (e) {
+			expect(e).to.be.instanceOf(TypeError);
+		}
+		try {
+			await this.db.backup(123);
+			expect.fail('should have thrown');
+		} catch (e) {
+			expect(e).to.be.instanceOf(TypeError);
+		}
 	});
-	it.skip('should throw if destination is empty', function () {
-		expect(() => this.db.backup('')).to.throw(TypeError);
-		expect(() => this.db.backup('   ')).to.throw(TypeError);
+	it('should throw if destination is empty', async function () {
+		try {
+			await this.db.backup('');
+			expect.fail('should have thrown');
+		} catch (e) {
+			expect(e).to.be.instanceOf(TypeError);
+		}
+		try {
+			await this.db.backup('   ');
+			expect.fail('should have thrown');
+		} catch (e) {
+			expect(e).to.be.instanceOf(TypeError);
+		}
 	});
-	it.skip('should return a promise', function () {
+	it('should return a promise', function () {
 		const promise = this.db.backup(util.next());
 		expect(promise).to.be.a('promise');
 		return promise;
 	});
-	it.skip('should backup the database', async function () {
+	it('should backup the database', async function () {
 		const dest = util.next();
 		await this.db.backup(dest);
 		const db2 = new Database(dest);
@@ -803,7 +828,7 @@ describe('Database#backup()', function () {
 		expect(rows[0].a).to.equal('hello');
 		db2.close();
 	});
-	it.skip('should support progress callback', async function () {
+	it('should support progress callback', async function () {
 		let called = false;
 		await this.db.backup(util.next(), {
 			progress: ({ totalPages, remainingPages }) => {

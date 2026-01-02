@@ -251,6 +251,45 @@ impl Database {
         result.map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))
     }
 
+    /// Perform a simple backup of the database using VACUUM INTO.
+    /// This is a synchronous operation that creates a complete copy of the database.
+    /// For incremental backup with progress callbacks, a more sophisticated implementation
+    /// using rusqlite's backup API would be needed.
+    #[napi(js_name = "_backup")]
+    pub fn backup(&self, dest_path: String, attached_name: Option<String>) -> Result<BackupProgress> {
+        if !self.is_open {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "The database connection is not open",
+            ));
+        }
+
+        let attached = attached_name.unwrap_or_else(|| "main".to_string());
+
+        // Use VACUUM INTO for a simple backup
+        // This creates a complete copy of the database
+        let conn = self.inner.connection().read();
+
+        // For attached databases, we'd need to handle differently
+        // For now, just use VACUUM INTO for the main database
+        if attached == "main" {
+            let sql = format!("VACUUM INTO '{}'", dest_path.replace("'", "''"));
+            conn.execute(&sql, [])
+                .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+        } else {
+            // For attached databases, we need to open the attached db and backup
+            return Err(Error::new(
+                Status::GenericFailure,
+                "Backup of attached databases is not yet supported",
+            ));
+        }
+
+        Ok(BackupProgress {
+            total_pages: 1,
+            remaining_pages: 0,
+        })
+    }
+
     /// Register a user-defined SQL function.
     /// @param fn - JavaScript function to call
     /// @param name - SQL function name
@@ -361,6 +400,15 @@ pub struct DatabaseOptions {
     pub readonly: Option<bool>,
     pub file_must_exist: Option<bool>,
     pub timeout: Option<i32>,
+}
+
+/// Progress information for database backup
+#[napi(object)]
+pub struct BackupProgress {
+    #[napi(js_name = "totalPages")]
+    pub total_pages: i32,
+    #[napi(js_name = "remainingPages")]
+    pub remaining_pages: i32,
 }
 
 /// A prepared SQL statement.

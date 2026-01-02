@@ -9,6 +9,11 @@ export interface DatabaseOptions {
   fileMustExist?: boolean
   timeout?: number
 }
+/** Progress information for database backup */
+export interface BackupProgress {
+  totalPages: number
+  remainingPages: number
+}
 /** Column information from Statement#columns() */
 export interface ColumnInfo {
   name: string
@@ -73,6 +78,13 @@ export declare class Database {
   _getDefaultSafeIntegers(): boolean
   /** Load a SQLite extension. */
   _loadExtension(path: string, entryPoint?: string | undefined | null): void
+  /**
+   * Perform a simple backup of the database using VACUUM INTO.
+   * This is a synchronous operation that creates a complete copy of the database.
+   * For incremental backup with progress callbacks, a more sophisticated implementation
+   * using rusqlite's backup API would be needed.
+   */
+  _backup(destPath: string, attachedName?: string | undefined | null): BackupProgress
   /**
    * Register a user-defined SQL function.
    * @param fn - JavaScript function to call

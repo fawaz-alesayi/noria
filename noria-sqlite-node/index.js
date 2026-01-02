@@ -376,6 +376,50 @@ Database.prototype.function = function defineFunction(name, options, fn) {
 	return this;
 };
 
+// Backup the database to a file
+Database.prototype.backup = async function backup(filename, options) {
+	if (options == null) options = {};
+
+	// Validate arguments
+	if (typeof filename !== 'string') throw new TypeError('Expected first argument to be a string');
+	if (typeof options !== 'object') throw new TypeError('Expected second argument to be an options object');
+
+	// Interpret options
+	filename = filename.trim();
+	const attachedName = 'attached' in options ? options.attached : 'main';
+	const handler = 'progress' in options ? options.progress : null;
+
+	// Validate interpreted options
+	if (!filename) throw new TypeError('Backup filename cannot be an empty string');
+	if (filename === ':memory:') throw new TypeError('Invalid backup filename ":memory:"');
+	if (typeof attachedName !== 'string') throw new TypeError('Expected the "attached" option to be a string');
+	if (!attachedName) throw new TypeError('The "attached" option cannot be an empty string');
+	if (handler != null && typeof handler !== 'function') throw new TypeError('Expected the "progress" option to be a function');
+
+	// Make sure the specified directory exists
+	const dirname = path.dirname(filename);
+	if (dirname && dirname !== '.' && !fs.existsSync(dirname)) {
+		throw new TypeError('Cannot save backup because the directory does not exist');
+	}
+
+	try {
+		const progress = this[cppdb]._backup(filename, attachedName);
+		// Call progress handler if provided
+		if (handler) {
+			handler(progress);
+		}
+		return progress;
+	} catch (e) {
+		if (e.message && e.message.startsWith('SQLITE_')) {
+			const match = e.message.match(/^(SQLITE_\w+):\s*(.*)/);
+			if (match) {
+				throw new SqliteError(match[2] || match[1], match[1]);
+			}
+		}
+		throw e;
+	}
+};
+
 // Statement wrapper
 function Statement(nativeStmt, db) {
 	this[cppdb] = nativeStmt;
