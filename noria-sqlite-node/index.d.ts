@@ -57,6 +57,20 @@ export declare class Database {
   _exec(sql: string): void
   /** Close the database connection. */
   close(): void
+  /**
+   * Toggle unsafe mode.
+   * In unsafe mode, operations that would normally be blocked during iteration are allowed.
+   * @param enabled - Whether to enable unsafe mode. If not provided, returns current state.
+   */
+  _unsafeMode(enabled?: boolean | undefined | null): boolean
+  /**
+   * Toggle default safe integers mode.
+   * When enabled, new statements will return integers as BigInt by default.
+   * @param enabled - Whether to enable safe integers. If not provided, returns current state.
+   */
+  _defaultSafeIntegers(enabled?: boolean | undefined | null): boolean
+  /** Get the default safe integers setting. */
+  _getDefaultSafeIntegers(): boolean
   /** Load a SQLite extension. */
   _loadExtension(path: string, entryPoint?: string | undefined | null): void
 }
@@ -81,6 +95,8 @@ export declare class Statement {
   expand(enabled?: boolean | undefined | null): this
   /** Enable raw mode - return rows as arrays. */
   raw(enabled?: boolean | undefined | null): this
+  /** Enable safe integers mode - return integers as BigInt. */
+  _safeIntegers(enabled?: boolean | undefined | null): this
   /** Bind parameters permanently for reuse. */
   bind(...params: any[]): this
   /**
