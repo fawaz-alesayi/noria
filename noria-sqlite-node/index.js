@@ -320,6 +320,62 @@ Database.prototype.loadExtension = function loadExtension(path, entryPoint) {
 	return this;
 };
 
+// Register a user-defined SQL function
+Database.prototype.function = function defineFunction(name, options, fn) {
+	// Apply defaults
+	if (options == null) options = {};
+	if (typeof options === 'function') { fn = options; options = {}; }
+
+	// Validate arguments
+	if (typeof name !== 'string') throw new TypeError('Expected first argument to be a string');
+	if (typeof fn !== 'function') throw new TypeError('Expected last argument to be a function');
+	if (typeof options !== 'object') throw new TypeError('Expected second argument to be an options object');
+	if (!name) throw new TypeError('User-defined function name cannot be an empty string');
+
+	// Interpret options
+	const safeIntegers = 'safeIntegers' in options ? (getBooleanOption(options, 'safeIntegers') ? 1 : 0) : 2;
+	const deterministic = getBooleanOption(options, 'deterministic');
+	const directOnly = getBooleanOption(options, 'directOnly');
+	const varargs = getBooleanOption(options, 'varargs');
+	let argCount = -1;
+
+	// Determine argument count
+	if (!varargs) {
+		argCount = fn.length;
+		if (!Number.isInteger(argCount) || argCount < 0) throw new TypeError('Expected function.length to be a positive integer');
+		if (argCount > 100) throw new RangeError('User-defined functions cannot have more than 100 arguments');
+	}
+
+	// Create wrapper function that handles BigInt conversion
+	const db = this;
+	const wrapperFn = function(...args) {
+		// Convert BigInt markers to actual BigInt
+		const convertedArgs = args.map(convertBigInts);
+		const result = fn.apply(this, convertedArgs);
+		// Convert BigInt results back to marker objects for transport
+		if (typeof result === 'bigint') {
+			return { $bigint: result.toString() };
+		}
+		if (Buffer.isBuffer(result)) {
+			return { type: 'Buffer', data: Array.from(result) };
+		}
+		return result;
+	};
+
+	try {
+		this[cppdb]._registerFunction(wrapperFn, name, argCount, safeIntegers, deterministic, directOnly);
+	} catch (e) {
+		if (e.message && e.message.startsWith('SQLITE_')) {
+			const match = e.message.match(/^(SQLITE_\w+):\s*(.*)/);
+			if (match) {
+				throw new SqliteError(match[2] || match[1], match[1]);
+			}
+		}
+		throw e;
+	}
+	return this;
+};
+
 // Statement wrapper
 function Statement(nativeStmt, db) {
 	this[cppdb] = nativeStmt;

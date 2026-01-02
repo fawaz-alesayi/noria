@@ -627,14 +627,20 @@ describe('Database#function()', function () {
 		this.db.close();
 	});
 
-	it.skip('should throw if name is not a string', function () {
+	it('should throw if name is not a string', function () {
 		expect(() => this.db.function(null, () => {})).to.throw(TypeError);
 		expect(() => this.db.function(123, () => {})).to.throw(TypeError);
 	});
-	it.skip('should throw if function is not provided', function () {
+	it('should throw if function is not provided', function () {
 		expect(() => this.db.function('foo')).to.throw(TypeError);
 		expect(() => this.db.function('foo', null)).to.throw(TypeError);
 	});
+	// NOTE: The following tests are skipped because calling JavaScript functions
+	// from within SQLite callbacks requires direct V8 API access which NAPI-RS
+	// doesn't provide. ThreadsafeFunction with Blocking mode causes a deadlock
+	// because it blocks the main Node.js thread while waiting for the callback.
+	// This requires a more sophisticated implementation using worker threads or
+	// direct V8 bindings.
 	it.skip('should register a function', function () {
 		this.db.function('add2', (a, b) => a + b);
 		expect(this.db.prepare('SELECT add2(?, ?)').pluck().get(10, 5)).to.equal(15);

@@ -4,9 +4,12 @@
 //! with transparent incremental view maintenance powered by Noria.
 
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use noria_sqlite::{Database as NoriaDatabase, Statement as NoriaStatement};
 use parking_lot::Mutex;
+use rusqlite::functions::FunctionFlags;
+use std::sync::mpsc;
 use std::sync::Arc;
 
 /// SqliteError for compatibility with better-sqlite3
@@ -246,6 +249,108 @@ impl Database {
         }
 
         result.map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))
+    }
+
+    /// Register a user-defined SQL function.
+    /// @param fn - JavaScript function to call
+    /// @param name - SQL function name
+    /// @param argc - Number of arguments (-1 for varargs)
+    /// @param safe_ints - Whether to use BigInt for integers (0=false, 1=true, 2=inherit)
+    /// @param deterministic - Whether function is deterministic
+    /// @param direct_only - Whether function can only be called directly (not from triggers/views)
+    #[napi(js_name = "_registerFunction")]
+    pub fn register_function(
+        &self,
+        #[napi(ts_arg_type = "(...args: any[]) => any")] callback: JsFunction,
+        name: String,
+        argc: i32,
+        safe_ints: i32,
+        deterministic: bool,
+        direct_only: bool,
+    ) -> Result<()> {
+        if !self.is_open {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "The database connection is not open",
+            ));
+        }
+
+        // We'll store the channel sender alongside the args
+        type CallArgs = (Vec<serde_json::Value>, mpsc::Sender<serde_json::Value>);
+
+        // Create a threadsafe function from the callback
+        // The callback receives args as Vec<serde_json::Value> and returns serde_json::Value
+        let tsfn: ThreadsafeFunction<CallArgs, ErrorStrategy::Fatal> = callback
+            .create_threadsafe_function(0, |ctx| {
+                // ctx.value is (args, sender)
+                // We return just the args to be passed to the JS function
+                // The sender is used later in call_with_return_value
+                let (args, _sender) = ctx.value;
+                Ok(args)
+            })?;
+
+        // Determine the effective safe_ints setting
+        let use_safe_ints = if safe_ints == 2 {
+            self.default_safe_integers
+        } else {
+            safe_ints == 1
+        };
+
+        // Build function flags
+        let mut flags = FunctionFlags::SQLITE_UTF8;
+        if deterministic {
+            flags |= FunctionFlags::SQLITE_DETERMINISTIC;
+        }
+        if direct_only {
+            flags |= FunctionFlags::SQLITE_DIRECTONLY;
+        }
+
+        let tsfn = Arc::new(tsfn);
+        let tsfn_clone = tsfn.clone();
+
+        // Register the function with SQLite
+        let conn = self.inner.connection().write();
+        conn.create_scalar_function(&name, argc, flags, move |ctx| {
+            // Convert SQLite arguments to JSON for JavaScript
+            let mut args = Vec::with_capacity(ctx.len());
+            for i in 0..ctx.len() {
+                let value = sqlite_value_to_json(ctx.get_raw(i), use_safe_ints);
+                args.push(value);
+            }
+
+            // Create a channel for this invocation
+            let (tx, rx) = mpsc::channel();
+            let tx_for_callback = tx.clone();
+
+            // Call the JavaScript function with blocking mode
+            // The callback receives the JS function's return value directly
+            let status = tsfn_clone.call_with_return_value(
+                (args, tx),
+                ThreadsafeFunctionCallMode::Blocking,
+                move |js_return: serde_json::Value| {
+                    // Send the result through the channel
+                    let _ = tx_for_callback.send(js_return);
+                    Ok(())
+                },
+            );
+
+            if status != Status::Ok {
+                return Err(rusqlite::Error::UserFunctionError(Box::new(
+                    std::io::Error::new(std::io::ErrorKind::Other, "Failed to call JS function"),
+                )));
+            }
+
+            // Wait for the result from JavaScript
+            match rx.recv() {
+                Ok(value) => json_to_sqlite_result(value),
+                Err(_) => Err(rusqlite::Error::UserFunctionError(Box::new(
+                    std::io::Error::new(std::io::ErrorKind::Other, "Channel closed"),
+                ))),
+            }
+        })
+        .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+
+        Ok(())
     }
 }
 
@@ -743,6 +848,76 @@ fn row_value_to_json(row: &rusqlite::Row, idx: usize, safe_ints: bool) -> rusqli
                 "data": data
             })
         }
+    })
+}
+
+/// Convert a SQLite value (from function context) to JSON for JavaScript.
+fn sqlite_value_to_json(value: rusqlite::types::ValueRef, safe_ints: bool) -> serde_json::Value {
+    use rusqlite::types::ValueRef;
+
+    match value {
+        ValueRef::Null => serde_json::Value::Null,
+        ValueRef::Integer(i) => {
+            if safe_ints {
+                serde_json::json!({ "$bigint": i.to_string() })
+            } else {
+                serde_json::json!(i as f64)
+            }
+        }
+        ValueRef::Real(f) => serde_json::json!(f),
+        ValueRef::Text(s) => {
+            serde_json::Value::String(std::str::from_utf8(s).unwrap_or("").to_string())
+        }
+        ValueRef::Blob(b) => {
+            let data: Vec<serde_json::Value> =
+                b.iter().map(|&byte| serde_json::json!(byte)).collect();
+            serde_json::json!({
+                "type": "Buffer",
+                "data": data
+            })
+        }
+    }
+}
+
+/// Convert a JSON value from JavaScript to a rusqlite Result for function return.
+fn json_to_sqlite_result(value: serde_json::Value) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'static>> {
+    use rusqlite::types::{ToSqlOutput, Value};
+
+    Ok(match value {
+        serde_json::Value::Null => ToSqlOutput::Owned(Value::Null),
+        serde_json::Value::Bool(b) => ToSqlOutput::Owned(Value::Integer(if b { 1 } else { 0 })),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                ToSqlOutput::Owned(Value::Integer(i))
+            } else if let Some(f) = n.as_f64() {
+                ToSqlOutput::Owned(Value::Real(f))
+            } else {
+                ToSqlOutput::Owned(Value::Null)
+            }
+        }
+        serde_json::Value::String(s) => ToSqlOutput::Owned(Value::Text(s)),
+        serde_json::Value::Object(obj) => {
+            // Handle Buffer-like objects
+            if let Some(serde_json::Value::String(t)) = obj.get("type") {
+                if t == "Buffer" {
+                    if let Some(serde_json::Value::Array(data)) = obj.get("data") {
+                        let bytes: Vec<u8> = data
+                            .iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect();
+                        return Ok(ToSqlOutput::Owned(Value::Blob(bytes)));
+                    }
+                }
+            }
+            // Handle BigInt marker
+            if let Some(serde_json::Value::String(s)) = obj.get("$bigint") {
+                if let Ok(i) = s.parse::<i64>() {
+                    return Ok(ToSqlOutput::Owned(Value::Integer(i)));
+                }
+            }
+            ToSqlOutput::Owned(Value::Null)
+        }
+        serde_json::Value::Array(_) => ToSqlOutput::Owned(Value::Null),
     })
 }
 

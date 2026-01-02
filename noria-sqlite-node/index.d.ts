@@ -73,6 +73,16 @@ export declare class Database {
   _getDefaultSafeIntegers(): boolean
   /** Load a SQLite extension. */
   _loadExtension(path: string, entryPoint?: string | undefined | null): void
+  /**
+   * Register a user-defined SQL function.
+   * @param fn - JavaScript function to call
+   * @param name - SQL function name
+   * @param argc - Number of arguments (-1 for varargs)
+   * @param safe_ints - Whether to use BigInt for integers (0=false, 1=true, 2=inherit)
+   * @param deterministic - Whether function is deterministic
+   * @param direct_only - Whether function can only be called directly (not from triggers/views)
+   */
+  _registerFunction(callback: (...args: any[]) => any, name: string, argc: number, safeInts: number, deterministic: boolean, directOnly: boolean): void
 }
 /** A prepared SQL statement. */
 export declare class Statement {
