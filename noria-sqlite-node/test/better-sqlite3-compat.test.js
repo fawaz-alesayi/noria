@@ -962,12 +962,13 @@ describe('WAL Checkpoint', function () {
 		const mode = this.db.pragma('journal_mode', { simple: true });
 		expect(mode).to.equal('wal');
 	});
-	it.skip('should checkpoint the WAL file', function () {
+	it('should checkpoint the WAL file', function () {
 		for (let i = 0; i < 100; i++) {
 			this.db.prepare('INSERT INTO entries VALUES (?, ?)').run('test', i);
 		}
-		this.db.pragma('wal_checkpoint(RESTART)');
-		// WAL should be reset after checkpoint
+		// Checkpoint the WAL - this should work as we're using pragma
+		const result = this.db.pragma('wal_checkpoint(RESTART)');
+		expect(result).to.be.an('array');
 	});
 });
 
@@ -1044,9 +1045,8 @@ describe('Miscellaneous', function () {
 		this.db.close();
 	});
 
-	it('should support LIMIT in DELETE', function () {
+	it('should support LIMIT in DELETE if SQLite is compiled with UPDATE_DELETE_LIMIT', function () {
 		// SQLite needs to be compiled with SQLITE_ENABLE_UPDATE_DELETE_LIMIT for this
-		// which most distributions have, but we'll skip if not supported
 		try {
 			const info = this.db.prepare('DELETE FROM foo ORDER BY x ASC LIMIT 1').run();
 			expect(info.changes).to.equal(1);
@@ -1060,7 +1060,7 @@ describe('Miscellaneous', function () {
 			throw e;
 		}
 	});
-	it('should support LIMIT in UPDATE', function () {
+	it('should support LIMIT in UPDATE if SQLite is compiled with UPDATE_DELETE_LIMIT', function () {
 		try {
 			const info = this.db.prepare('UPDATE foo SET y = ? ORDER BY x DESC LIMIT 2').run('updated');
 			expect(info.changes).to.equal(2);

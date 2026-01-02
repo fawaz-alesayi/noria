@@ -254,8 +254,11 @@ Database.prototype.pragma = function pragma(source, options) {
 	const simple = options && options.simple;
 	const sql = `PRAGMA ${source}`;
 
-	// Check if this is a getter or setter pragma
-	if (source.includes('=') || source.includes('(')) {
+	// Some pragmas with parentheses still return results (e.g., wal_checkpoint)
+	const returnsResults = source.toLowerCase().startsWith('wal_checkpoint') ||
+		(!source.includes('=') && !source.includes('('));
+
+	if (!returnsResults) {
 		// Setter pragma - just execute it
 		this.exec(sql);
 		return;
