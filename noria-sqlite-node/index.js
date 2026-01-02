@@ -279,6 +279,22 @@ Database.prototype.pragma = function pragma(source, options) {
 	}
 };
 
+// Toggle unsafe mode - allows operations during iteration
+Database.prototype.unsafeMode = function unsafeMode(enabled) {
+	if (enabled !== undefined && typeof enabled !== 'boolean') {
+		throw new TypeError('Expected argument to be a boolean');
+	}
+	return this[cppdb]._unsafeMode(enabled);
+};
+
+// Toggle default safe integers mode - new statements will return integers as BigInt
+Database.prototype.defaultSafeIntegers = function defaultSafeIntegers(enabled) {
+	if (enabled !== undefined && typeof enabled !== 'boolean') {
+		throw new TypeError('Expected argument to be a boolean');
+	}
+	return this[cppdb]._defaultSafeIntegers(enabled);
+};
+
 // Load a SQLite extension
 Database.prototype.loadExtension = function loadExtension(path, entryPoint) {
 	if (typeof path !== 'string') {
@@ -326,7 +342,7 @@ Object.defineProperties(Statement.prototype, {
 // Statement methods - all take variadic parameters
 Statement.prototype.run = function run(...params) {
 	try {
-		return this[cppdb].run(params);
+		return this[cppdb].run(convertParams(params));
 	} catch (e) {
 		if (e.message && e.message.includes('already has bound parameters')) {
 			throw new TypeError('This statement already has bound parameters');
@@ -347,8 +363,9 @@ Statement.prototype.get = function get(...params) {
 		throw new TypeError('This statement does not return data. Use run() instead');
 	}
 	try {
-		const result = this[cppdb].get(params);
-		return result === null ? undefined : result;
+		const result = this[cppdb].get(convertParams(params));
+		if (result === null) return undefined;
+		return convertBigInts(result);
 	} catch (e) {
 		if (e.message && e.message.startsWith('SQLITE_')) {
 			const match = e.message.match(/^(SQLITE_\w+):\s*(.*)/);
@@ -366,7 +383,8 @@ Statement.prototype.all = function all(...params) {
 		throw new TypeError('This statement does not return data. Use run() instead');
 	}
 	try {
-		return this[cppdb].all(params);
+		const results = this[cppdb].all(convertParams(params));
+		return results.map(convertBigInts);
 	} catch (e) {
 		if (e.message && e.message.startsWith('SQLITE_')) {
 			const match = e.message.match(/^(SQLITE_\w+):\s*(.*)/);
@@ -393,14 +411,51 @@ Statement.prototype.raw = function raw(enabled) {
 	return this;
 };
 
-// Convert params for native binding (handle Buffers specially)
+Statement.prototype.safeIntegers = function safeIntegers(enabled) {
+	this[cppdb]._safeIntegers(enabled);
+	return this;
+};
+
+// Convert params for native binding (handle Buffers and BigInt specially)
 function convertParams(params) {
 	return params.map(p => {
 		if (Buffer.isBuffer(p)) {
 			return { type: 'Buffer', data: Array.from(p) };
 		}
+		if (typeof p === 'bigint') {
+			// Convert BigInt to number if it fits safely
+			if (p >= Number.MIN_SAFE_INTEGER && p <= Number.MAX_SAFE_INTEGER) {
+				return Number(p);
+			}
+			// For large BigInts, use a special marker so Rust can parse as i64
+			return { $bigint: p.toString() };
+		}
 		return p;
 	});
+}
+
+// Convert BigInt markers in result back to actual BigInt
+function convertBigInts(value) {
+	if (value === null || value === undefined) {
+		return value;
+	}
+	if (typeof value === 'object') {
+		if (value.$bigint !== undefined) {
+			return BigInt(value.$bigint);
+		}
+		if (Array.isArray(value)) {
+			return value.map(convertBigInts);
+		}
+		if (value.type === 'Buffer' && Array.isArray(value.data)) {
+			return Buffer.from(value.data);
+		}
+		const result = {};
+		for (const key of Object.keys(value)) {
+			result[key] = convertBigInts(value[key]);
+		}
+		return result;
+	}
+	return value;
 }
 
 Statement.prototype.bind = function bind(...params) {

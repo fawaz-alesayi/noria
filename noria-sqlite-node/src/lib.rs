@@ -25,6 +25,8 @@ pub struct Database {
     is_memory: bool,
     is_readonly: bool,
     is_open: bool,
+    unsafe_mode: bool,
+    default_safe_integers: bool,
 }
 
 #[napi]
@@ -71,6 +73,8 @@ impl Database {
             is_memory,
             is_readonly,
             is_open: true,
+            unsafe_mode: false,
+            default_safe_integers: false,
         })
     }
 
@@ -152,6 +156,7 @@ impl Database {
             pluck_mode: false,
             expand_mode: false,
             raw_mode: false,
+            safe_ints: self.default_safe_integers,
             bound_params: None,
         })
     }
@@ -179,6 +184,34 @@ impl Database {
     pub fn close(&mut self) -> Result<()> {
         self.is_open = false;
         Ok(())
+    }
+
+    /// Toggle unsafe mode.
+    /// In unsafe mode, operations that would normally be blocked during iteration are allowed.
+    /// @param enabled - Whether to enable unsafe mode. If not provided, returns current state.
+    #[napi(js_name = "_unsafeMode")]
+    pub fn unsafe_mode(&mut self, enabled: Option<bool>) -> bool {
+        if let Some(value) = enabled {
+            self.unsafe_mode = value;
+        }
+        self.unsafe_mode
+    }
+
+    /// Toggle default safe integers mode.
+    /// When enabled, new statements will return integers as BigInt by default.
+    /// @param enabled - Whether to enable safe integers. If not provided, returns current state.
+    #[napi(js_name = "_defaultSafeIntegers")]
+    pub fn default_safe_integers(&mut self, enabled: Option<bool>) -> bool {
+        if let Some(value) = enabled {
+            self.default_safe_integers = value;
+        }
+        self.default_safe_integers
+    }
+
+    /// Get the default safe integers setting.
+    #[napi(js_name = "_getDefaultSafeIntegers")]
+    pub fn get_default_safe_integers(&self) -> bool {
+        self.default_safe_integers
     }
 
     /// Load a SQLite extension.
@@ -236,6 +269,7 @@ pub struct Statement {
     pluck_mode: bool,
     expand_mode: bool,
     raw_mode: bool,
+    safe_ints: bool,
     bound_params: Option<Vec<serde_json::Value>>,
 }
 
@@ -282,16 +316,17 @@ impl Statement {
         let param_refs: Vec<&dyn rusqlite::ToSql> =
             param_values.iter().map(|b| b.as_ref()).collect();
 
+        let safe_ints = self.safe_ints;
         let stmt = self.inner.lock();
         let result = stmt.query_row(&param_refs, |row| {
             if self.pluck_mode {
                 // Return just the first column value
-                row_value_to_json(row, 0)
+                row_value_to_json(row, 0, safe_ints)
             } else if self.raw_mode {
                 // Return as array
                 let mut arr = Vec::new();
                 for i in 0..row.as_ref().column_count() {
-                    arr.push(row_value_to_json(row, i)?);
+                    arr.push(row_value_to_json(row, i, safe_ints)?);
                 }
                 Ok(serde_json::Value::Array(arr))
             } else {
@@ -300,7 +335,7 @@ impl Statement {
                 for i in 0..row.as_ref().column_count() {
                     let default_name = format!("col{}", i);
                     let name = row.as_ref().column_name(i).unwrap_or(&default_name);
-                    let value = row_value_to_json(row, i)?;
+                    let value = row_value_to_json(row, i, safe_ints)?;
                     obj.insert(name.to_string(), value);
                 }
                 Ok(serde_json::Value::Object(obj))
@@ -338,15 +373,16 @@ impl Statement {
         let param_refs: Vec<&dyn rusqlite::ToSql> =
             param_values.iter().map(|b| b.as_ref()).collect();
 
+        let safe_ints = self.safe_ints;
         let stmt = self.inner.lock();
         let results = stmt
             .query_map(&param_refs, |row| {
                 if self.pluck_mode {
-                    row_value_to_json(row, 0)
+                    row_value_to_json(row, 0, safe_ints)
                 } else if self.raw_mode {
                     let mut arr = Vec::new();
                     for i in 0..row.as_ref().column_count() {
-                        arr.push(row_value_to_json(row, i)?);
+                        arr.push(row_value_to_json(row, i, safe_ints)?);
                     }
                     Ok(serde_json::Value::Array(arr))
                 } else {
@@ -354,7 +390,7 @@ impl Statement {
                     for i in 0..row.as_ref().column_count() {
                         let default_name = format!("col{}", i);
                         let name = row.as_ref().column_name(i).unwrap_or(&default_name);
-                        let value = row_value_to_json(row, i)?;
+                        let value = row_value_to_json(row, i, safe_ints)?;
                         obj.insert(name.to_string(), value);
                     }
                     Ok(serde_json::Value::Object(obj))
@@ -463,6 +499,13 @@ impl Statement {
         self
     }
 
+    /// Enable safe integers mode - return integers as BigInt.
+    #[napi(js_name = "_safeIntegers")]
+    pub fn safe_integers(&mut self, enabled: Option<bool>) -> &Self {
+        self.safe_ints = enabled.unwrap_or(true);
+        self
+    }
+
     /// Bind parameters permanently for reuse.
     #[napi(ts_args_type = "...params: any[]")]
     pub fn bind(&mut self, params: Vec<serde_json::Value>) -> Result<&Self> {
@@ -538,6 +581,19 @@ pub struct RunResult {
     pub last_insert_rowid: i64,
 }
 
+/// Check if an object is a special marker (Buffer or BigInt) rather than named params
+fn is_special_marker(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    // Buffer marker
+    if obj.get("type").map_or(false, |t| t == "Buffer") {
+        return true;
+    }
+    // BigInt marker
+    if obj.contains_key("$bigint") {
+        return true;
+    }
+    false
+}
+
 /// Flatten nested arrays in params (better-sqlite3 accepts arrays mixed with values)
 /// Also handles object params for named parameters
 fn flatten_params(params: &[serde_json::Value]) -> Result<Vec<serde_json::Value>> {
@@ -549,10 +605,10 @@ fn flatten_params(params: &[serde_json::Value]) -> Result<Vec<serde_json::Value>
                     result.push(item.clone());
                 }
             }
-            // If first param is an object with regular keys (not Buffer), it's named params
+            // If first param is an object with regular keys (not Buffer/BigInt), it's named params
             serde_json::Value::Object(obj) => {
-                // Check if it's a Buffer - those get passed through
-                if obj.get("type").map_or(false, |t| t == "Buffer") {
+                // Check if it's a special marker - those get passed through as values
+                if is_special_marker(obj) {
                     result.push(param.clone());
                 } else {
                     // It's a named params object - push it as-is for special handling
@@ -565,12 +621,12 @@ fn flatten_params(params: &[serde_json::Value]) -> Result<Vec<serde_json::Value>
     Ok(result)
 }
 
-/// Check if params contains named parameters (an object that's not a Buffer)
+/// Check if params contains named parameters (an object that's not a special marker)
 fn has_named_params(params: &[serde_json::Value]) -> bool {
     if params.len() == 1 {
         if let serde_json::Value::Object(obj) = &params[0] {
-            // It's named params if it's an object that's not a Buffer
-            return obj.get("type").map_or(true, |t| t != "Buffer");
+            // It's named params if it's an object that's not a special marker
+            return !is_special_marker(obj);
         }
     }
     false
@@ -602,6 +658,12 @@ fn json_to_sql_value(v: &serde_json::Value) -> Box<dyn rusqlite::ToSql> {
                             .collect();
                         return Box::new(bytes);
                     }
+                }
+            }
+            // Handle BigInt marker objects
+            if let Some(serde_json::Value::String(s)) = obj.get("$bigint") {
+                if let Ok(i) = s.parse::<i64>() {
+                    return Box::new(i);
                 }
             }
             Box::new(rusqlite::types::Null)
@@ -637,9 +699,9 @@ fn convert_params(params: &[serde_json::Value]) -> Vec<Box<dyn rusqlite::ToSql>>
     params
         .iter()
         .filter_map(|v| {
-            // Skip objects that are named param containers (not Buffers)
+            // Skip objects that are named param containers (not special markers)
             if let serde_json::Value::Object(obj) = v {
-                if obj.get("type").map_or(true, |t| t != "Buffer") {
+                if !is_special_marker(obj) {
                     return None; // Skip named param objects
                 }
             }
@@ -649,12 +711,25 @@ fn convert_params(params: &[serde_json::Value]) -> Vec<Box<dyn rusqlite::ToSql>>
 }
 
 /// Convert a rusqlite row value to JSON.
-fn row_value_to_json(row: &rusqlite::Row, idx: usize) -> rusqlite::Result<serde_json::Value> {
+/// When safe_ints is true, integers are returned as a special marker object
+/// that the JS wrapper will convert to BigInt.
+fn row_value_to_json(row: &rusqlite::Row, idx: usize, safe_ints: bool) -> rusqlite::Result<serde_json::Value> {
     use rusqlite::types::ValueRef;
 
     Ok(match row.get_ref(idx)? {
         ValueRef::Null => serde_json::Value::Null,
-        ValueRef::Integer(i) => serde_json::Value::Number(i.into()),
+        ValueRef::Integer(i) => {
+            if safe_ints {
+                // Return as a special marker that JS will convert to BigInt
+                serde_json::json!({
+                    "$bigint": i.to_string()
+                })
+            } else {
+                // Return as f64 to ensure JavaScript treats it as Number
+                // (NAPI-RS may auto-convert large i64 to BigInt, but f64 stays as Number)
+                serde_json::json!(i as f64)
+            }
+        }
         ValueRef::Real(f) => serde_json::json!(f),
         ValueRef::Text(s) => {
             serde_json::Value::String(std::str::from_utf8(s).unwrap_or("").to_string())

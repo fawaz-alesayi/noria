@@ -878,19 +878,19 @@ describe('BigInts', function () {
 		this.db.close();
 	});
 
-	it.skip('should accept BigInt as bound parameter', function () {
+	it('should accept BigInt as bound parameter', function () {
 		this.db.prepare('INSERT INTO entries VALUES (?)').run(123n);
 		const row = this.db.prepare('SELECT * FROM entries').get();
 		expect(row.a).to.equal(123);
 	});
-	it.skip('should return BigInt with safeIntegers enabled', function () {
+	it('should return BigInt with safeIntegers enabled', function () {
 		this.db.prepare('INSERT INTO entries VALUES (?)').run(9007199254740993n);
 		const stmt = this.db.prepare('SELECT * FROM entries');
 		stmt.safeIntegers(true);
 		const row = stmt.get();
 		expect(row.a).to.equal(9007199254740993n);
 	});
-	it.skip('should toggle safeIntegers per statement', function () {
+	it('should toggle safeIntegers per statement', function () {
 		this.db.prepare('INSERT INTO entries VALUES (?)').run(9007199254740993n);
 		const stmt = this.db.prepare('SELECT * FROM entries');
 		expect(stmt.get().a).to.equal(9007199254740992); // loses precision
@@ -899,7 +899,7 @@ describe('BigInts', function () {
 		stmt.safeIntegers(false);
 		expect(stmt.get().a).to.equal(9007199254740992);
 	});
-	it.skip('should support defaultSafeIntegers on database', function () {
+	it('should support defaultSafeIntegers on database', function () {
 		this.db.defaultSafeIntegers(true);
 		this.db.prepare('INSERT INTO entries VALUES (?)').run(9007199254740993n);
 		const row = this.db.prepare('SELECT * FROM entries').get();
@@ -936,7 +936,7 @@ describe('Database#unsafeMode()', function () {
 			expect(() => write.run()).to.not.throw();
 		}
 	});
-	it.skip('should toggle unsafe mode', function () {
+	it('should toggle unsafe mode', function () {
 		expect(this.db.unsafeMode()).to.be.false;
 		this.db.unsafeMode(true);
 		expect(this.db.unsafeMode()).to.be.true;
