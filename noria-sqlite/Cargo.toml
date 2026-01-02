@@ -16,7 +16,7 @@ bundled = ["rusqlite/bundled"]
 
 [dependencies]
 # SQLite bindings with session extension support
-rusqlite = { version = "0.32.1", features = ["session", "bundled"] }
+rusqlite = { version = "0.32.1", features = ["session", "bundled", "column_decltype"] }
 
 # Noria core (for DataType, etc.)
 noria = { path = "../noria" }

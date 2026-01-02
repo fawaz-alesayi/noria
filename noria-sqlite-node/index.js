@@ -381,10 +381,22 @@ Statement.prototype.iterate = function* iterate(...params) {
 	}
 };
 
-// Columns info (stub)
+// Columns info
 Statement.prototype.columns = function columns() {
-	// TODO: implement proper column info
-	return [];
+	if (!this.reader) {
+		throw new TypeError('This statement does not return data. Use run() instead');
+	}
+	try {
+		return this[cppdb].columns();
+	} catch (e) {
+		if (e.message && e.message.startsWith('SQLITE_')) {
+			const match = e.message.match(/^(SQLITE_\w+):\s*(.*)/);
+			if (match) {
+				throw new SqliteError(match[2] || match[1], match[1]);
+			}
+		}
+		throw e;
+	}
 };
 
 // Attach SqliteError to Database

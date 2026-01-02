@@ -394,6 +394,55 @@ impl Statement {
         // For now, just return self - actual binding happens at execution time
         Ok(self)
     }
+
+    /// Get column information for this statement.
+    /// Note: SQLite column origin info requires SQLITE_ENABLE_COLUMN_METADATA which
+    /// may not be available. We return basic column names for now.
+    #[napi]
+    pub fn columns(&self) -> Result<Vec<ColumnInfo>> {
+        if !self.is_reader {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "This statement does not return data",
+            ));
+        }
+
+        let conn = self.db.connection().read();
+        let stmt = conn.prepare(&self.sql)
+            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+
+        let count = stmt.column_count();
+        let mut columns = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let name = stmt.column_name(i)
+                .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?
+                .to_string();
+
+            // For now, return basic info without origin metadata
+            // Full metadata requires SQLITE_ENABLE_COLUMN_METADATA compile flag
+            columns.push(ColumnInfo {
+                name,
+                column: None,
+                table: None,
+                database: None,
+                type_name: None,
+            });
+        }
+
+        Ok(columns)
+    }
+}
+
+/// Column information from Statement#columns()
+#[napi(object)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub column: Option<String>,
+    pub table: Option<String>,
+    pub database: Option<String>,
+    #[napi(js_name = "type")]
+    pub type_name: Option<String>,
 }
 
 /// Result of running a statement.

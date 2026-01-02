@@ -9,6 +9,14 @@ export interface DatabaseOptions {
   fileMustExist?: boolean
   timeout?: number
 }
+/** Column information from Statement#columns() */
+export interface ColumnInfo {
+  name: string
+  column?: string
+  table?: string
+  database?: string
+  type?: string
+}
 /** Result of running a statement. */
 export interface RunResult {
   changes: number
@@ -73,4 +81,10 @@ export declare class Statement {
   raw(enabled?: boolean | undefined | null): this
   /** Bind parameters for reuse. */
   bind(...params: any[]): this
+  /**
+   * Get column information for this statement.
+   * Note: SQLite column origin info requires SQLITE_ENABLE_COLUMN_METADATA which
+   * may not be available. We return basic column names for now.
+   */
+  columns(): Array<ColumnInfo>
 }
