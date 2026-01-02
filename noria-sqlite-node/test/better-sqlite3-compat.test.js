@@ -539,3 +539,615 @@ describe('Database#pragma()', function () {
 		expect(typeof journalMode).to.equal('string');
 	});
 });
+
+// ============================================================================
+// Statement#bind() tests (from 24.statement.bind.js)
+// TODO: Implement permanent parameter binding
+// ============================================================================
+describe('Statement#bind()', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+		this.db.prepare('CREATE TABLE entries (a TEXT, b INTEGER, c BLOB)').run();
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it.skip('should permanently bind parameters', function () {
+		const stmt = this.db.prepare("INSERT INTO entries VALUES (?, ?, ?)");
+		const buffer = Buffer.alloc(4).fill(0xdd);
+		stmt.bind('foobar', 25, buffer);
+		stmt.run();
+		buffer.fill(0xaa);
+		stmt.run();
+		const rows = this.db.prepare('SELECT * FROM entries ORDER BY rowid').all();
+		expect(rows.length).to.equal(2);
+		expect(rows[0].a).to.equal('foobar');
+		expect(rows[0].b).to.equal(25);
+		expect(rows[1].a).to.equal('foobar');
+		expect(rows[1].b).to.equal(25);
+	});
+	it.skip('should not allow parameters after binding', function () {
+		const stmt = this.db.prepare("INSERT INTO entries VALUES (?, ?, ?)");
+		stmt.bind('foobar', 25, null);
+		expect(() => stmt.run('foobar', 25, null)).to.throw(TypeError);
+	});
+	it.skip('should throw if binding twice', function () {
+		const stmt = this.db.prepare("INSERT INTO entries VALUES (?, ?, ?)");
+		stmt.bind('foobar', 25, null);
+		expect(() => stmt.bind('foobar', 25, null)).to.throw(TypeError);
+	});
+	it.skip('should throw with incorrect parameter count', function () {
+		const stmt = this.db.prepare("INSERT INTO entries VALUES (?, ?, ?)");
+		expect(() => stmt.bind('foobar', 25)).to.throw(RangeError);
+		expect(() => stmt.bind('foobar', 25, null, null)).to.throw(RangeError);
+	});
+});
+
+// ============================================================================
+// Statement#columns() tests (from 25.statement.columns.js)
+// TODO: Implement column metadata
+// ============================================================================
+describe('Statement#columns()', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+		this.db.prepare('CREATE TABLE entries (a TEXT, b INTEGER, c BLOB)').run();
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it.skip('should throw if invoked on a non-reader statement', function () {
+		const stmt = this.db.prepare("INSERT INTO entries VALUES (?, ?, ?)");
+		expect(() => stmt.columns()).to.throw(TypeError);
+	});
+	it.skip('should return an array of column descriptors', function () {
+		expect(this.db.prepare('SELECT 5.0 as d, * FROM entries').columns()).to.deep.equal([
+			{ name: 'd', column: null, table: null, database: null, type: null },
+			{ name: 'a', column: 'a', table: 'entries', database: 'main', type: 'TEXT' },
+			{ name: 'b', column: 'b', table: 'entries', database: 'main', type: 'INTEGER' },
+			{ name: 'c', column: 'c', table: 'entries', database: 'main', type: 'BLOB' },
+		]);
+	});
+	it.skip('should not return stale descriptors after recompile', function () {
+		const stmt = this.db.prepare('SELECT * FROM entries');
+		expect(stmt.columns()).to.have.lengthOf(3);
+		this.db.prepare('ALTER TABLE entries ADD COLUMN d TEXT').run();
+		stmt.get();
+		expect(stmt.columns()).to.have.lengthOf(4);
+	});
+});
+
+// ============================================================================
+// Database#function() tests (from 32.database.function.js)
+// TODO: Implement user-defined functions
+// ============================================================================
+describe('Database#function()', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it.skip('should throw if name is not a string', function () {
+		expect(() => this.db.function(null, () => {})).to.throw(TypeError);
+		expect(() => this.db.function(123, () => {})).to.throw(TypeError);
+	});
+	it.skip('should throw if function is not provided', function () {
+		expect(() => this.db.function('foo')).to.throw(TypeError);
+		expect(() => this.db.function('foo', null)).to.throw(TypeError);
+	});
+	it.skip('should register a function', function () {
+		this.db.function('add2', (a, b) => a + b);
+		expect(this.db.prepare('SELECT add2(?, ?)').pluck().get(10, 5)).to.equal(15);
+	});
+	it.skip('should work with deterministic option', function () {
+		this.db.function('det_double', { deterministic: true }, x => x * 2);
+		expect(this.db.prepare('SELECT det_double(?)').pluck().get(21)).to.equal(42);
+	});
+	it.skip('should work with varargs option', function () {
+		this.db.function('varsum', { varargs: true }, (...args) => args.reduce((a, b) => a + b, 0));
+		expect(this.db.prepare('SELECT varsum(1, 2, 3, 4, 5)').pluck().get()).to.equal(15);
+	});
+	it.skip('should handle null parameters', function () {
+		this.db.function('isnull', x => x === null ? 1 : 0);
+		expect(this.db.prepare('SELECT isnull(NULL)').pluck().get()).to.equal(1);
+		expect(this.db.prepare('SELECT isnull(5)').pluck().get()).to.equal(0);
+	});
+	it.skip('should handle buffer parameters', function () {
+		this.db.function('buflen', x => x ? x.length : 0);
+		expect(this.db.prepare('SELECT buflen(?)').pluck().get(Buffer.alloc(10))).to.equal(10);
+	});
+	it.skip('should propagate errors', function () {
+		this.db.function('throwit', () => { throw new Error('test error'); });
+		expect(() => this.db.prepare('SELECT throwit()').get()).to.throw('test error');
+	});
+});
+
+// ============================================================================
+// Database#aggregate() tests (from 33.database.aggregate.js)
+// TODO: Implement user-defined aggregates
+// ============================================================================
+describe('Database#aggregate()', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+		this.db.exec('CREATE TABLE entries (value INTEGER)');
+		this.db.exec('INSERT INTO entries VALUES (1), (2), (3), (4), (5)');
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it.skip('should throw if name is not a string', function () {
+		expect(() => this.db.aggregate(null, { step: () => {} })).to.throw(TypeError);
+	});
+	it.skip('should throw if options.step is not a function', function () {
+		expect(() => this.db.aggregate('foo', {})).to.throw(TypeError);
+		expect(() => this.db.aggregate('foo', { step: null })).to.throw(TypeError);
+	});
+	it.skip('should register an aggregate function', function () {
+		this.db.aggregate('mysum', {
+			start: 0,
+			step: (acc, val) => acc + val,
+		});
+		expect(this.db.prepare('SELECT mysum(value) FROM entries').pluck().get()).to.equal(15);
+	});
+	it.skip('should support result transformer', function () {
+		this.db.aggregate('myavg', {
+			start: () => ({ sum: 0, count: 0 }),
+			step: (acc, val) => { acc.sum += val; acc.count++; return acc; },
+			result: acc => acc.sum / acc.count,
+		});
+		expect(this.db.prepare('SELECT myavg(value) FROM entries').pluck().get()).to.equal(3);
+	});
+	it.skip('should support inverse for window functions', function () {
+		this.db.aggregate('movsum', {
+			start: 0,
+			step: (acc, val) => acc + val,
+			inverse: (acc, val) => acc - val,
+		});
+		const rows = this.db.prepare(`
+			SELECT movsum(value) OVER (ORDER BY rowid ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) as ms
+			FROM entries
+		`).pluck().all();
+		expect(rows).to.deep.equal([1, 3, 5, 7, 9]);
+	});
+});
+
+// ============================================================================
+// Database#table() tests (from 34.database.table.js)
+// TODO: Implement virtual tables
+// ============================================================================
+describe('Database#table()', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it.skip('should throw if name is not a string', function () {
+		expect(() => this.db.table(null, { columns: ['x'], *rows() {} })).to.throw(TypeError);
+	});
+	it.skip('should throw if columns is not an array', function () {
+		expect(() => this.db.table('foo', { *rows() {} })).to.throw(TypeError);
+	});
+	it.skip('should throw if rows is not a generator', function () {
+		expect(() => this.db.table('foo', { columns: ['x'], rows: () => [] })).to.throw(TypeError);
+	});
+	it.skip('should register a virtual table', function () {
+		this.db.table('nums', {
+			columns: ['value'],
+			*rows() {
+				yield [1];
+				yield [2];
+				yield [3];
+			}
+		});
+		const rows = this.db.prepare('SELECT * FROM nums').pluck().all();
+		expect(rows).to.deep.equal([1, 2, 3]);
+	});
+	it.skip('should support parameters', function () {
+		this.db.table('range', {
+			columns: ['value'],
+			parameters: ['start', 'end'],
+			*rows(start, end) {
+				for (let i = start; i <= end; i++) {
+					yield [i];
+				}
+			}
+		});
+		const rows = this.db.prepare('SELECT * FROM range(1, 5)').pluck().all();
+		expect(rows).to.deep.equal([1, 2, 3, 4, 5]);
+	});
+});
+
+// ============================================================================
+// Database#backup() tests (from 36.database.backup.js)
+// TODO: Implement database backup
+// ============================================================================
+describe('Database#backup()', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+		this.db.exec('CREATE TABLE entries (a TEXT)');
+		this.db.exec("INSERT INTO entries VALUES ('hello')");
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it.skip('should throw if destination is not a string', function () {
+		expect(() => this.db.backup()).to.throw(TypeError);
+		expect(() => this.db.backup(null)).to.throw(TypeError);
+		expect(() => this.db.backup(123)).to.throw(TypeError);
+	});
+	it.skip('should throw if destination is empty', function () {
+		expect(() => this.db.backup('')).to.throw(TypeError);
+		expect(() => this.db.backup('   ')).to.throw(TypeError);
+	});
+	it.skip('should return a promise', function () {
+		const promise = this.db.backup(util.next());
+		expect(promise).to.be.a('promise');
+		return promise;
+	});
+	it.skip('should backup the database', async function () {
+		const dest = util.next();
+		await this.db.backup(dest);
+		const db2 = new Database(dest);
+		const rows = db2.prepare('SELECT * FROM entries').all();
+		expect(rows.length).to.equal(1);
+		expect(rows[0].a).to.equal('hello');
+		db2.close();
+	});
+	it.skip('should support progress callback', async function () {
+		let called = false;
+		await this.db.backup(util.next(), {
+			progress: ({ totalPages, remainingPages }) => {
+				called = true;
+				expect(totalPages).to.be.a('number');
+				expect(remainingPages).to.be.a('number');
+			}
+		});
+		expect(called).to.be.true;
+	});
+});
+
+// ============================================================================
+// Database#serialize() tests (from 37.database.serialize.js)
+// TODO: Implement database serialization
+// ============================================================================
+describe('Database#serialize()', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+		this.db.exec('CREATE TABLE entries (a TEXT)');
+		this.db.exec("INSERT INTO entries VALUES ('hello')");
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it.skip('should return a Buffer', function () {
+		const buffer = this.db.serialize();
+		expect(buffer).to.be.an.instanceof(Buffer);
+	});
+	it.skip('should create a valid database from serialized buffer', function () {
+		const buffer = this.db.serialize();
+		const db2 = new Database(buffer);
+		const rows = db2.prepare('SELECT * FROM entries').all();
+		expect(rows.length).to.equal(1);
+		expect(rows[0].a).to.equal('hello');
+		db2.close();
+	});
+	it.skip('should support readonly option', function () {
+		const buffer = this.db.serialize();
+		const db2 = new Database(buffer, { readonly: true });
+		expect(() => db2.exec("INSERT INTO entries VALUES ('world')")).to.throw(Database.SqliteError);
+		db2.close();
+	});
+});
+
+// ============================================================================
+// Database#loadExtension() tests (from 35.database.load-extension.js)
+// TODO: Implement extension loading
+// ============================================================================
+describe('Database#loadExtension()', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it.skip('should throw if path is not a string', function () {
+		expect(() => this.db.loadExtension()).to.throw(TypeError);
+		expect(() => this.db.loadExtension(null)).to.throw(TypeError);
+		expect(() => this.db.loadExtension(123)).to.throw(TypeError);
+	});
+	it.skip('should throw if extension file does not exist', function () {
+		expect(() => this.db.loadExtension('/nonexistent/path.so')).to.throw(Database.SqliteError);
+	});
+});
+
+// ============================================================================
+// BigInt tests (from 40.bigints.js)
+// TODO: Implement BigInt support with safeIntegers
+// ============================================================================
+describe('BigInts', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+		this.db.exec('CREATE TABLE entries (a INTEGER)');
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it.skip('should accept BigInt as bound parameter', function () {
+		this.db.prepare('INSERT INTO entries VALUES (?)').run(123n);
+		const row = this.db.prepare('SELECT * FROM entries').get();
+		expect(row.a).to.equal(123);
+	});
+	it.skip('should return BigInt with safeIntegers enabled', function () {
+		this.db.prepare('INSERT INTO entries VALUES (?)').run(9007199254740993n);
+		const stmt = this.db.prepare('SELECT * FROM entries');
+		stmt.safeIntegers(true);
+		const row = stmt.get();
+		expect(row.a).to.equal(9007199254740993n);
+	});
+	it.skip('should toggle safeIntegers per statement', function () {
+		this.db.prepare('INSERT INTO entries VALUES (?)').run(9007199254740993n);
+		const stmt = this.db.prepare('SELECT * FROM entries');
+		expect(stmt.get().a).to.equal(9007199254740992); // loses precision
+		stmt.safeIntegers(true);
+		expect(stmt.get().a).to.equal(9007199254740993n);
+		stmt.safeIntegers(false);
+		expect(stmt.get().a).to.equal(9007199254740992);
+	});
+	it.skip('should support defaultSafeIntegers on database', function () {
+		this.db.defaultSafeIntegers(true);
+		this.db.prepare('INSERT INTO entries VALUES (?)').run(9007199254740993n);
+		const row = this.db.prepare('SELECT * FROM entries').get();
+		expect(row.a).to.equal(9007199254740993n);
+	});
+});
+
+// ============================================================================
+// Database#unsafeMode() tests (from 45.unsafe-mode.js)
+// TODO: Implement unsafe mode
+// ============================================================================
+describe('Database#unsafeMode()', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+		this.db.exec('CREATE TABLE foo (x INTEGER)');
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it.skip('should block unsafe operations by default', function () {
+		const read = this.db.prepare('SELECT 5');
+		const write = this.db.prepare('INSERT INTO foo VALUES (0)');
+		for (const row of read.iterate()) {
+			expect(() => write.run()).to.throw(TypeError);
+			expect(() => this.db.exec('SELECT 1')).to.throw(TypeError);
+		}
+	});
+	it.skip('should allow unsafe operations when enabled', function () {
+		this.db.unsafeMode(true);
+		const read = this.db.prepare('SELECT 5');
+		const write = this.db.prepare('INSERT INTO foo VALUES (0)');
+		for (const row of read.iterate()) {
+			expect(() => write.run()).to.not.throw();
+		}
+	});
+	it.skip('should toggle unsafe mode', function () {
+		expect(this.db.unsafeMode()).to.be.false;
+		this.db.unsafeMode(true);
+		expect(this.db.unsafeMode()).to.be.true;
+		this.db.unsafeMode(false);
+		expect(this.db.unsafeMode()).to.be.false;
+	});
+});
+
+// ============================================================================
+// WAL Checkpoint tests (from 31.database.checkpoint.js)
+// ============================================================================
+describe('WAL Checkpoint', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+		this.db.pragma('journal_mode = WAL');
+		this.db.exec('CREATE TABLE entries (a TEXT, b INTEGER)');
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it('should set journal mode to WAL', function () {
+		const mode = this.db.pragma('journal_mode', { simple: true });
+		expect(mode).to.equal('wal');
+	});
+	it.skip('should checkpoint the WAL file', function () {
+		for (let i = 0; i < 100; i++) {
+			this.db.prepare('INSERT INTO entries VALUES (?, ?)').run('test', i);
+		}
+		this.db.pragma('wal_checkpoint(RESTART)');
+		// WAL should be reset after checkpoint
+	});
+});
+
+// ============================================================================
+// Statement#expand() tests
+// TODO: Implement expand for table-prefixed column names
+// ============================================================================
+describe('Statement#expand()', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+		this.db.exec('CREATE TABLE users (id INTEGER, name TEXT)');
+		this.db.exec('CREATE TABLE posts (id INTEGER, user_id INTEGER, title TEXT)');
+		this.db.exec("INSERT INTO users VALUES (1, 'Alice')");
+		this.db.exec("INSERT INTO posts VALUES (1, 1, 'Hello World')");
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it.skip('should return nested objects with table prefixes', function () {
+		const stmt = this.db.prepare('SELECT users.id, users.name, posts.title FROM users JOIN posts ON users.id = posts.user_id');
+		const row = stmt.expand().get();
+		expect(row).to.deep.equal({
+			users: { id: 1, name: 'Alice' },
+			posts: { title: 'Hello World' }
+		});
+	});
+	it.skip('should toggle expand mode', function () {
+		const stmt = this.db.prepare('SELECT users.id, users.name FROM users');
+		expect(stmt.expand(true).get()).to.have.property('users');
+		expect(stmt.expand(false).get()).to.not.have.property('users');
+	});
+});
+
+// ============================================================================
+// Named parameters tests
+// ============================================================================
+describe('Named parameters', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+		this.db.exec('CREATE TABLE entries (a TEXT, b INTEGER)');
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it('should accept named parameters with $', function () {
+		this.db.prepare('INSERT INTO entries VALUES ($name, $age)').run({ name: 'Alice', age: 30 });
+		const row = this.db.prepare('SELECT * FROM entries').get();
+		expect(row).to.deep.equal({ a: 'Alice', b: 30 });
+	});
+	it('should accept named parameters with @', function () {
+		this.db.prepare('INSERT INTO entries VALUES (@name, @age)').run({ name: 'Bob', age: 25 });
+		const row = this.db.prepare('SELECT * FROM entries').get();
+		expect(row).to.deep.equal({ a: 'Bob', b: 25 });
+	});
+	it('should accept named parameters with :', function () {
+		this.db.prepare('INSERT INTO entries VALUES (:name, :age)').run({ name: 'Carol', age: 35 });
+		const row = this.db.prepare('SELECT * FROM entries').get();
+		expect(row).to.deep.equal({ a: 'Carol', b: 35 });
+	});
+});
+
+// ============================================================================
+// Miscellaneous tests (from 50.misc.js)
+// ============================================================================
+describe('Miscellaneous', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+		this.db.exec('CREATE TABLE foo (x INTEGER, y TEXT, z REAL)');
+		this.db.exec("INSERT INTO foo VALUES (1, 'a', 1.1), (2, 'b', 2.2), (3, 'c', 3.3)");
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it('should support LIMIT in DELETE', function () {
+		// SQLite needs to be compiled with SQLITE_ENABLE_UPDATE_DELETE_LIMIT for this
+		// which most distributions have, but we'll skip if not supported
+		try {
+			const info = this.db.prepare('DELETE FROM foo ORDER BY x ASC LIMIT 1').run();
+			expect(info.changes).to.equal(1);
+			const rows = this.db.prepare('SELECT * FROM foo').all();
+			expect(rows.length).to.equal(2);
+			expect(rows[0].x).to.equal(2);
+		} catch (e) {
+			if (e.message.includes('syntax error') || e.code === 'SQLITE_ERROR') {
+				this.skip(); // LIMIT not supported in DELETE
+			}
+			throw e;
+		}
+	});
+	it('should support LIMIT in UPDATE', function () {
+		try {
+			const info = this.db.prepare('UPDATE foo SET y = ? ORDER BY x DESC LIMIT 2').run('updated');
+			expect(info.changes).to.equal(2);
+			const rows = this.db.prepare('SELECT * FROM foo ORDER BY x').all();
+			expect(rows[0].y).to.equal('a');
+			expect(rows[1].y).to.equal('updated');
+			expect(rows[2].y).to.equal('updated');
+		} catch (e) {
+			if (e.message.includes('syntax error') || e.code === 'SQLITE_ERROR') {
+				this.skip();
+			}
+			throw e;
+		}
+	});
+	it('should handle high-throughput inserts', function () {
+		this.timeout(5000);
+		this.db.exec('CREATE TABLE perf (a INTEGER, b TEXT, c REAL)');
+		const insert = this.db.prepare('INSERT INTO perf VALUES (?, ?, ?)');
+		const insertMany = this.db.transaction((rows) => {
+			for (const row of rows) {
+				insert.run(row.a, row.b, row.c);
+			}
+		});
+		const rows = [];
+		for (let i = 0; i < 1000; i++) {
+			rows.push({ a: i, b: `text${i}`, c: i * 0.1 });
+		}
+		insertMany(rows);
+		const count = this.db.prepare('SELECT COUNT(*) as cnt FROM perf').get();
+		expect(count.cnt).to.equal(1000);
+	});
+});
+
+// ============================================================================
+// Verbose mode tests (from 43.verbose.js)
+// TODO: Implement verbose callback
+// ============================================================================
+describe('Verbose mode', function () {
+	it.skip('should call verbose callback for each statement', function () {
+		const statements = [];
+		const db = new Database(':memory:', {
+			verbose: (sql) => statements.push(sql)
+		});
+		db.exec('CREATE TABLE foo (x INTEGER)');
+		db.prepare('INSERT INTO foo VALUES (?)').run(42);
+		db.prepare('SELECT * FROM foo').all();
+		db.close();
+		expect(statements).to.have.lengthOf(3);
+	});
+});
+
+// ============================================================================
+// Worker threads tests (from 44.worker-threads.js)
+// TODO: Verify worker thread safety
+// ============================================================================
+describe('Worker threads', function () {
+	it.skip('should work in worker threads', function () {
+		// This would require actually spawning a worker thread
+		// and verifying database operations work correctly
+	});
+});
+
+// ============================================================================
+// Database integrity tests (from 42.integrity.js)
+// ============================================================================
+describe('Database integrity', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+		this.db.exec('CREATE TABLE entries (a TEXT, b INTEGER)');
+		for (let i = 0; i < 100; i++) {
+			this.db.exec(`INSERT INTO entries VALUES ('item${i}', ${i})`);
+		}
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it('should pass integrity check', function () {
+		const result = this.db.pragma('integrity_check', { simple: true });
+		expect(result).to.equal('ok');
+	});
+	it('should pass quick check', function () {
+		const result = this.db.pragma('quick_check', { simple: true });
+		expect(result).to.equal('ok');
+	});
+});

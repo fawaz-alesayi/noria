@@ -9,6 +9,10 @@
 const fs = require('fs');
 const path = require('path');
 
+// Load native binding from the generated file
+const nativeBinding = require('./native.js');
+const NativeDatabase = nativeBinding.Database;
+
 // Symbol for storing native binding
 const cppdb = Symbol('cppdb');
 
@@ -33,54 +37,6 @@ function SqliteError(message, code) {
 Object.setPrototypeOf(SqliteError, Error);
 Object.setPrototypeOf(SqliteError.prototype, Error.prototype);
 Object.defineProperty(SqliteError.prototype, 'name', { value: 'SqliteError', writable: true, enumerable: false, configurable: true });
-
-// Load native binding
-let nativeBinding = null;
-
-function loadNativeBinding() {
-	const { platform, arch } = process;
-
-	// Platform-specific paths
-	const platformBindings = {
-		darwin: {
-			x64: 'noria_sqlite_node.darwin-x64.node',
-			arm64: 'noria_sqlite_node.darwin-arm64.node',
-		},
-		linux: {
-			x64: 'noria_sqlite_node.linux-x64-gnu.node',
-			arm64: 'noria_sqlite_node.linux-arm64-gnu.node',
-		},
-		win32: {
-			x64: 'noria_sqlite_node.win32-x64-msvc.node',
-		},
-	};
-
-	const platformMap = platformBindings[platform];
-	if (!platformMap) {
-		throw new Error(`Unsupported platform: ${platform}`);
-	}
-
-	const bindingName = platformMap[arch];
-	if (!bindingName) {
-		throw new Error(`Unsupported architecture: ${arch} on ${platform}`);
-	}
-
-	const bindingPath = path.join(__dirname, bindingName);
-	if (fs.existsSync(bindingPath)) {
-		return require(bindingPath);
-	}
-
-	throw new Error(`Native binding not found: ${bindingPath}`);
-}
-
-try {
-	nativeBinding = loadNativeBinding();
-} catch (e) {
-	throw new Error(`Failed to load noria-sqlite native binding: ${e.message}`);
-}
-
-// Get the native Database class
-const NativeDatabase = nativeBinding.Database;
 
 // Helper to get boolean option
 function getBooleanOption(options, name) {
@@ -130,7 +86,6 @@ function Database(filenameGiven, options) {
 	const fileMustExist = getBooleanOption(options, 'fileMustExist');
 	const timeout = 'timeout' in options ? options.timeout : 5000;
 	const verbose = 'verbose' in options ? options.verbose : null;
-	const nativeBindingOpt = 'nativeBinding' in options ? options.nativeBinding : null;
 
 	// Validate interpreted options
 	if (readonly && anonymous && !buffer) {

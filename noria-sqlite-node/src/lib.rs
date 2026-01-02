@@ -307,14 +307,36 @@ impl Statement {
     #[napi(ts_args_type = "...params: any[]")]
     pub fn run(&self, params: Vec<serde_json::Value>) -> Result<RunResult> {
         let flat_params = flatten_params(&params)?;
-        let param_values = convert_params(&flat_params);
-        let param_refs: Vec<&dyn rusqlite::ToSql> =
-            param_values.iter().map(|b| b.as_ref()).collect();
 
-        let changes = self
-            .db
-            .execute(&self.sql, rusqlite::params_from_iter(&param_refs))
-            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+        let changes = if has_named_params(&flat_params) {
+            // Handle named parameters
+            if let serde_json::Value::Object(obj) = &flat_params[0] {
+                let named = extract_named_params(&self.sql, obj);
+                let conn = self.db.connection().read();
+                let mut stmt = conn.prepare(&self.sql)
+                    .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+
+                // Build named params slice - rusqlite expects &[(&str, &dyn ToSql)]
+                let named_refs: Vec<(&str, &dyn rusqlite::ToSql)> = named
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_ref()))
+                    .collect();
+
+                stmt.execute(named_refs.as_slice())
+                    .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?
+            } else {
+                0
+            }
+        } else {
+            // Handle positional parameters
+            let param_values = convert_params(&flat_params);
+            let param_refs: Vec<&dyn rusqlite::ToSql> =
+                param_values.iter().map(|b| b.as_ref()).collect();
+
+            self.db
+                .execute(&self.sql, rusqlite::params_from_iter(&param_refs))
+                .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?
+        };
 
         // Get last_insert_rowid from the connection
         let last_rowid = {
@@ -383,6 +405,7 @@ pub struct RunResult {
 }
 
 /// Flatten nested arrays in params (better-sqlite3 accepts arrays mixed with values)
+/// Also handles object params for named parameters
 fn flatten_params(params: &[serde_json::Value]) -> Result<Vec<serde_json::Value>> {
     let mut result = Vec::new();
     for param in params {
@@ -392,47 +415,101 @@ fn flatten_params(params: &[serde_json::Value]) -> Result<Vec<serde_json::Value>
                     result.push(item.clone());
                 }
             }
+            // If first param is an object with regular keys (not Buffer), it's named params
+            serde_json::Value::Object(obj) => {
+                // Check if it's a Buffer - those get passed through
+                if obj.get("type").map_or(false, |t| t == "Buffer") {
+                    result.push(param.clone());
+                } else {
+                    // It's a named params object - push it as-is for special handling
+                    result.push(param.clone());
+                }
+            }
             _ => result.push(param.clone()),
         }
     }
     Ok(result)
 }
 
+/// Check if params contains named parameters (an object that's not a Buffer)
+fn has_named_params(params: &[serde_json::Value]) -> bool {
+    if params.len() == 1 {
+        if let serde_json::Value::Object(obj) = &params[0] {
+            // It's named params if it's an object that's not a Buffer
+            return obj.get("type").map_or(true, |t| t != "Buffer");
+        }
+    }
+    false
+}
+
+/// Convert a single JSON value to rusqlite value
+fn json_to_sql_value(v: &serde_json::Value) -> Box<dyn rusqlite::ToSql> {
+    match v {
+        serde_json::Value::Null => Box::new(rusqlite::types::Null),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Box::new(i)
+            } else if let Some(f) = n.as_f64() {
+                Box::new(f)
+            } else {
+                Box::new(rusqlite::types::Null)
+            }
+        }
+        serde_json::Value::String(s) => Box::new(s.clone()),
+        serde_json::Value::Bool(b) => Box::new(*b as i64),
+        serde_json::Value::Object(obj) => {
+            // Handle Buffer-like objects
+            if let Some(serde_json::Value::String(t)) = obj.get("type") {
+                if t == "Buffer" {
+                    if let Some(serde_json::Value::Array(data)) = obj.get("data") {
+                        let bytes: Vec<u8> = data
+                            .iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect();
+                        return Box::new(bytes);
+                    }
+                }
+            }
+            Box::new(rusqlite::types::Null)
+        }
+        _ => Box::new(rusqlite::types::Null),
+    }
+}
+
+/// Extract named parameters from an object
+/// SQLite named params use $name, @name, or :name syntax
+/// rusqlite expects the full parameter name with prefix
+fn extract_named_params(sql: &str, obj: &serde_json::Map<String, serde_json::Value>) -> Vec<(String, Box<dyn rusqlite::ToSql>)> {
+    obj.iter()
+        .map(|(k, v)| {
+            // Determine what prefix the SQL uses for this parameter
+            let prefixed_name = if sql.contains(&format!("${}", k)) {
+                format!("${}", k)
+            } else if sql.contains(&format!("@{}", k)) {
+                format!("@{}", k)
+            } else if sql.contains(&format!(":{}", k)) {
+                format!(":{}", k)
+            } else {
+                // Default to $ prefix
+                format!("${}", k)
+            };
+            (prefixed_name, json_to_sql_value(v))
+        })
+        .collect()
+}
+
 /// Convert JSON values to rusqlite params.
 fn convert_params(params: &[serde_json::Value]) -> Vec<Box<dyn rusqlite::ToSql>> {
     params
         .iter()
-        .map(|v| -> Box<dyn rusqlite::ToSql> {
-            match v {
-                serde_json::Value::Null => Box::new(rusqlite::types::Null),
-                serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        Box::new(i)
-                    } else if let Some(f) = n.as_f64() {
-                        Box::new(f)
-                    } else {
-                        Box::new(rusqlite::types::Null)
-                    }
+        .filter_map(|v| {
+            // Skip objects that are named param containers (not Buffers)
+            if let serde_json::Value::Object(obj) = v {
+                if obj.get("type").map_or(true, |t| t != "Buffer") {
+                    return None; // Skip named param objects
                 }
-                serde_json::Value::String(s) => Box::new(s.clone()),
-                serde_json::Value::Bool(b) => Box::new(*b as i64),
-                serde_json::Value::Object(obj) => {
-                    // Handle Buffer-like objects
-                    if let Some(serde_json::Value::String(t)) = obj.get("type") {
-                        if t == "Buffer" {
-                            if let Some(serde_json::Value::Array(data)) = obj.get("data") {
-                                let bytes: Vec<u8> = data
-                                    .iter()
-                                    .filter_map(|v| v.as_u64().map(|n| n as u8))
-                                    .collect();
-                                return Box::new(bytes);
-                            }
-                        }
-                    }
-                    Box::new(rusqlite::types::Null)
-                }
-                _ => Box::new(rusqlite::types::Null),
             }
+            Some(json_to_sql_value(v))
         })
         .collect()
 }
