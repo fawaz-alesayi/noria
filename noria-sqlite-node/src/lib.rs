@@ -290,6 +290,38 @@ impl Database {
         })
     }
 
+    /// Serialize the database to a Buffer.
+    /// Returns the raw database bytes as a Node.js Buffer.
+    #[napi(js_name = "_serialize")]
+    pub fn serialize(&self, attached_name: Option<String>) -> Result<Buffer> {
+        if !self.is_open {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "The database connection is not open",
+            ));
+        }
+
+        let attached = attached_name.unwrap_or_else(|| "main".to_string());
+
+        let conn = self.inner.connection().read();
+
+        // Use rusqlite's serialize method
+        // For "main" database, use DatabaseName::Main
+        let db_name = if attached == "main" {
+            rusqlite::DatabaseName::Main
+        } else {
+            rusqlite::DatabaseName::Attached(&attached)
+        };
+
+        let data = conn
+            .serialize(db_name)
+            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+
+        // Data implements Deref<Target = [u8]>, so we can get bytes from it
+        let bytes: Vec<u8> = (*data).to_vec();
+        Ok(Buffer::from(bytes))
+    }
+
     /// Register a user-defined SQL function.
     /// @param fn - JavaScript function to call
     /// @param name - SQL function name

@@ -86,6 +86,11 @@ export declare class Database {
    */
   _backup(destPath: string, attachedName?: string | undefined | null): BackupProgress
   /**
+   * Serialize the database to a Buffer.
+   * Returns the raw database bytes as a Node.js Buffer.
+   */
+  _serialize(attachedName?: string | undefined | null): Buffer
+  /**
    * Register a user-defined SQL function.
    * @param fn - JavaScript function to call
    * @param name - SQL function name

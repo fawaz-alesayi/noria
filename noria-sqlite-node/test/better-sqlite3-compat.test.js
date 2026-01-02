@@ -855,10 +855,11 @@ describe('Database#serialize()', function () {
 		this.db.close();
 	});
 
-	it.skip('should return a Buffer', function () {
+	it('should return a Buffer', function () {
 		const buffer = this.db.serialize();
 		expect(buffer).to.be.an.instanceof(Buffer);
 	});
+	// Skip: requires deserialize support which is more complex
 	it.skip('should create a valid database from serialized buffer', function () {
 		const buffer = this.db.serialize();
 		const db2 = new Database(buffer);

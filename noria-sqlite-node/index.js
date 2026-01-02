@@ -376,6 +376,31 @@ Database.prototype.function = function defineFunction(name, options, fn) {
 	return this;
 };
 
+// Serialize the database to a Buffer
+Database.prototype.serialize = function serialize(options) {
+	if (options == null) options = {};
+
+	// Validate arguments
+	if (typeof options !== 'object') throw new TypeError('Expected first argument to be an options object');
+
+	// Interpret and validate options
+	const attachedName = 'attached' in options ? options.attached : 'main';
+	if (typeof attachedName !== 'string') throw new TypeError('Expected the "attached" option to be a string');
+	if (!attachedName) throw new TypeError('The "attached" option cannot be an empty string');
+
+	try {
+		return this[cppdb]._serialize(attachedName);
+	} catch (e) {
+		if (e.message && e.message.startsWith('SQLITE_')) {
+			const match = e.message.match(/^(SQLITE_\w+):\s*(.*)/);
+			if (match) {
+				throw new SqliteError(match[2] || match[1], match[1]);
+			}
+		}
+		throw e;
+	}
+};
+
 // Backup the database to a file
 Database.prototype.backup = async function backup(filename, options) {
 	if (options == null) options = {};
