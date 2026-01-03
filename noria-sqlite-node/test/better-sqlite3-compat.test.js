@@ -1226,10 +1226,8 @@ describe('Noria Acceleration', function () {
 		expect(result).to.deep.equal({ id: 1, name: 'Alice', age: 30 });
 	});
 
-	// TODO: CDC propagation for UPDATE needs more work
-	// The cache is populated on first read, but UPDATE CDC events
-	// aren't propagating to update the cached entries yet.
-	it.skip('should reflect UPDATE changes', function () {
+	// Test that UPDATE changes propagate to cached entries
+	it('should reflect UPDATE changes', function () {
 		// Insert initial data
 		this.db.prepare('INSERT INTO users VALUES (?, ?, ?)').run(1, 'Alice', 30);
 
@@ -1247,8 +1245,8 @@ describe('Noria Acceleration', function () {
 		expect(result.name).to.equal('Alicia');
 	});
 
-	// TODO: CDC propagation for DELETE needs more work
-	it.skip('should reflect DELETE changes', function () {
+	// Test that DELETE changes propagate to cached entries
+	it('should reflect DELETE changes', function () {
 		// Insert initial data
 		this.db.prepare('INSERT INTO users VALUES (?, ?, ?)').run(1, 'Alice', 30);
 

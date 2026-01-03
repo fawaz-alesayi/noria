@@ -215,6 +215,13 @@ impl NoriaEngine {
         let mut result = Vec::new();
         let mut records_to_inject = Vec::new();
 
+        // Check if key columns are already in the SQLite result.
+        // For SELECT *, the key column is already in the output (e.g., key_columns = [0]).
+        // For SELECT name, age FROM..., the key is added at the end by projection (e.g., key_columns = [2]).
+        // We only append key if the key column indices are >= the SQLite column count.
+        let key_columns = view.handle.key_columns();
+        let needs_key_append = key_columns.iter().any(|&col| col >= column_count);
+
         while let Some(row) = rows.next()? {
             let mut row_data = Vec::with_capacity(column_count);
             for i in 0..column_count {
@@ -235,13 +242,17 @@ impl NoriaEngine {
             }
             result.push(row_data.clone());
 
-            // For cache injection, we need to append the key columns to match
-            // the projected output format (which includes key columns at the end)
-            // The view was projected to include key columns for proper cache lookups
-            let mut row_for_cache = row_data;
-            for key_val in key {
-                row_for_cache.push(key_val.clone());
-            }
+            // For cache injection, only append key if it's not already in the output.
+            // This ensures row format matches what CDC produces through the dataflow.
+            let row_for_cache = if needs_key_append {
+                let mut extended = row_data;
+                for key_val in key {
+                    extended.push(key_val.clone());
+                }
+                extended
+            } else {
+                row_data
+            };
             records_to_inject.push(Record::Positive(row_for_cache));
         }
 

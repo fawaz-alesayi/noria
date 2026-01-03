@@ -151,28 +151,46 @@ impl Database {
     /// # Ok::<(), noria_sqlite::Error>(())
     /// ```
     pub fn execute<P: rusqlite::Params>(&self, sql: &str, params: P) -> Result<usize> {
-        let conn = self.conn.write();
+        // Extract events while holding the connection lock, then apply after releasing
+        let (rows_changed, events) = {
+            let conn = self.conn.write();
 
-        // Create a session to track changes
-        let mut tracker = SessionTracker::new(&conn)?;
-        tracker.attach_all()?;
+            // Create a session to track changes
+            let mut tracker = SessionTracker::new(&conn)?;
+            tracker.attach_all()?;
 
-        // Execute the statement
-        let rows_changed = conn.execute(sql, params)?;
+            // Execute the statement
+            let rows_changed = conn.execute(sql, params)?;
 
-        // Get the changeset and apply to dataflow
-        if rows_changed > 0 {
-            if let Ok(changeset) = tracker.changeset() {
-                if let Ok(events) = SessionTracker::extract_events(&changeset) {
-                    self.apply_cdc_events(&events);
-                }
-            }
+            // Get the changeset and extract events while we still have the lock
+            let events = if rows_changed > 0 {
+                tracker
+                    .changeset()
+                    .ok()
+                    .and_then(|changeset| SessionTracker::extract_events(&changeset).ok())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            (rows_changed, events)
+            // Write lock is released here
+        };
+
+        // Apply CDC events after releasing the connection lock
+        // This allows complete_row_from_db to acquire a read lock
+        if !events.is_empty() {
+            self.apply_cdc_events(&events);
         }
 
         Ok(rows_changed)
     }
 
     /// Apply CDC events to the dataflow engine.
+    ///
+    /// For UPDATE events, the session extension only provides values for changed columns.
+    /// We need complete row data for correct dataflow propagation, so we fetch the
+    /// current row from SQLite to fill in any None values.
     fn apply_cdc_events(&self, events: &[CdcEvent]) {
         for event in events {
             match event {
@@ -187,11 +205,84 @@ impl Database {
                     old_row,
                     new_row,
                 } => {
+                    // For UPDATE, session extension only provides changed columns.
+                    // Fill in None values from the current row in SQLite.
+                    let complete_new_row = self.complete_row_from_db(table, new_row);
+                    let complete_old_row = self.fill_none_from_new(old_row, &complete_new_row);
+
                     self.engine
-                        .apply_update_rows(table, old_row.clone(), new_row.clone());
+                        .apply_update_rows(table, complete_old_row, complete_new_row);
                 }
             }
         }
+    }
+
+    /// Complete a row by fetching current values from SQLite for None columns.
+    fn complete_row_from_db(&self, table: &str, partial_row: &[DataType]) -> Vec<DataType> {
+        // Find a non-None column to use as key for lookup (usually id at index 0)
+        let key_idx = partial_row.iter().position(|v| *v != DataType::None);
+        if key_idx.is_none() {
+            return partial_row.to_vec();
+        }
+        let key_idx = key_idx.unwrap();
+        let key_val = &partial_row[key_idx];
+
+        // Query the current row
+        let conn = self.conn.read();
+        let sql = format!("SELECT * FROM {} WHERE rowid = ?", table);
+
+        // For the key, we need to get the rowid. In SQLite, if the first column is INTEGER PRIMARY KEY,
+        // it's an alias for rowid. Otherwise, we need to construct the query differently.
+        // For simplicity, use the PK value directly.
+        let key_int = match key_val {
+            DataType::BigInt(v) => *v,
+            DataType::Int(v) => *v as i64,
+            _ => return partial_row.to_vec(), // Can't complete if key isn't integer
+        };
+
+        let result: rusqlite::Result<Vec<DataType>> = conn
+            .prepare(&sql)
+            .and_then(|mut stmt| {
+                stmt.query_row([key_int], |row| {
+                    let mut full_row = Vec::with_capacity(partial_row.len());
+                    for i in 0..partial_row.len() {
+                        let val = match row.get_ref(i) {
+                            Ok(rusqlite::types::ValueRef::Null) => DataType::None,
+                            Ok(rusqlite::types::ValueRef::Integer(v)) => DataType::BigInt(v),
+                            Ok(rusqlite::types::ValueRef::Real(f)) => {
+                                let int_part = f.trunc() as i64;
+                                let frac_part = ((f.fract().abs()) * 1_000_000_000.0) as i32;
+                                DataType::Real(int_part, frac_part)
+                            }
+                            Ok(rusqlite::types::ValueRef::Text(s)) => {
+                                DataType::from(std::str::from_utf8(s).unwrap_or(""))
+                            }
+                            _ => DataType::None,
+                        };
+                        full_row.push(val);
+                    }
+                    Ok(full_row)
+                })
+            });
+
+        result.unwrap_or_else(|_| partial_row.to_vec())
+    }
+
+    /// Fill None values in old_row from new_row.
+    /// After UPDATE, both old and new should have the same columns, just different values
+    /// for what changed. If old has None and new doesn't, copy the value.
+    fn fill_none_from_new(&self, old_row: &[DataType], new_row: &[DataType]) -> Vec<DataType> {
+        old_row
+            .iter()
+            .zip(new_row.iter())
+            .map(|(old, new)| {
+                if *old == DataType::None && *new != DataType::None {
+                    new.clone()
+                } else {
+                    old.clone()
+                }
+            })
+            .collect()
     }
 
     /// Execute multiple SQL statements.
