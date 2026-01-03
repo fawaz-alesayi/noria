@@ -126,17 +126,22 @@ impl Database {
             ));
         }
 
-        // Validate SQL at prepare time and get column names
-        let column_names = {
+        // Validate SQL at prepare time and get column names and table origins
+        let (column_names, column_tables) = {
             let conn = self.inner.connection().read();
             let sqlite_stmt = conn.prepare(&sql)
                 .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
 
-            // Extract column names for SELECT queries
-            let count = sqlite_stmt.column_count();
-            (0..count)
-                .filter_map(|i| sqlite_stmt.column_name(i).ok().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
+            // Extract column names and table origins using column_metadata feature
+            let metadata = sqlite_stmt.columns_with_metadata();
+            let names: Vec<String> = metadata.iter()
+                .map(|col| col.name().to_string())
+                .collect();
+            let tables: Vec<Option<String>> = metadata.iter()
+                .map(|col| col.table_name().map(|s| s.to_string()))
+                .collect();
+
+            (names, tables)
         };
 
         let stmt = self
@@ -174,6 +179,7 @@ impl Database {
             safe_ints: self.default_safe_integers,
             bound_params: None,
             column_names,
+            column_tables,
             is_cached,
         })
     }
@@ -273,8 +279,8 @@ impl Database {
         // Load the extension
         let result = unsafe {
             match entry_point {
-                Some(ep) => conn.load_extension(&path, Some(&ep)),
-                None => conn.load_extension(&path, None::<&str>),
+                Some(ep) => conn.load_extension(path.as_str(), Some(ep.as_str())),
+                None => conn.load_extension(path.as_str(), None::<&str>),
             }
         };
 
@@ -340,16 +346,9 @@ impl Database {
 
         let conn = self.inner.connection().read();
 
-        // Use rusqlite's serialize method
-        // For "main" database, use DatabaseName::Main
-        let db_name = if attached == "main" {
-            rusqlite::DatabaseName::Main
-        } else {
-            rusqlite::DatabaseName::Attached(&attached)
-        };
-
+        // Use rusqlite's serialize method with schema name as &str
         let data = conn
-            .serialize(db_name)
+            .serialize(attached.as_str())
             .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
 
         // Data implements Deref<Target = [u8]>, so we can get bytes from it
@@ -438,7 +437,7 @@ impl Database {
 
         // Register the function with SQLite
         let conn = self.inner.connection().write();
-        conn.create_scalar_function(&name, argc, flags, move |sqlite_ctx| {
+        conn.create_scalar_function(name.as_str(), argc, flags, move |sqlite_ctx| {
             let ctx = &ctx_clone;
 
             unsafe {
@@ -787,7 +786,7 @@ impl Database {
 
         // Register the aggregate function
         let conn = self.inner.connection().write();
-        conn.create_aggregate_function(&name, argc, flags, aggregate)
+        conn.create_aggregate_function(name.as_str(), argc, flags, aggregate)
             .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
 
         Ok(())
@@ -844,6 +843,8 @@ pub struct Statement {
     bound_params: Option<Vec<serde_json::Value>>,
     /// Column names for cached result conversion
     column_names: Vec<String>,
+    /// Column table names for expand mode (None if no origin table)
+    column_tables: Vec<Option<String>>,
     /// Whether this statement has a Noria view (is accelerated)
     is_cached: bool,
 }
@@ -894,6 +895,8 @@ impl Statement {
             param_values.iter().map(|b| b.as_ref()).collect();
 
         let safe_ints = self.safe_ints;
+        let expand_mode = self.expand_mode;
+        let column_tables = &self.column_tables;
 
         // Try cached path first if this query is accelerated
         if self.is_cached {
@@ -907,6 +910,9 @@ impl Statement {
                 } else if self.raw_mode {
                     // Return as array
                     cached_row_to_json_array(&row, safe_ints)
+                } else if expand_mode {
+                    // Return as nested objects grouped by table
+                    cached_row_to_json_expanded(&row, &self.column_names, column_tables, safe_ints)
                 } else {
                     // Return as object
                     cached_row_to_json_object(&row, &self.column_names, safe_ints)
@@ -916,6 +922,9 @@ impl Statement {
             // If cached path returned None (no rows), return None
             // If it returned an error, fall through to SQLite
         }
+
+        // Capture column_tables for closure
+        let column_tables_clone = column_tables.clone();
 
         // Fall back to SQLite path
         let stmt = self.inner.lock();
@@ -930,6 +939,9 @@ impl Statement {
                     arr.push(row_value_to_json(row, i, safe_ints)?);
                 }
                 Ok(serde_json::Value::Array(arr))
+            } else if expand_mode {
+                // Return as nested objects grouped by table
+                row_to_json_expanded(row, &column_tables_clone, safe_ints)
             } else {
                 // Return as object
                 let mut obj = serde_json::Map::new();
@@ -977,6 +989,8 @@ impl Statement {
             param_values.iter().map(|b| b.as_ref()).collect();
 
         let safe_ints = self.safe_ints;
+        let expand_mode = self.expand_mode;
+        let column_tables = &self.column_tables;
 
         // Try cached path first if this query is accelerated
         if self.is_cached {
@@ -990,6 +1004,8 @@ impl Statement {
                             .unwrap_or(serde_json::Value::Null)
                     } else if self.raw_mode {
                         cached_row_to_json_array(row, safe_ints)
+                    } else if expand_mode {
+                        cached_row_to_json_expanded(row, &self.column_names, column_tables, safe_ints)
                     } else {
                         cached_row_to_json_object(row, &self.column_names, safe_ints)
                     }
@@ -998,6 +1014,9 @@ impl Statement {
             }
             // Cache miss - fall through to SQLite (which will populate cache via upquery)
         }
+
+        // Capture column_tables for closure
+        let column_tables_clone = column_tables.clone();
 
         // Fall back to SQLite path
         let stmt = self.inner.lock();
@@ -1011,6 +1030,8 @@ impl Statement {
                         arr.push(row_value_to_json(row, i, safe_ints)?);
                     }
                     Ok(serde_json::Value::Array(arr))
+                } else if expand_mode {
+                    row_to_json_expanded(row, &column_tables_clone, safe_ints)
                 } else {
                     let mut obj = serde_json::Map::new();
                     for i in 0..row.as_ref().column_count() {
@@ -1403,6 +1424,72 @@ fn cached_row_to_json_object(
 fn cached_row_to_json_array(row: &[DataType], safe_ints: bool) -> serde_json::Value {
     let arr: Vec<serde_json::Value> = row.iter().map(|dt| datatype_to_json(dt, safe_ints)).collect();
     serde_json::Value::Array(arr)
+}
+
+/// Convert a cached row to JSON with nested objects grouped by table (for expand mode).
+fn cached_row_to_json_expanded(
+    row: &[DataType],
+    column_names: &[String],
+    column_tables: &[Option<String>],
+    safe_ints: bool,
+) -> serde_json::Value {
+    let mut tables: std::collections::HashMap<String, serde_json::Map<String, serde_json::Value>> =
+        std::collections::HashMap::new();
+
+    for (i, dt) in row.iter().enumerate() {
+        let col_name = column_names.get(i)
+            .map(|s| s.clone())
+            .unwrap_or_else(|| format!("col{}", i));
+
+        let table_name = column_tables.get(i)
+            .and_then(|t| t.clone())
+            .unwrap_or_else(|| "$".to_string()); // Use "$" for columns without table origin
+
+        let value = datatype_to_json(dt, safe_ints);
+
+        tables.entry(table_name)
+            .or_insert_with(serde_json::Map::new)
+            .insert(col_name, value);
+    }
+
+    // Convert HashMap to JSON object
+    let mut obj = serde_json::Map::new();
+    for (table, cols) in tables {
+        obj.insert(table, serde_json::Value::Object(cols));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Convert a rusqlite row to JSON with nested objects grouped by table (for expand mode).
+fn row_to_json_expanded(
+    row: &rusqlite::Row,
+    column_tables: &[Option<String>],
+    safe_ints: bool,
+) -> rusqlite::Result<serde_json::Value> {
+    let mut tables: std::collections::HashMap<String, serde_json::Map<String, serde_json::Value>> =
+        std::collections::HashMap::new();
+
+    for i in 0..row.as_ref().column_count() {
+        let default_name = format!("col{}", i);
+        let col_name = row.as_ref().column_name(i).unwrap_or(&default_name).to_string();
+
+        let table_name = column_tables.get(i)
+            .and_then(|t| t.clone())
+            .unwrap_or_else(|| "$".to_string()); // Use "$" for columns without table origin
+
+        let value = row_value_to_json(row, i, safe_ints)?;
+
+        tables.entry(table_name)
+            .or_insert_with(serde_json::Map::new)
+            .insert(col_name, value);
+    }
+
+    // Convert HashMap to JSON object
+    let mut obj = serde_json::Map::new();
+    for (table, cols) in tables {
+        obj.insert(table, serde_json::Value::Object(cols));
+    }
+    Ok(serde_json::Value::Object(obj))
 }
 
 /// Convert serde_json params to noria::DataType keys for cache lookup.

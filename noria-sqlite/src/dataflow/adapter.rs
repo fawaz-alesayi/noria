@@ -71,10 +71,10 @@ impl SqliteAdapter {
         // Use PRAGMA table_info to get column information
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table_name))?;
         let column_iter = stmt.query_map([], |row| {
-            let cid: usize = row.get(0)?;
+            let cid: i64 = row.get(0)?;
             let name: String = row.get(1)?;
             let pk: bool = row.get(5)?;
-            Ok((cid, name, pk))
+            Ok((cid as usize, name, pk))
         })?;
 
         for col_result in column_iter {

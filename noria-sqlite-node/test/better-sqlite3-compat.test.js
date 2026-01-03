@@ -1018,7 +1018,7 @@ describe('Statement#expand()', function () {
 		this.db.close();
 	});
 
-	it.skip('should return nested objects with table prefixes', function () {
+	it('should return nested objects with table prefixes', function () {
 		const stmt = this.db.prepare('SELECT users.id, users.name, posts.title FROM users JOIN posts ON users.id = posts.user_id');
 		const row = stmt.expand().get();
 		expect(row).to.deep.equal({
@@ -1026,7 +1026,7 @@ describe('Statement#expand()', function () {
 			posts: { title: 'Hello World' }
 		});
 	});
-	it.skip('should toggle expand mode', function () {
+	it('should toggle expand mode', function () {
 		const stmt = this.db.prepare('SELECT users.id, users.name FROM users');
 		expect(stmt.expand(true).get()).to.have.property('users');
 		expect(stmt.expand(false).get()).to.not.have.property('users');

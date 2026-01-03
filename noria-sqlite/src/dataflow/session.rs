@@ -86,14 +86,14 @@ impl<'conn> SessionTracker<'conn> {
 
     /// Attach a table to track changes.
     pub fn attach_table(&mut self, table: &str) -> rusqlite::Result<()> {
-        self.session.attach(Some(table))?;
+        self.session.attach::<&str>(Some(table))?;
         self.attached_tables.insert(table.to_string());
         Ok(())
     }
 
     /// Attach all tables in the database.
     pub fn attach_all(&mut self) -> rusqlite::Result<()> {
-        self.session.attach(None)?;
+        self.session.attach::<&str>(None)?;
         Ok(())
     }
 
