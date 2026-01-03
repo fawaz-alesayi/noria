@@ -702,7 +702,7 @@ describe('Database#aggregate()', function () {
 		expect(this.db.prepare('SELECT myavg(value) FROM entries').pluck().get()).to.equal(3);
 	});
 	// Window functions require WindowAggregate trait in rusqlite which is more complex
-	it.skip('should support inverse for window functions', function () {
+	it('should support inverse for window functions', function () {
 		this.db.aggregate('movsum', {
 			start: 0,
 			step: (acc, val) => acc + val,

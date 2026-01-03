@@ -775,6 +775,120 @@ impl Database {
             }
         }
 
+        // Implement WindowAggregate for window functions (when inverse is provided)
+        impl rusqlite::functions::WindowAggregate<Accumulator, rusqlite::types::Value> for JsAggregate {
+            fn value(&self, acc: Option<&mut Accumulator>) -> rusqlite::Result<rusqlite::types::Value> {
+                unsafe {
+                    let env = self.ctx.raw_env;
+
+                    match acc {
+                        Some(a) => {
+                            let current_acc = &a.value;
+
+                            // If we have a result function, call it
+                            if !self.ctx.result_ref.is_null() {
+                                let acc_napi = rusqlite_value_to_napi(env, current_acc)?;
+
+                                let mut result_fn: sys::napi_value = std::ptr::null_mut();
+                                sys::napi_get_reference_value(env, self.ctx.result_ref, &mut result_fn);
+
+                                let mut undefined: sys::napi_value = std::ptr::null_mut();
+                                sys::napi_get_undefined(env, &mut undefined);
+
+                                let mut result: sys::napi_value = std::ptr::null_mut();
+                                let status = sys::napi_call_function(
+                                    env,
+                                    undefined,
+                                    result_fn,
+                                    1,
+                                    &acc_napi,
+                                    &mut result,
+                                );
+
+                                if status != sys::Status::napi_ok {
+                                    return Err(rusqlite::Error::UserFunctionError(Box::new(
+                                        std::io::Error::new(std::io::ErrorKind::Other, "Failed to call result function"),
+                                    )));
+                                }
+                                napi_value_to_rusqlite_value(env, result)
+                            } else {
+                                Ok(current_acc.clone())
+                            }
+                        }
+                        None => Ok(rusqlite::types::Value::Null),
+                    }
+                }
+            }
+
+            fn inverse(&self, sqlite_ctx: &mut rusqlite::functions::Context<'_>, acc: &mut Accumulator) -> rusqlite::Result<()> {
+                unsafe {
+                    let env = self.ctx.raw_env;
+
+                    // Check if we have an inverse function
+                    if self.ctx.inverse_ref.is_null() {
+                        return Err(rusqlite::Error::UserFunctionError(Box::new(
+                            std::io::Error::new(std::io::ErrorKind::Other, "No inverse function provided"),
+                        )));
+                    }
+
+                    // Get the inverse function
+                    let mut inverse_fn: sys::napi_value = std::ptr::null_mut();
+                    sys::napi_get_reference_value(env, self.ctx.inverse_ref, &mut inverse_fn);
+
+                    // Convert current accumulator to NAPI value
+                    let acc_napi = rusqlite_value_to_napi(env, &acc.value)?;
+
+                    // Build args: (accumulator, ...sqlite_values)
+                    let arg_count = sqlite_ctx.len() + 1;
+                    let mut napi_args: Vec<sys::napi_value> = Vec::with_capacity(arg_count);
+                    napi_args.push(acc_napi);
+
+                    for i in 0..sqlite_ctx.len() {
+                        let napi_val = sqlite_value_to_napi(env, sqlite_ctx.get_raw(i), self.ctx.safe_ints)?;
+                        napi_args.push(napi_val);
+                    }
+
+                    // Call inverse(acc, ...values)
+                    let mut undefined: sys::napi_value = std::ptr::null_mut();
+                    sys::napi_get_undefined(env, &mut undefined);
+
+                    let mut result: sys::napi_value = std::ptr::null_mut();
+                    let status = sys::napi_call_function(
+                        env,
+                        undefined,
+                        inverse_fn,
+                        arg_count,
+                        napi_args.as_ptr(),
+                        &mut result,
+                    );
+
+                    if status != sys::Status::napi_ok {
+                        let mut is_pending = false;
+                        sys::napi_is_exception_pending(env, &mut is_pending);
+                        if is_pending {
+                            let mut exception: sys::napi_value = std::ptr::null_mut();
+                            sys::napi_get_and_clear_last_exception(env, &mut exception);
+                        }
+                        return Err(rusqlite::Error::UserFunctionError(Box::new(
+                            std::io::Error::new(std::io::ErrorKind::Other, "Failed to call inverse function"),
+                        )));
+                    }
+
+                    // Update accumulator with new value (if inverse returned something)
+                    let mut value_type: sys::napi_valuetype = sys::ValueType::napi_undefined;
+                    sys::napi_typeof(env, result, &mut value_type);
+
+                    if value_type != sys::ValueType::napi_undefined {
+                        // Convert result back to rusqlite Value and update accumulator
+                        let new_value = napi_value_to_rusqlite_value(env, result)?;
+                        acc.value = new_value;
+                    }
+
+                    Ok(())
+                }
+            }
+        }
+
         let ctx = Arc::new(AggregateContext {
             raw_env,
             start_ref,
@@ -788,10 +902,15 @@ impl Database {
 
         let aggregate = JsAggregate { ctx };
 
-        // Register the aggregate function
+        // Register as window function if inverse is provided, otherwise as regular aggregate
         let conn = self.inner.connection().write();
-        conn.create_aggregate_function(name.as_str(), argc, flags, aggregate)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+        if inverse.is_some() {
+            conn.create_window_function(name.as_str(), argc, flags, aggregate)
+                .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+        } else {
+            conn.create_aggregate_function(name.as_str(), argc, flags, aggregate)
+                .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+        }
 
         Ok(())
     }

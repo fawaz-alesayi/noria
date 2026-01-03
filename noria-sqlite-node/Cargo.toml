@@ -20,7 +20,7 @@ napi = { version = "2", features = ["napi9", "serde-json"] }
 napi-derive = "2"
 
 # SQLite bindings (re-export for type conversions)
-rusqlite = { version = "0.38.0", features = ["bundled", "column_decltype", "column_metadata"] }
+rusqlite = { version = "0.38.0", features = ["bundled", "column_decltype", "column_metadata", "window"] }
 
 # JSON serialization
 serde = "1.0"
