@@ -143,31 +143,26 @@ Therefore, `noria-sqlite` will use a **Bundled Strategy**:
 
 ### 8.2 Known Limitations & TODOs
 
-1. **Transaction-Aware CDC**
-   - CDC currently tracks changes before transaction commit
-   - Transaction rollback doesn't properly invalidate cache entries
-   - Should capture changeset only on COMMIT
-
-2. **Named Parameters CDC**
+1. **Named Parameters CDC**
    - Named parameters ($name, @name, :name) bypass CDC path
    - Should route through Database#execute() for proper tracking
 
-3. **Complex Query Support**
+2. **Complex Query Support**
    - JOINs are parsed but may have edge cases
    - Subqueries not fully supported in SQL converter
    - Window functions not implemented
 
-4. **Eviction Strategy**
+3. **Eviction Strategy**
    - Random eviction not yet implemented
    - Memory limits not enforced
    - Views can grow unbounded in memory
 
 ### 8.3 Impact Assessment
 
-**Current Score: 8.5/10**
+**Current Score: 9/10**
 
 The library now provides:
-- ✅ A working better-sqlite3 drop-in replacement (101 tests passing)
+- ✅ A working better-sqlite3 drop-in replacement (102 tests passing)
 - ✅ Session-based CDC infrastructure (fully working)
 - ✅ Full dataflow operators (Filter, Project, Join, Aggregate)
 - ✅ Incremental update propagation for INSERT/UPDATE/DELETE operations
@@ -176,9 +171,9 @@ The library now provides:
 - ✅ O(1) cache hits from evmap-backed views
 - ✅ CDC propagation correctly updates cached view entries
 - ✅ Introspection API for cache statistics (db.cacheStats())
+- ✅ Transaction-aware CDC (events buffered until COMMIT, discarded on ROLLBACK)
 
 Remaining work:
-- Add transaction-aware CDC (only track on commit)
 - Implement random eviction with memory limits
 
 **In essence**: The core Noria value proposition is now fully working. Parameterized SELECT
@@ -316,8 +311,8 @@ The user's assumption regarding views is technically correct but practically sol
 4. ~~Implement dynamic view synthesis for prepared statements~~ ✅
 5. ~~Fix UPDATE/DELETE CDC propagation to cached view entries~~ ✅
 6. ~~Add introspection API for cache statistics (db.cacheStats())~~ ✅
+7. ~~Add transaction-aware CDC (buffer events, apply on COMMIT, discard on ROLLBACK)~~ ✅
 
 **Next Steps** (in priority order):
-1. Add transaction-aware CDC (capture changeset only on COMMIT)
-2. Implement random eviction with memory limits
-3. Support more complex SQL patterns (subqueries, window functions)
+1. Implement random eviction with memory limits
+2. Support more complex SQL patterns (subqueries, window functions)
