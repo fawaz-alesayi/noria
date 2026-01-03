@@ -4,7 +4,9 @@
 //! with transparent incremental view maintenance powered by Noria.
 
 use napi::bindgen_prelude::*;
+use napi::sys;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::NapiRaw;
 use napi_derive::napi;
 use noria_sqlite::{Database as NoriaDatabase, Statement as NoriaStatement};
 use parking_lot::Mutex;
@@ -329,9 +331,14 @@ impl Database {
     /// @param safe_ints - Whether to use BigInt for integers (0=false, 1=true, 2=inherit)
     /// @param deterministic - Whether function is deterministic
     /// @param direct_only - Whether function can only be called directly (not from triggers/views)
+    ///
+    /// This uses raw NAPI calls similar to how better-sqlite3 uses raw V8 calls.
+    /// Since SQLite runs on the main Node.js thread, we can call JS functions
+    /// directly without ThreadsafeFunction.
     #[napi(js_name = "_registerFunction")]
     pub fn register_function(
         &self,
+        env: Env,
         #[napi(ts_arg_type = "(...args: any[]) => any")] callback: JsFunction,
         name: String,
         argc: i32,
@@ -346,19 +353,18 @@ impl Database {
             ));
         }
 
-        // We'll store the channel sender alongside the args
-        type CallArgs = (Vec<serde_json::Value>, mpsc::Sender<serde_json::Value>);
+        // Store raw NAPI pointers - similar to how better-sqlite3 stores v8::Isolate*
+        // This is safe because SQLite callbacks run on the same thread as Node.js
+        let raw_env = env.raw();
 
-        // Create a threadsafe function from the callback
-        // The callback receives args as Vec<serde_json::Value> and returns serde_json::Value
-        let tsfn: ThreadsafeFunction<CallArgs, ErrorStrategy::Fatal> = callback
-            .create_threadsafe_function(0, |ctx| {
-                // ctx.value is (args, sender)
-                // We return just the args to be passed to the JS function
-                // The sender is used later in call_with_return_value
-                let (args, _sender) = ctx.value;
-                Ok(args)
-            })?;
+        // Create a reference to the function so it won't be garbage collected
+        let mut fn_ref: sys::napi_ref = std::ptr::null_mut();
+        unsafe {
+            let status = sys::napi_create_reference(raw_env, callback.raw(), 1, &mut fn_ref);
+            if status != sys::Status::napi_ok {
+                return Err(Error::new(Status::GenericFailure, "Failed to create function reference"));
+            }
+        }
 
         // Determine the effective safe_ints setting
         let use_safe_ints = if safe_ints == 2 {
@@ -376,47 +382,85 @@ impl Database {
             flags |= FunctionFlags::SQLITE_DIRECTONLY;
         }
 
-        let tsfn = Arc::new(tsfn);
-        let tsfn_clone = tsfn.clone();
+        // Create a closure context that holds the raw pointers
+        // This is similar to better-sqlite3's CustomFunction class
+        struct FunctionContext {
+            raw_env: sys::napi_env,
+            fn_ref: sys::napi_ref,
+            safe_ints: bool,
+        }
+
+        // SAFETY: These pointers are valid for the lifetime of the database connection
+        // because SQLite runs on the same thread as Node.js and we hold a reference
+        unsafe impl Send for FunctionContext {}
+        unsafe impl Sync for FunctionContext {}
+
+        let ctx = Arc::new(FunctionContext {
+            raw_env,
+            fn_ref,
+            safe_ints: use_safe_ints,
+        });
+
+        let ctx_clone = ctx.clone();
 
         // Register the function with SQLite
         let conn = self.inner.connection().write();
-        conn.create_scalar_function(&name, argc, flags, move |ctx| {
-            // Convert SQLite arguments to JSON for JavaScript
-            let mut args = Vec::with_capacity(ctx.len());
-            for i in 0..ctx.len() {
-                let value = sqlite_value_to_json(ctx.get_raw(i), use_safe_ints);
-                args.push(value);
-            }
+        conn.create_scalar_function(&name, argc, flags, move |sqlite_ctx| {
+            let ctx = &ctx_clone;
 
-            // Create a channel for this invocation
-            let (tx, rx) = mpsc::channel();
-            let tx_for_callback = tx.clone();
+            unsafe {
+                // Get the function from the reference
+                let mut js_fn: sys::napi_value = std::ptr::null_mut();
+                let status = sys::napi_get_reference_value(ctx.raw_env, ctx.fn_ref, &mut js_fn);
+                if status != sys::Status::napi_ok || js_fn.is_null() {
+                    return Err(rusqlite::Error::UserFunctionError(Box::new(
+                        std::io::Error::new(std::io::ErrorKind::Other, "Failed to get function reference"),
+                    )));
+                }
 
-            // Call the JavaScript function with blocking mode
-            // The callback receives the JS function's return value directly
-            let status = tsfn_clone.call_with_return_value(
-                (args, tx),
-                ThreadsafeFunctionCallMode::Blocking,
-                move |js_return: serde_json::Value| {
-                    // Send the result through the channel
-                    let _ = tx_for_callback.send(js_return);
-                    Ok(())
-                },
-            );
+                // Get undefined for 'this' value
+                let mut undefined: sys::napi_value = std::ptr::null_mut();
+                sys::napi_get_undefined(ctx.raw_env, &mut undefined);
 
-            if status != Status::Ok {
-                return Err(rusqlite::Error::UserFunctionError(Box::new(
-                    std::io::Error::new(std::io::ErrorKind::Other, "Failed to call JS function"),
-                )));
-            }
+                // Convert SQLite arguments to NAPI values
+                let arg_count = sqlite_ctx.len();
+                let mut napi_args: Vec<sys::napi_value> = Vec::with_capacity(arg_count);
 
-            // Wait for the result from JavaScript
-            match rx.recv() {
-                Ok(value) => json_to_sqlite_result(value),
-                Err(_) => Err(rusqlite::Error::UserFunctionError(Box::new(
-                    std::io::Error::new(std::io::ErrorKind::Other, "Channel closed"),
-                ))),
+                for i in 0..arg_count {
+                    let napi_val = sqlite_value_to_napi(ctx.raw_env, sqlite_ctx.get_raw(i), ctx.safe_ints)?;
+                    napi_args.push(napi_val);
+                }
+
+                // Call the JavaScript function directly - like better-sqlite3's fn->Call()
+                let mut result: sys::napi_value = std::ptr::null_mut();
+                let status = sys::napi_call_function(
+                    ctx.raw_env,
+                    undefined,
+                    js_fn,
+                    arg_count,
+                    if arg_count > 0 { napi_args.as_ptr() } else { std::ptr::null() },
+                    &mut result,
+                );
+
+                if status != sys::Status::napi_ok {
+                    // Check if there was a JS exception
+                    let mut is_pending = false;
+                    sys::napi_is_exception_pending(ctx.raw_env, &mut is_pending);
+                    if is_pending {
+                        // Clear the exception and return error
+                        let mut exception: sys::napi_value = std::ptr::null_mut();
+                        sys::napi_get_and_clear_last_exception(ctx.raw_env, &mut exception);
+                        return Err(rusqlite::Error::UserFunctionError(Box::new(
+                            std::io::Error::new(std::io::ErrorKind::Other, "JavaScript function threw an error"),
+                        )));
+                    }
+                    return Err(rusqlite::Error::UserFunctionError(Box::new(
+                        std::io::Error::new(std::io::ErrorKind::Other, "Failed to call JavaScript function"),
+                    )));
+                }
+
+                // Convert the result back to SQLite
+                napi_value_to_sqlite_result(ctx.raw_env, result)
             }
         })
         .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
@@ -929,6 +973,136 @@ fn row_value_to_json(row: &rusqlite::Row, idx: usize, safe_ints: bool) -> rusqli
             })
         }
     })
+}
+
+/// Convert a SQLite value to a raw NAPI value for direct function calls.
+/// This is similar to how better-sqlite3's Data::GetArgumentsJS works.
+unsafe fn sqlite_value_to_napi(
+    env: sys::napi_env,
+    value: rusqlite::types::ValueRef,
+    safe_ints: bool,
+) -> rusqlite::Result<sys::napi_value> {
+    use rusqlite::types::ValueRef;
+
+    let mut result: sys::napi_value = std::ptr::null_mut();
+
+    match value {
+        ValueRef::Null => {
+            sys::napi_get_null(env, &mut result);
+        }
+        ValueRef::Integer(i) => {
+            if safe_ints {
+                // Create BigInt for safe integers
+                let mut lossless = true;
+                sys::napi_create_bigint_int64(env, i, &mut result);
+            } else {
+                // Create number (as f64)
+                sys::napi_create_double(env, i as f64, &mut result);
+            }
+        }
+        ValueRef::Real(f) => {
+            sys::napi_create_double(env, f, &mut result);
+        }
+        ValueRef::Text(s) => {
+            let text = std::str::from_utf8(s).unwrap_or("");
+            sys::napi_create_string_utf8(
+                env,
+                text.as_ptr() as *const i8,
+                text.len(),
+                &mut result,
+            );
+        }
+        ValueRef::Blob(b) => {
+            // Create a Buffer from the blob data
+            let mut buffer_data: *mut std::ffi::c_void = std::ptr::null_mut();
+            sys::napi_create_buffer_copy(
+                env,
+                b.len(),
+                b.as_ptr() as *const std::ffi::c_void,
+                &mut buffer_data,
+                &mut result,
+            );
+        }
+    }
+
+    Ok(result)
+}
+
+/// Convert a raw NAPI value back to SQLite result.
+/// This is similar to how better-sqlite3's Data::ResultValueFromJS works.
+unsafe fn napi_value_to_sqlite_result(
+    env: sys::napi_env,
+    value: sys::napi_value,
+) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'static>> {
+    use rusqlite::types::{ToSqlOutput, Value};
+
+    if value.is_null() {
+        return Ok(ToSqlOutput::Owned(Value::Null));
+    }
+
+    let mut value_type: sys::napi_valuetype = sys::ValueType::napi_undefined;
+    sys::napi_typeof(env, value, &mut value_type);
+
+    match value_type {
+        sys::ValueType::napi_null | sys::ValueType::napi_undefined => {
+            Ok(ToSqlOutput::Owned(Value::Null))
+        }
+        sys::ValueType::napi_boolean => {
+            let mut bool_val = false;
+            sys::napi_get_value_bool(env, value, &mut bool_val);
+            Ok(ToSqlOutput::Owned(Value::Integer(if bool_val { 1 } else { 0 })))
+        }
+        sys::ValueType::napi_number => {
+            let mut num_val: f64 = 0.0;
+            sys::napi_get_value_double(env, value, &mut num_val);
+            // Check if it's an integer
+            if num_val.fract() == 0.0 && num_val >= i64::MIN as f64 && num_val <= i64::MAX as f64 {
+                Ok(ToSqlOutput::Owned(Value::Integer(num_val as i64)))
+            } else {
+                Ok(ToSqlOutput::Owned(Value::Real(num_val)))
+            }
+        }
+        sys::ValueType::napi_string => {
+            // Get string length
+            let mut str_len: usize = 0;
+            sys::napi_get_value_string_utf8(env, value, std::ptr::null_mut(), 0, &mut str_len);
+
+            // Allocate buffer and get string
+            let mut buf = vec![0u8; str_len + 1];
+            let mut copied: usize = 0;
+            sys::napi_get_value_string_utf8(
+                env,
+                value,
+                buf.as_mut_ptr() as *mut i8,
+                str_len + 1,
+                &mut copied,
+            );
+            buf.truncate(copied);
+            let s = String::from_utf8_lossy(&buf).into_owned();
+            Ok(ToSqlOutput::Owned(Value::Text(s)))
+        }
+        sys::ValueType::napi_bigint => {
+            let mut int_val: i64 = 0;
+            let mut lossless = true;
+            sys::napi_get_value_bigint_int64(env, value, &mut int_val, &mut lossless);
+            Ok(ToSqlOutput::Owned(Value::Integer(int_val)))
+        }
+        sys::ValueType::napi_object => {
+            // Check if it's a Buffer
+            let mut is_buffer = false;
+            sys::napi_is_buffer(env, value, &mut is_buffer);
+            if is_buffer {
+                let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+                let mut len: usize = 0;
+                sys::napi_get_buffer_info(env, value, &mut data, &mut len);
+                let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
+                return Ok(ToSqlOutput::Owned(Value::Blob(bytes)));
+            }
+            // Other objects become null
+            Ok(ToSqlOutput::Owned(Value::Null))
+        }
+        _ => Ok(ToSqlOutput::Owned(Value::Null)),
+    }
 }
 
 /// Convert a SQLite value (from function context) to JSON for JavaScript.

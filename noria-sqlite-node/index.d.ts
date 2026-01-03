@@ -98,6 +98,10 @@ export declare class Database {
    * @param safe_ints - Whether to use BigInt for integers (0=false, 1=true, 2=inherit)
    * @param deterministic - Whether function is deterministic
    * @param direct_only - Whether function can only be called directly (not from triggers/views)
+   *
+   * This uses raw NAPI calls similar to how better-sqlite3 uses raw V8 calls.
+   * Since SQLite runs on the main Node.js thread, we can call JS functions
+   * directly without ThreadsafeFunction.
    */
   _registerFunction(callback: (...args: any[]) => any, name: string, argc: number, safeInts: number, deterministic: boolean, directOnly: boolean): void
 }
