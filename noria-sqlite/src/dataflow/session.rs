@@ -452,4 +452,63 @@ mod tests {
         assert!(tables.contains(&"users"));
         assert!(tables.contains(&"posts"));
     }
+
+    #[test]
+    fn test_session_with_transaction_rollback() {
+        // This test verifies what the Session Extension does when a transaction is rolled back.
+        // Key question: Does the session still record changes that were rolled back?
+        let conn = setup_test_db();
+        let mut tracker = SessionTracker::new(&conn).unwrap();
+        tracker.attach_all().unwrap();
+
+        // Start a transaction
+        conn.execute("BEGIN", []).unwrap();
+
+        // Insert a row
+        conn.execute("INSERT INTO users VALUES (1, 'Alice', 30)", [])
+            .unwrap();
+
+        // Rollback the transaction
+        conn.execute("ROLLBACK", []).unwrap();
+
+        // Get the changeset - does it contain the rolled-back INSERT?
+        let changeset = tracker.changeset().unwrap();
+        let events = SessionTracker::extract_events(&changeset).unwrap();
+
+        // Print for debugging
+        println!("Events after ROLLBACK: {:?}", events);
+        println!("Event count: {}", events.len());
+
+        // The critical question: is events.len() == 0 or == 1?
+        // If 0: Session Extension handles rollback automatically (good!)
+        // If 1: Session Extension does NOT handle rollback (we need to handle it)
+    }
+
+    #[test]
+    fn test_session_with_transaction_commit() {
+        // Verify session records changes when transaction commits
+        let conn = setup_test_db();
+        let mut tracker = SessionTracker::new(&conn).unwrap();
+        tracker.attach_all().unwrap();
+
+        // Start a transaction
+        conn.execute("BEGIN", []).unwrap();
+
+        // Insert a row
+        conn.execute("INSERT INTO users VALUES (1, 'Alice', 30)", [])
+            .unwrap();
+
+        // Commit the transaction
+        conn.execute("COMMIT", []).unwrap();
+
+        // Get the changeset
+        let changeset = tracker.changeset().unwrap();
+        let events = SessionTracker::extract_events(&changeset).unwrap();
+
+        println!("Events after COMMIT: {:?}", events);
+        println!("Event count: {}", events.len());
+
+        // Should have 1 event (the committed INSERT)
+        assert_eq!(events.len(), 1);
+    }
 }
