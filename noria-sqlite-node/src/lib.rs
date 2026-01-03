@@ -1605,15 +1605,40 @@ unsafe fn sqlite_value_to_napi(
             );
         }
         ValueRef::Blob(b) => {
-            // Create a Buffer from the blob data
+            // Call Buffer.from(Uint8Array) to create a proper Node.js Buffer
+            // First, create a Uint8Array with the blob data
+            let mut arraybuffer: sys::napi_value = std::ptr::null_mut();
             let mut buffer_data: *mut std::ffi::c_void = std::ptr::null_mut();
-            sys::napi_create_buffer_copy(
-                env,
-                b.len(),
-                b.as_ptr() as *const std::ffi::c_void,
-                &mut buffer_data,
-                &mut result,
-            );
+            let ab_status = sys::napi_create_arraybuffer(env, b.len(), &mut buffer_data, &mut arraybuffer);
+            if ab_status == sys::Status::napi_ok && !buffer_data.is_null() {
+                std::ptr::copy_nonoverlapping(b.as_ptr(), buffer_data as *mut u8, b.len());
+
+                // Create Uint8Array view
+                let mut uint8_array: sys::napi_value = std::ptr::null_mut();
+                sys::napi_create_typedarray(
+                    env,
+                    sys::TypedarrayType::uint8_array,
+                    b.len(),
+                    arraybuffer,
+                    0,
+                    &mut uint8_array,
+                );
+
+                // Get Buffer global
+                let mut global: sys::napi_value = std::ptr::null_mut();
+                sys::napi_get_global(env, &mut global);
+
+                let buffer_str = std::ffi::CString::new("Buffer").unwrap();
+                let mut buffer_ctor: sys::napi_value = std::ptr::null_mut();
+                sys::napi_get_named_property(env, global, buffer_str.as_ptr(), &mut buffer_ctor);
+
+                let from_str = std::ffi::CString::new("from").unwrap();
+                let mut buffer_from: sys::napi_value = std::ptr::null_mut();
+                sys::napi_get_named_property(env, buffer_ctor, from_str.as_ptr(), &mut buffer_from);
+
+                // Call Buffer.from(uint8_array)
+                sys::napi_call_function(env, buffer_ctor, buffer_from, 1, &uint8_array, &mut result);
+            }
         }
     }
 

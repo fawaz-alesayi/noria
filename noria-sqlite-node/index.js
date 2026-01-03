@@ -660,6 +660,10 @@ function convertBigInts(value) {
 		return value;
 	}
 	if (typeof value === 'object') {
+		// Return actual Buffers as-is
+		if (Buffer.isBuffer(value)) {
+			return value;
+		}
 		if (value.$bigint !== undefined) {
 			return BigInt(value.$bigint);
 		}

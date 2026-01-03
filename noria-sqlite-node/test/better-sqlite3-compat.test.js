@@ -655,8 +655,7 @@ describe('Database#function()', function () {
 		expect(this.db.prepare('SELECT my_isnull(NULL)').pluck().get()).to.equal(1);
 		expect(this.db.prepare('SELECT my_isnull(5)').pluck().get()).to.equal(0);
 	});
-	// Skip: buffer parameters are passed as raw Uint8Array, not Node.js Buffer
-	it.skip('should handle buffer parameters', function () {
+	it('should handle buffer parameters', function () {
 		this.db.function('buflen', x => Buffer.isBuffer(x) ? x.length : 0);
 		expect(this.db.prepare('SELECT buflen(?)').pluck().get(Buffer.alloc(10))).to.equal(10);
 	});
@@ -858,7 +857,7 @@ describe('Database#serialize()', function () {
 		const buffer = this.db.serialize();
 		expect(buffer).to.be.an.instanceof(Buffer);
 	});
-	// Skip: requires deserialize support which is more complex
+	// Skip: requires deserialize support which needs sqlite3_malloc64 for OwnedData
 	it.skip('should create a valid database from serialized buffer', function () {
 		const buffer = this.db.serialize();
 		const db2 = new Database(buffer);
