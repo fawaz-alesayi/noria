@@ -143,10 +143,10 @@ Therefore, `noria-sqlite` will use a **Bundled Strategy**:
 
 ### 8.2 Known Limitations & TODOs
 
-1. **CDC Propagation to Cached Entries**
-   - INSERT changes propagate correctly to views
-   - UPDATE/DELETE changes are tracked but may not update already-cached entries
-   - Transaction rollback doesn't properly invalidate cache (tracked inserts before commit)
+1. **Transaction-Aware CDC**
+   - CDC currently tracks changes before transaction commit
+   - Transaction rollback doesn't properly invalidate cache entries
+   - Should capture changeset only on COMMIT
 
 2. **Named Parameters CDC**
    - Named parameters ($name, @name, :name) bypass CDC path
@@ -164,25 +164,27 @@ Therefore, `noria-sqlite` will use a **Bundled Strategy**:
 
 ### 8.3 Impact Assessment
 
-**Current Score: 7/10**
+**Current Score: 8/10**
 
 The library now provides:
-- ✅ A working better-sqlite3 drop-in replacement (91 tests passing)
-- ✅ Session-based CDC infrastructure (foundation working)
+- ✅ A working better-sqlite3 drop-in replacement (93 tests passing)
+- ✅ Session-based CDC infrastructure (fully working)
 - ✅ Full dataflow operators (Filter, Project, Join, Aggregate)
-- ✅ Incremental update propagation for INSERT operations
+- ✅ Incremental update propagation for INSERT/UPDATE/DELETE operations
 - ✅ Partial materialization with upquery fallback
 - ✅ Dynamic view synthesis from prepared statements
 - ✅ O(1) cache hits from evmap-backed views
+- ✅ CDC propagation correctly updates cached view entries
 
 Remaining work:
-- Fix UPDATE/DELETE CDC propagation to cached entries
 - Add transaction-aware CDC (only track on commit)
 - Implement random eviction with memory limits
+- Add introspection API for cache statistics
 
-**In essence**: The core Noria value proposition is now working. Parameterized SELECT
+**In essence**: The core Noria value proposition is now fully working. Parameterized SELECT
 queries are automatically accelerated with O(1) lookups on cache hits and transparent
-upqueries on cache misses.
+upqueries on cache misses. INSERT, UPDATE, and DELETE operations propagate through
+the dataflow to keep cached views up-to-date.
 
 ---
 
@@ -304,12 +306,12 @@ The user's assumption regarding views is technically correct but practically sol
 **Completed Milestones** ✅:
 1. ~~Implement incremental update propagation through dataflow operators~~ ✅
 2. ~~Implement upquery mechanism for cache misses~~ ✅
-3. ~~Wire CDC changesets to dataflow graph injection~~ ✅ (for INSERT)
+3. ~~Wire CDC changesets to dataflow graph injection~~ ✅
 4. ~~Implement dynamic view synthesis for prepared statements~~ ✅
+5. ~~Fix UPDATE/DELETE CDC propagation to cached view entries~~ ✅
 
 **Next Steps** (in priority order):
-1. Fix UPDATE/DELETE CDC propagation to already-cached view entries
-2. Add transaction-aware CDC (capture changeset only on COMMIT)
-3. Implement random eviction with memory limits
-4. Add introspection API for cache statistics
-5. Support more complex SQL patterns (subqueries, window functions)
+1. Add transaction-aware CDC (capture changeset only on COMMIT)
+2. Implement random eviction with memory limits
+3. Add introspection API for cache statistics
+4. Support more complex SQL patterns (subqueries, window functions)
