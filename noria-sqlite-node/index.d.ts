@@ -177,10 +177,15 @@ export declare class Statement {
    * This provides better performance for high-throughput scenarios.
    */
   _getFast(params: Array<any>): unknown
-  /** Optimized version of all() - uses rusqlite's cached statements with raw column extraction. */
-  _allFast(params: Array<any>): unknown
+  /**
+   * Optimized version of all() - bypasses rusqlite and serde_json entirely.
+   * Uses cached raw SQLite statement and direct NAPI value extraction.
+   */
+  _allFast(params: object): unknown
   /** Execute the statement and return info about the execution. */
   run(...params: any[]): RunResult
+  /** Fast version of run() - bypasses rusqlite and serde_json entirely. */
+  _runFast(params: object): RunResult
   /** Enable pluck mode - return only the first column value. */
   pluck(enabled?: boolean | undefined | null): this
   /** Enable expand mode - group columns by table. */

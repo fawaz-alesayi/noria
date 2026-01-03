@@ -621,7 +621,12 @@ Object.defineProperties(Statement.prototype, {
 // Statement methods - all take variadic parameters
 Statement.prototype.run = function run(...params) {
 	try {
-		return this[cppdb].run(convertParams(params));
+		// Fast path: pass raw params array directly (no JSON serialization)
+		let rawParams = params;
+		if (params.length === 1 && Array.isArray(params[0]) && !Buffer.isBuffer(params[0])) {
+			rawParams = params[0];
+		}
+		return this[cppdb]._runFast(rawParams);
 	} catch (e) {
 		if (e.message && e.message.includes('already has bound parameters')) {
 			throw new TypeError('This statement already has bound parameters');
@@ -678,8 +683,13 @@ Statement.prototype.all = function all(...params) {
 			const results = this[cppdb].all(convertParams(params));
 			return results.map(convertBigInts);
 		}
-		// Use fast path (direct NAPI object creation) - bypass JSON serialization
-		const results = this[cppdb]._allFast(convertParams(params));
+		// Fast path: pass raw params array directly (no JSON serialization)
+		// Handle bind([array]) case
+		let rawParams = params;
+		if (params.length === 1 && Array.isArray(params[0]) && !Buffer.isBuffer(params[0])) {
+			rawParams = params[0];
+		}
+		const results = this[cppdb]._allFast(rawParams);
 		return results;
 	} catch (e) {
 		if (e.message && e.message.startsWith('SQLITE_')) {

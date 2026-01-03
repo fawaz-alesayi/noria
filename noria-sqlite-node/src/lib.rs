@@ -193,10 +193,20 @@ impl Database {
             .map(|n| std::ffi::CString::new(n.as_str()).unwrap())
             .collect();
 
+        // Pre-allocate SQL CString for raw operations
+        let sql_cstr = std::ffi::CString::new(sql.as_str()).unwrap();
+
+        // Cache the raw db handle for fast operations (avoids RwLock read on each call)
+        let db_handle = {
+            let conn = self.inner.connection().read();
+            RawDb(unsafe { conn.handle() })
+        };
+
         Ok(Statement {
             inner: Arc::new(Mutex::new(stmt)),
             db: self.inner.clone(),
             sql,
+            sql_cstr,
             is_reader,
             is_ddl,
             pluck_mode: false,
@@ -209,6 +219,8 @@ impl Database {
             column_tables,
             is_cached,
             param_count,
+            raw_stmt: Mutex::new(None),
+            db_handle,
         })
     }
 
@@ -1151,12 +1163,33 @@ pub struct CacheStats {
     pub cache_misses: i64,
 }
 
+/// Wrapper for raw SQLite statement pointer to make it Send/Sync.
+/// SAFETY: SQLite statements are safe to send between threads as long as
+/// only one thread accesses them at a time (enforced by Mutex).
+struct RawStmt(*mut ffi::sqlite3_stmt);
+unsafe impl Send for RawStmt {}
+unsafe impl Sync for RawStmt {}
+
+impl Drop for RawStmt {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { ffi::sqlite3_finalize(self.0); }
+        }
+    }
+}
+
+/// Wrapper for raw sqlite3 database handle for caching
+struct RawDb(*mut ffi::sqlite3);
+unsafe impl Send for RawDb {}
+unsafe impl Sync for RawDb {}
+
 /// A prepared SQL statement.
 #[napi]
 pub struct Statement {
     inner: Arc<Mutex<NoriaStatement>>,
     db: Arc<NoriaDatabase>,
     sql: String,
+    sql_cstr: std::ffi::CString,
     is_reader: bool,
     is_ddl: bool,
     pluck_mode: bool,
@@ -1174,6 +1207,10 @@ pub struct Statement {
     is_cached: bool,
     /// Number of parameters expected by this statement
     param_count: usize,
+    /// Cached raw SQLite statement for fast operations
+    raw_stmt: Mutex<Option<RawStmt>>,
+    /// Cached raw database handle for fast operations (avoids RwLock read)
+    db_handle: RawDb,
 }
 
 #[napi]
@@ -1454,36 +1491,54 @@ impl Statement {
         }
     }
 
-    /// Optimized version of all() - uses rusqlite's cached statements with raw column extraction.
+    /// Optimized version of all() - bypasses rusqlite and serde_json entirely.
+    /// Uses cached raw SQLite statement and direct NAPI value extraction.
     #[napi(js_name = "_allFast")]
-    pub fn all_fast(&self, env: Env, params: Vec<serde_json::Value>) -> Result<JsUnknown> {
-        // Check if params were provided when already bound
-        if self.bound_params.is_some() && !params.is_empty() {
-            return Err(Error::new(
-                Status::InvalidArg,
-                "This statement already has bound parameters",
-            ));
-        }
-
-        // Use bound params or provided params
-        let flat_params = if let Some(ref bound) = self.bound_params {
-            bound.clone()
-        } else {
-            flatten_params(&params)?
-        };
-        let param_values = convert_params(&flat_params);
-        let param_refs: Vec<&dyn rusqlite::ToSql> =
-            param_values.iter().map(|b| b.as_ref()).collect();
-
+    pub fn all_fast(&self, env: Env, params: napi::JsObject) -> Result<JsUnknown> {
         let safe_ints = self.safe_ints;
         let raw_env = env.raw();
         let col_name_cstrs = &self.column_name_cstrs;
         let col_count = col_name_cstrs.len() as i32;
 
-        // Use rusqlite's cached statement for efficiency
-        let conn = self.db.connection().read();
-        let mut sqlite_stmt = conn.prepare_cached(&self.sql)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+        // Use cached db handle (no RwLock read needed)
+        let db_handle = self.db_handle.0;
+
+        // Get or create cached raw statement
+        let mut raw_stmt_guard = self.raw_stmt.lock();
+        let raw_stmt = if let Some(ref cached) = *raw_stmt_guard {
+            // Reset the statement for reuse (no need to clear bindings since we rebind all)
+            unsafe { ffi::sqlite3_reset(cached.0); }
+            cached.0
+        } else {
+            // Create new statement
+            let mut stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+            let rc = unsafe {
+                ffi::sqlite3_prepare_v2(
+                    db_handle,
+                    self.sql_cstr.as_ptr(),
+                    -1,
+                    &mut stmt,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc != ffi::SQLITE_OK {
+                return Err(Error::new(Status::GenericFailure,
+                    format!("SQLITE_ERROR: prepare failed ({})", rc)));
+            }
+            *raw_stmt_guard = Some(RawStmt(stmt));
+            stmt
+        };
+
+        // Bind parameters directly from NAPI values (no serde_json!)
+        let params_raw = unsafe { params.raw() };
+        let param_count = self.param_count;
+        for i in 0..param_count {
+            let mut element: sys::napi_value = std::ptr::null_mut();
+            unsafe {
+                sys::napi_get_element(raw_env, params_raw, i as u32, &mut element);
+            }
+            bind_napi_value_raw(raw_env, raw_stmt, (i + 1) as i32, element)?;
+        }
 
         // Create result array
         let result_arr = unsafe {
@@ -1493,27 +1548,26 @@ impl Statement {
         };
 
         let mut row_idx = 0u32;
-        let mut rows = sqlite_stmt.query(rusqlite::params_from_iter(&param_refs))
-            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
 
-        // Use rusqlite's Row but with minimal overhead
-        while let Some(row) = rows.next()
-            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?
-        {
+        // Step through results using raw SQLite
+        loop {
+            let rc = unsafe { ffi::sqlite3_step(raw_stmt) };
+            if rc == ffi::SQLITE_DONE {
+                break;
+            }
+            if rc != ffi::SQLITE_ROW {
+                return Err(Error::new(Status::GenericFailure,
+                    format!("SQLITE_ERROR: step failed ({})", rc)));
+            }
+
             let row_val = unsafe {
                 if self.pluck_mode {
-                    let ref_val = row.get_ref(0)
-                        .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
-                    sqlite_value_to_napi(raw_env, ref_val, safe_ints)
-                        .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?
+                    raw_sqlite_column_to_napi(raw_env, raw_stmt, 0, safe_ints)
                 } else if self.raw_mode {
                     let mut arr: sys::napi_value = std::ptr::null_mut();
                     sys::napi_create_array_with_length(raw_env, col_count as usize, &mut arr);
                     for i in 0..col_count {
-                        let ref_val = row.get_ref(i as usize)
-                            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
-                        let val = sqlite_value_to_napi(raw_env, ref_val, safe_ints)
-                            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+                        let val = raw_sqlite_column_to_napi(raw_env, raw_stmt, i, safe_ints);
                         sys::napi_set_element(raw_env, arr, i as u32, val);
                     }
                     arr
@@ -1521,10 +1575,7 @@ impl Statement {
                     let mut obj: sys::napi_value = std::ptr::null_mut();
                     sys::napi_create_object(raw_env, &mut obj);
                     for i in 0..col_count {
-                        let ref_val = row.get_ref(i as usize)
-                            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
-                        let val = sqlite_value_to_napi(raw_env, ref_val, safe_ints)
-                            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+                        let val = raw_sqlite_column_to_napi(raw_env, raw_stmt, i, safe_ints);
                         sys::napi_set_named_property(raw_env, obj, col_name_cstrs[i as usize].as_ptr(), val);
                     }
                     obj
@@ -1597,6 +1648,71 @@ impl Statement {
         // DDL statements (CREATE, DROP, ALTER, etc.) return 0 changes
         // to match better-sqlite3 behavior
         let final_changes = if self.is_ddl { 0 } else { changes as i64 };
+        let final_rowid = if self.is_ddl { 0 } else { last_rowid };
+
+        Ok(RunResult {
+            changes: final_changes,
+            last_insert_rowid: final_rowid,
+        })
+    }
+
+    /// Fast version of run() - bypasses rusqlite and serde_json entirely.
+    #[napi(js_name = "_runFast")]
+    pub fn run_fast(&self, env: Env, params: napi::JsObject) -> Result<RunResult> {
+        let raw_env = env.raw();
+
+        // Use cached db handle (no RwLock read needed)
+        let db_handle = self.db_handle.0;
+
+        // Get or create cached raw statement
+        let mut raw_stmt_guard = self.raw_stmt.lock();
+        let raw_stmt = if let Some(ref cached) = *raw_stmt_guard {
+            // Reset the statement for reuse (no need to clear bindings since we rebind all)
+            unsafe { ffi::sqlite3_reset(cached.0); }
+            cached.0
+        } else {
+            // Create new statement
+            let mut stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+            let rc = unsafe {
+                ffi::sqlite3_prepare_v2(
+                    db_handle,
+                    self.sql_cstr.as_ptr(),
+                    -1,
+                    &mut stmt,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc != ffi::SQLITE_OK {
+                return Err(Error::new(Status::GenericFailure,
+                    format!("SQLITE_ERROR: prepare failed ({})", rc)));
+            }
+            *raw_stmt_guard = Some(RawStmt(stmt));
+            stmt
+        };
+
+        // Bind parameters directly from NAPI values
+        let params_raw = unsafe { params.raw() };
+        let param_count = self.param_count;
+        for i in 0..param_count {
+            let mut element: sys::napi_value = std::ptr::null_mut();
+            unsafe {
+                sys::napi_get_element(raw_env, params_raw, i as u32, &mut element);
+            }
+            bind_napi_value_raw(raw_env, raw_stmt, (i + 1) as i32, element)?;
+        }
+
+        // Execute
+        let rc = unsafe { ffi::sqlite3_step(raw_stmt) };
+        if rc != ffi::SQLITE_DONE && rc != ffi::SQLITE_ROW {
+            return Err(Error::new(Status::GenericFailure,
+                format!("SQLITE_ERROR: step failed ({})", rc)));
+        }
+
+        // Get changes and last rowid
+        let changes = unsafe { ffi::sqlite3_changes(db_handle) } as i64;
+        let last_rowid = unsafe { ffi::sqlite3_last_insert_rowid(db_handle) };
+
+        let final_changes = if self.is_ddl { 0 } else { changes };
         let final_rowid = if self.is_ddl { 0 } else { last_rowid };
 
         Ok(RunResult {
@@ -2625,6 +2741,96 @@ unsafe fn raw_sqlite_column_to_napi(
     }
 
     result
+}
+
+/// Bind a raw NAPI value directly to a SQLite statement (no serde_json).
+/// NAPI value type constants
+const NAPI_UNDEFINED: i32 = 0;
+const NAPI_NULL: i32 = 1;
+const NAPI_BOOLEAN: i32 = 2;
+const NAPI_NUMBER: i32 = 3;
+const NAPI_STRING: i32 = 4;
+const NAPI_OBJECT: i32 = 6;
+const NAPI_BIGINT: i32 = 9;
+
+#[inline(always)]
+fn bind_napi_value_raw(
+    env: sys::napi_env,
+    stmt: *mut ffi::sqlite3_stmt,
+    idx: i32,
+    value: sys::napi_value,
+) -> Result<()> {
+    let mut value_type: i32 = 0;
+    unsafe { sys::napi_typeof(env, value, &mut value_type) };
+
+    let rc = unsafe {
+        match value_type {
+            NAPI_UNDEFINED | NAPI_NULL => {
+                ffi::sqlite3_bind_null(stmt, idx)
+            }
+            NAPI_BOOLEAN => {
+                let mut bool_val = false;
+                sys::napi_get_value_bool(env, value, &mut bool_val);
+                ffi::sqlite3_bind_int(stmt, idx, if bool_val { 1 } else { 0 })
+            }
+            NAPI_NUMBER => {
+                let mut num: f64 = 0.0;
+                sys::napi_get_value_double(env, value, &mut num);
+                // Check if it's an integer
+                if num.fract() == 0.0 && num >= i64::MIN as f64 && num <= i64::MAX as f64 {
+                    ffi::sqlite3_bind_int64(stmt, idx, num as i64)
+                } else {
+                    ffi::sqlite3_bind_double(stmt, idx, num)
+                }
+            }
+            NAPI_STRING => {
+                let mut len: usize = 0;
+                sys::napi_get_value_string_utf8(env, value, std::ptr::null_mut(), 0, &mut len);
+                let mut buf = vec![0u8; len + 1];
+                let mut copied: usize = 0;
+                sys::napi_get_value_string_utf8(env, value, buf.as_mut_ptr() as *mut i8, len + 1, &mut copied);
+                ffi::sqlite3_bind_text(
+                    stmt,
+                    idx,
+                    buf.as_ptr() as *const i8,
+                    copied as i32,
+                    ffi::SQLITE_TRANSIENT(),
+                )
+            }
+            NAPI_BIGINT => {
+                let mut i64_val: i64 = 0;
+                let mut lossless = true;
+                sys::napi_get_value_bigint_int64(env, value, &mut i64_val, &mut lossless);
+                ffi::sqlite3_bind_int64(stmt, idx, i64_val)
+            }
+            NAPI_OBJECT => {
+                // Check if it's a Buffer
+                let mut is_buffer = false;
+                sys::napi_is_buffer(env, value, &mut is_buffer);
+                if is_buffer {
+                    let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+                    let mut len: usize = 0;
+                    sys::napi_get_buffer_info(env, value, &mut data, &mut len);
+                    ffi::sqlite3_bind_blob(
+                        stmt,
+                        idx,
+                        data as *const std::ffi::c_void,
+                        len as i32,
+                        ffi::SQLITE_TRANSIENT(),
+                    )
+                } else {
+                    // Other objects bind as null
+                    ffi::sqlite3_bind_null(stmt, idx)
+                }
+            }
+            _ => ffi::sqlite3_bind_null(stmt, idx),
+        }
+    };
+
+    if rc != ffi::SQLITE_OK {
+        return Err(Error::new(Status::GenericFailure, format!("SQLITE_ERROR: bind failed ({})", rc)));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
