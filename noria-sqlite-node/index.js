@@ -714,25 +714,35 @@ Statement.prototype.safeIntegers = function safeIntegers(enabled) {
 };
 
 // Convert params for native binding (handle Buffers and BigInt specially)
+function convertValue(p) {
+	if (Buffer.isBuffer(p)) {
+		return { type: 'Buffer', data: Array.from(p) };
+	}
+	if (typeof p === 'bigint') {
+		// Convert BigInt to number if it fits safely
+		if (p >= Number.MIN_SAFE_INTEGER && p <= Number.MAX_SAFE_INTEGER) {
+			return Number(p);
+		}
+		// For large BigInts, use a special marker so Rust can parse as i64
+		return { $bigint: p.toString() };
+	}
+	// Recursively convert object properties (for named params like { col: Buffer })
+	if (p !== null && typeof p === 'object' && !Array.isArray(p)) {
+		const result = {};
+		for (const key of Object.keys(p)) {
+			result[key] = convertValue(p[key]);
+		}
+		return result;
+	}
+	return p;
+}
+
 function convertParams(params) {
 	// Handle bind([array]) case - unwrap single array argument
 	if (params.length === 1 && Array.isArray(params[0]) && !Buffer.isBuffer(params[0])) {
 		params = params[0];
 	}
-	return params.map(p => {
-		if (Buffer.isBuffer(p)) {
-			return { type: 'Buffer', data: Array.from(p) };
-		}
-		if (typeof p === 'bigint') {
-			// Convert BigInt to number if it fits safely
-			if (p >= Number.MIN_SAFE_INTEGER && p <= Number.MAX_SAFE_INTEGER) {
-				return Number(p);
-			}
-			// For large BigInts, use a special marker so Rust can parse as i64
-			return { $bigint: p.toString() };
-		}
-		return p;
-	});
+	return params.map(convertValue);
 }
 
 // Convert BigInt markers in result back to actual BigInt

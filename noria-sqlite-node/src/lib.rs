@@ -184,6 +184,12 @@ impl Database {
             || sql_upper.starts_with("REINDEX")
             || sql_upper.starts_with("ANALYZE");
 
+        // Pre-allocate CStrings for column names (used by fast path)
+        let column_name_cstrs: Vec<std::ffi::CString> = column_names
+            .iter()
+            .map(|n| std::ffi::CString::new(n.as_str()).unwrap())
+            .collect();
+
         Ok(Statement {
             inner: Arc::new(Mutex::new(stmt)),
             db: self.inner.clone(),
@@ -196,6 +202,7 @@ impl Database {
             safe_ints: self.default_safe_integers,
             bound_params: None,
             column_names,
+            column_name_cstrs,
             column_tables,
             is_cached,
             param_count,
@@ -1156,6 +1163,8 @@ pub struct Statement {
     bound_params: Option<Vec<serde_json::Value>>,
     /// Column names for cached result conversion
     column_names: Vec<String>,
+    /// Pre-allocated CStrings for fast NAPI property setting
+    column_name_cstrs: Vec<std::ffi::CString>,
     /// Column table names for expand mode (None if no origin table)
     column_tables: Vec<Option<String>>,
     /// Whether this statement has a Noria view (is accelerated)
@@ -1466,17 +1475,14 @@ impl Statement {
         let safe_ints = self.safe_ints;
         let raw_env = env.raw();
 
-        // Execute the query
-        let stmt = self.inner.lock();
+        // Execute the query directly on the connection (bypass NoriaStatement for speed)
         let conn = self.db.connection().read();
-        let mut sqlite_stmt = conn.prepare(&self.sql)
+        let mut sqlite_stmt = conn.prepare_cached(&self.sql)
             .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
 
-        // Get column count and pre-allocate CStrings for column names (avoid per-row allocation)
+        // Get column count (use pre-allocated CStrings from self)
         let col_count = sqlite_stmt.column_count();
-        let col_name_cstrs: Vec<std::ffi::CString> = (0..col_count)
-            .map(|i| std::ffi::CString::new(sqlite_stmt.column_name(i).unwrap_or("?")).unwrap())
-            .collect();
+        let col_name_cstrs = &self.column_name_cstrs;
 
         // Create result array (pre-allocate with hint if we have one)
         let result_arr = unsafe {
@@ -2049,6 +2055,7 @@ fn row_value_to_json(row: &rusqlite::Row, idx: usize, safe_ints: bool) -> rusqli
 
 /// Convert a SQLite value to a raw NAPI value for direct function calls.
 /// This is similar to how better-sqlite3's Data::GetArgumentsJS works.
+#[inline(always)]
 unsafe fn sqlite_value_to_napi(
     env: sys::napi_env,
     value: rusqlite::types::ValueRef,
