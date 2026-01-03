@@ -713,6 +713,12 @@ Statement.prototype.safeIntegers = function safeIntegers(enabled) {
 	return this;
 };
 
+// Fast path check for primitive values (no conversion needed)
+function isPrimitive(v) {
+	const t = typeof v;
+	return v === null || t === 'number' || t === 'string' || t === 'boolean' || v === undefined;
+}
+
 // Convert params for native binding (handle Buffers and BigInt specially)
 function convertValue(p) {
 	if (Buffer.isBuffer(p)) {
@@ -742,6 +748,16 @@ function convertParams(params) {
 	if (params.length === 1 && Array.isArray(params[0]) && !Buffer.isBuffer(params[0])) {
 		params = params[0];
 	}
+	// Fast path: if all params are primitives, return as-is (no .map allocation)
+	let allPrimitive = true;
+	for (let i = 0; i < params.length; i++) {
+		if (!isPrimitive(params[i])) {
+			allPrimitive = false;
+			break;
+		}
+	}
+	if (allPrimitive) return params;
+	// Slow path: need to convert some values
 	return params.map(convertValue);
 }
 

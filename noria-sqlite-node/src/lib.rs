@@ -17,6 +17,9 @@ use rusqlite::functions::FunctionFlags;
 use std::sync::mpsc;
 use std::sync::Arc;
 
+// Raw SQLite FFI for high-performance operations (re-exported by rusqlite)
+use rusqlite::ffi;
+
 /// SqliteError for compatibility with better-sqlite3
 #[napi]
 pub struct SqliteError {
@@ -1451,7 +1454,7 @@ impl Statement {
         }
     }
 
-    /// Optimized version of all() that creates JS objects directly without JSON serialization.
+    /// Optimized version of all() - uses rusqlite's cached statements with raw column extraction.
     #[napi(js_name = "_allFast")]
     pub fn all_fast(&self, env: Env, params: Vec<serde_json::Value>) -> Result<JsUnknown> {
         // Check if params were provided when already bound
@@ -1474,20 +1477,17 @@ impl Statement {
 
         let safe_ints = self.safe_ints;
         let raw_env = env.raw();
+        let col_name_cstrs = &self.column_name_cstrs;
+        let col_count = col_name_cstrs.len() as i32;
 
-        // Execute the query directly on the connection (bypass NoriaStatement for speed)
+        // Use rusqlite's cached statement for efficiency
         let conn = self.db.connection().read();
         let mut sqlite_stmt = conn.prepare_cached(&self.sql)
             .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
 
-        // Get column count (use pre-allocated CStrings from self)
-        let col_count = sqlite_stmt.column_count();
-        let col_name_cstrs = &self.column_name_cstrs;
-
-        // Create result array (pre-allocate with hint if we have one)
+        // Create result array
         let result_arr = unsafe {
             let mut arr: sys::napi_value = std::ptr::null_mut();
-            // Use regular array - it will grow as needed
             sys::napi_create_array(raw_env, &mut arr);
             arr
         };
@@ -1496,6 +1496,7 @@ impl Statement {
         let mut rows = sqlite_stmt.query(rusqlite::params_from_iter(&param_refs))
             .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
 
+        // Use rusqlite's Row but with minimal overhead
         while let Some(row) = rows.next()
             .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?
         {
@@ -1507,9 +1508,9 @@ impl Statement {
                         .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?
                 } else if self.raw_mode {
                     let mut arr: sys::napi_value = std::ptr::null_mut();
-                    sys::napi_create_array_with_length(raw_env, col_count, &mut arr);
+                    sys::napi_create_array_with_length(raw_env, col_count as usize, &mut arr);
                     for i in 0..col_count {
-                        let ref_val = row.get_ref(i)
+                        let ref_val = row.get_ref(i as usize)
                             .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
                         let val = sqlite_value_to_napi(raw_env, ref_val, safe_ints)
                             .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
@@ -1520,12 +1521,11 @@ impl Statement {
                     let mut obj: sys::napi_value = std::ptr::null_mut();
                     sys::napi_create_object(raw_env, &mut obj);
                     for i in 0..col_count {
-                        let ref_val = row.get_ref(i)
+                        let ref_val = row.get_ref(i as usize)
                             .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
                         let val = sqlite_value_to_napi(raw_env, ref_val, safe_ints)
                             .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
-                        // Use pre-allocated CString - no allocation per row
-                        sys::napi_set_named_property(raw_env, obj, col_name_cstrs[i].as_ptr(), val);
+                        sys::napi_set_named_property(raw_env, obj, col_name_cstrs[i as usize].as_ptr(), val);
                     }
                     obj
                 }
@@ -2473,6 +2473,158 @@ fn json_to_sqlite_result(value: serde_json::Value) -> rusqlite::Result<rusqlite:
         }
         serde_json::Value::Array(_) => ToSqlOutput::Owned(Value::Null),
     })
+}
+
+// =============================================================================
+// Raw SQLite FFI functions for high-performance operations
+// =============================================================================
+
+/// Bind parameters to a raw SQLite statement.
+fn bind_params_raw(stmt: *mut ffi::sqlite3_stmt, params: &serde_json::Value) -> Result<()> {
+    match params {
+        serde_json::Value::Array(arr) => {
+            for (i, val) in arr.iter().enumerate() {
+                bind_value_raw(stmt, (i + 1) as i32, val)?;
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            // Named parameters - need to look up parameter indices
+            for (key, val) in obj {
+                let param_name = if key.starts_with('@') || key.starts_with('$') || key.starts_with(':') {
+                    std::ffi::CString::new(key.as_str()).unwrap()
+                } else {
+                    std::ffi::CString::new(format!("@{}", key)).unwrap()
+                };
+                let idx = unsafe { ffi::sqlite3_bind_parameter_index(stmt, param_name.as_ptr()) };
+                if idx > 0 {
+                    bind_value_raw(stmt, idx, val)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Bind a single value to a raw SQLite statement.
+#[inline(always)]
+fn bind_value_raw(stmt: *mut ffi::sqlite3_stmt, idx: i32, val: &serde_json::Value) -> Result<()> {
+    let rc = unsafe {
+        match val {
+            serde_json::Value::Null => ffi::sqlite3_bind_null(stmt, idx),
+            serde_json::Value::Bool(b) => ffi::sqlite3_bind_int(stmt, idx, if *b { 1 } else { 0 }),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    ffi::sqlite3_bind_int64(stmt, idx, i)
+                } else if let Some(f) = n.as_f64() {
+                    ffi::sqlite3_bind_double(stmt, idx, f)
+                } else {
+                    ffi::sqlite3_bind_null(stmt, idx)
+                }
+            }
+            serde_json::Value::String(s) => {
+                ffi::sqlite3_bind_text(
+                    stmt,
+                    idx,
+                    s.as_ptr() as *const i8,
+                    s.len() as i32,
+                    ffi::SQLITE_TRANSIENT(),
+                )
+            }
+            serde_json::Value::Object(obj) => {
+                // Handle Buffer-like objects
+                if let Some(serde_json::Value::String(t)) = obj.get("type") {
+                    if t == "Buffer" {
+                        if let Some(serde_json::Value::Array(data)) = obj.get("data") {
+                            let bytes: Vec<u8> = data
+                                .iter()
+                                .filter_map(|v| v.as_u64().map(|n| n as u8))
+                                .collect();
+                            return Ok(if unsafe {
+                                ffi::sqlite3_bind_blob(
+                                    stmt,
+                                    idx,
+                                    bytes.as_ptr() as *const std::ffi::c_void,
+                                    bytes.len() as i32,
+                                    ffi::SQLITE_TRANSIENT(),
+                                )
+                            } == ffi::SQLITE_OK { () } else { () });
+                        }
+                    }
+                }
+                // Handle BigInt marker
+                if let Some(serde_json::Value::String(s)) = obj.get("$bigint") {
+                    if let Ok(i) = s.parse::<i64>() {
+                        return Ok(if unsafe { ffi::sqlite3_bind_int64(stmt, idx, i) } == ffi::SQLITE_OK { () } else { () });
+                    }
+                }
+                ffi::sqlite3_bind_null(stmt, idx)
+            }
+            serde_json::Value::Array(_) => ffi::sqlite3_bind_null(stmt, idx),
+        }
+    };
+    if rc != ffi::SQLITE_OK {
+        return Err(Error::new(Status::GenericFailure, format!("SQLITE_ERROR: bind failed ({})", rc)));
+    }
+    Ok(())
+}
+
+/// Convert a raw SQLite column value to a NAPI value.
+#[inline(always)]
+unsafe fn raw_sqlite_column_to_napi(
+    env: sys::napi_env,
+    stmt: *mut ffi::sqlite3_stmt,
+    col: i32,
+    safe_ints: bool,
+) -> sys::napi_value {
+    let mut result: sys::napi_value = std::ptr::null_mut();
+
+    let col_type = ffi::sqlite3_column_type(stmt, col);
+
+    match col_type {
+        ffi::SQLITE_NULL => {
+            sys::napi_get_null(env, &mut result);
+        }
+        ffi::SQLITE_INTEGER => {
+            let i = ffi::sqlite3_column_int64(stmt, col);
+            if safe_ints {
+                sys::napi_create_bigint_int64(env, i, &mut result);
+            } else {
+                sys::napi_create_double(env, i as f64, &mut result);
+            }
+        }
+        ffi::SQLITE_FLOAT => {
+            let f = ffi::sqlite3_column_double(stmt, col);
+            sys::napi_create_double(env, f, &mut result);
+        }
+        ffi::SQLITE_TEXT => {
+            let ptr = ffi::sqlite3_column_text(stmt, col);
+            let len = ffi::sqlite3_column_bytes(stmt, col);
+            sys::napi_create_string_utf8(
+                env,
+                ptr as *const i8,
+                len as usize,
+                &mut result,
+            );
+        }
+        ffi::SQLITE_BLOB => {
+            let ptr = ffi::sqlite3_column_blob(stmt, col);
+            let len = ffi::sqlite3_column_bytes(stmt, col);
+            let mut _buffer_data: *mut std::ffi::c_void = std::ptr::null_mut();
+            sys::napi_create_buffer_copy(
+                env,
+                len as usize,
+                ptr,
+                &mut _buffer_data,
+                &mut result,
+            );
+        }
+        _ => {
+            sys::napi_get_null(env, &mut result);
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]

@@ -177,7 +177,7 @@ export declare class Statement {
    * This provides better performance for high-throughput scenarios.
    */
   _getFast(params: Array<any>): unknown
-  /** Optimized version of all() that creates JS objects directly without JSON serialization. */
+  /** Optimized version of all() - uses rusqlite's cached statements with raw column extraction. */
   _allFast(params: Array<any>): unknown
   /** Execute the statement and return info about the execution. */
   run(...params: any[]): RunResult
