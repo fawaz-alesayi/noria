@@ -36,7 +36,10 @@ impl Statement {
         config: &Config,
     ) -> Result<Self> {
         // Check if this query is cacheable (SELECT with parameters)
-        let view = if is_cacheable_query(sql) {
+        // Skip view creation if acceleration is disabled (passthrough mode)
+        let view = if config.acceleration_disabled {
+            None
+        } else if is_cacheable_query(sql) {
             // Try to create a view for this query
             match engine.create_view(sql) {
                 Ok(v) => Some(v),

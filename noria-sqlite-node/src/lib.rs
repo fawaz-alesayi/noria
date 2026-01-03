@@ -58,10 +58,23 @@ impl Database {
         let is_memory = filename.is_empty() || filename == ":memory:";
         let is_readonly = options.readonly.unwrap_or(false);
 
+        // Check if Noria acceleration should be disabled
+        let acceleration_disabled = options
+            .noria
+            .as_ref()
+            .and_then(|n| n.acceleration_disabled)
+            .unwrap_or(false);
+
+        // Create config with acceleration_disabled option
+        let config = noria_sqlite::Config {
+            acceleration_disabled,
+            ..Default::default()
+        };
+
         let db = if is_memory {
-            NoriaDatabase::open_in_memory()
+            NoriaDatabase::open_in_memory_with_config(config)
         } else {
-            NoriaDatabase::open(&filename)
+            NoriaDatabase::open_with_config(&filename, config)
         }
         .map_err(|e| {
             Error::new(
@@ -1087,6 +1100,18 @@ pub struct DatabaseOptions {
     pub readonly: Option<bool>,
     pub file_must_exist: Option<bool>,
     pub timeout: Option<i32>,
+    /// Noria-specific options
+    pub noria: Option<NoriaOptions>,
+}
+
+/// Noria-specific configuration options
+#[napi(object)]
+#[derive(Default)]
+pub struct NoriaOptions {
+    /// Disable Noria acceleration (passthrough to raw SQLite).
+    /// Useful for benchmarking raw SQLite performance.
+    #[napi(js_name = "accelerationDisabled")]
+    pub acceleration_disabled: Option<bool>,
 }
 
 /// Progress information for database backup

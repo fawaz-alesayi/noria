@@ -259,9 +259,9 @@ Database.prototype.pragma = function pragma(source, options) {
 	const simple = options && options.simple;
 	const sql = `PRAGMA ${source}`;
 
-	// Some pragmas with parentheses still return results (e.g., wal_checkpoint)
-	const returnsResults = source.toLowerCase().startsWith('wal_checkpoint') ||
-		(!source.includes('=') && !source.includes('('));
+	// Pragmas return results unless they have an '=' (setter)
+	// Pragmas with parentheses like table_info(name) are getters and return results
+	const returnsResults = !source.includes('=');
 
 	if (!returnsResults) {
 		// Setter pragma - just execute it
@@ -697,6 +697,10 @@ Statement.prototype.safeIntegers = function safeIntegers(enabled) {
 
 // Convert params for native binding (handle Buffers and BigInt specially)
 function convertParams(params) {
+	// Handle bind([array]) case - unwrap single array argument
+	if (params.length === 1 && Array.isArray(params[0]) && !Buffer.isBuffer(params[0])) {
+		params = params[0];
+	}
 	return params.map(p => {
 		if (Buffer.isBuffer(p)) {
 			return { type: 'Buffer', data: Array.from(p) };

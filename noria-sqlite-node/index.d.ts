@@ -8,6 +8,16 @@ export interface DatabaseOptions {
   readonly?: boolean
   fileMustExist?: boolean
   timeout?: number
+  /** Noria-specific options */
+  noria?: NoriaOptions
+}
+/** Noria-specific configuration options */
+export interface NoriaOptions {
+  /**
+   * Disable Noria acceleration (passthrough to raw SQLite).
+   * Useful for benchmarking raw SQLite performance.
+   */
+  accelerationDisabled?: boolean
 }
 /** Progress information for database backup */
 export interface BackupProgress {

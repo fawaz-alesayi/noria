@@ -60,6 +60,10 @@ pub struct Config {
 
     /// Consistency window in milliseconds
     pub consistency_window_ms: u64,
+
+    /// Disable Noria acceleration entirely (passthrough to SQLite).
+    /// Useful for benchmarking raw SQLite performance without Noria overhead.
+    pub acceleration_disabled: bool,
 }
 
 impl Default for Config {
@@ -69,6 +73,7 @@ impl Default for Config {
             view_synthesis_timeout_ms: 5000,      // 5 seconds
             enable_consistency_guard: true,
             consistency_window_ms: 50,            // 50ms
+            acceleration_disabled: false,
         }
     }
 }
