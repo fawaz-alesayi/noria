@@ -340,6 +340,9 @@ impl Database {
             node_count: stats.node_count,
             materialized_nodes: stats.materialized_nodes,
             total_rows: stats.total_rows,
+            view_count: stats.view_count,
+            cache_hits: stats.cache_hits,
+            cache_misses: stats.cache_misses,
         }
     }
 }
@@ -353,4 +356,10 @@ pub struct CacheStats {
     pub materialized_nodes: usize,
     /// Total rows across all materialized views
     pub total_rows: usize,
+    /// Number of registered views
+    pub view_count: usize,
+    /// Number of cache hits (lookups that found data in the cache)
+    pub cache_hits: u64,
+    /// Number of cache misses (lookups that required upquery)
+    pub cache_misses: u64,
 }

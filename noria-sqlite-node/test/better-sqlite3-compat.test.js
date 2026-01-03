@@ -1367,3 +1367,131 @@ describe('Noria Acceleration', function () {
 		expect(query.get(1).name).to.equal('Alice');
 	});
 });
+
+// ============================================================================
+// Cache Statistics API tests
+// These tests verify the introspection API for cache statistics
+// ============================================================================
+describe('Cache Statistics API', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+		this.db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)');
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it('should return cacheStats object with all required properties', function () {
+		const stats = this.db.cacheStats();
+
+		expect(stats).to.be.an('object');
+		expect(stats).to.have.property('nodeCount');
+		expect(stats).to.have.property('materializedNodes');
+		expect(stats).to.have.property('totalRows');
+		expect(stats).to.have.property('viewCount');
+		expect(stats).to.have.property('cacheHits');
+		expect(stats).to.have.property('cacheMisses');
+	});
+
+	it('should have non-negative numeric values', function () {
+		const stats = this.db.cacheStats();
+
+		expect(stats.nodeCount).to.be.a('number').and.at.least(0);
+		expect(stats.materializedNodes).to.be.a('number').and.at.least(0);
+		expect(stats.totalRows).to.be.a('number').and.at.least(0);
+		expect(stats.viewCount).to.be.a('number').and.at.least(0);
+		expect(stats.cacheHits).to.be.a('number').and.at.least(0);
+		expect(stats.cacheMisses).to.be.a('number').and.at.least(0);
+	});
+
+	it('should start with zero cache hits and misses', function () {
+		const stats = this.db.cacheStats();
+
+		expect(stats.cacheHits).to.equal(0);
+		expect(stats.cacheMisses).to.equal(0);
+	});
+
+	it('should track cache misses on first query (upquery)', function () {
+		// Insert data
+		this.db.prepare('INSERT INTO users VALUES (?, ?, ?)').run(1, 'Alice', 30);
+
+		// Create accelerated query
+		const stmt = this.db.prepare('SELECT * FROM users WHERE id = ?');
+
+		const statsBefore = this.db.cacheStats();
+		const initialMisses = statsBefore.cacheMisses;
+
+		// First query - should be a cache miss (triggers upquery)
+		stmt.get(1);
+
+		const statsAfter = this.db.cacheStats();
+		expect(statsAfter.cacheMisses).to.be.greaterThan(initialMisses);
+	});
+
+	it('should track cache hits on subsequent queries', function () {
+		// Insert data
+		this.db.prepare('INSERT INTO users VALUES (?, ?, ?)').run(1, 'Alice', 30);
+
+		// Create accelerated query
+		const stmt = this.db.prepare('SELECT * FROM users WHERE id = ?');
+
+		// First query - triggers upquery and populates cache
+		stmt.get(1);
+
+		const statsBefore = this.db.cacheStats();
+		const initialHits = statsBefore.cacheHits;
+
+		// Second query - should be a cache hit
+		stmt.get(1);
+
+		const statsAfter = this.db.cacheStats();
+		expect(statsAfter.cacheHits).to.be.greaterThan(initialHits);
+	});
+
+	it('should increment viewCount when queries are prepared', function () {
+		const statsBefore = this.db.cacheStats();
+		const initialViews = statsBefore.viewCount;
+
+		// Prepare a SELECT query (creates a view)
+		this.db.prepare('SELECT * FROM users WHERE id = ?');
+
+		const statsAfter = this.db.cacheStats();
+		expect(statsAfter.viewCount).to.be.greaterThan(initialViews);
+	});
+
+	it('should track totalRows in materialized views', function () {
+		// Insert data via CDC
+		this.db.prepare('INSERT INTO users VALUES (?, ?, ?)').run(1, 'Alice', 30);
+		this.db.prepare('INSERT INTO users VALUES (?, ?, ?)').run(2, 'Bob', 25);
+
+		// Create and query (populates cache via upquery)
+		const stmt = this.db.prepare('SELECT * FROM users WHERE id = ?');
+		stmt.get(1);
+		stmt.get(2);
+
+		const stats = this.db.cacheStats();
+		// Should have at least the rows we queried
+		expect(stats.totalRows).to.be.at.least(2);
+	});
+
+	it('should calculate hit rate correctly', function () {
+		// Insert data
+		this.db.prepare('INSERT INTO users VALUES (?, ?, ?)').run(1, 'Alice', 30);
+
+		const stmt = this.db.prepare('SELECT * FROM users WHERE id = ?');
+
+		// First query (miss)
+		stmt.get(1);
+
+		// Several more queries (hits)
+		for (let i = 0; i < 5; i++) {
+			stmt.get(1);
+		}
+
+		const stats = this.db.cacheStats();
+		const hitRate = stats.cacheHits / (stats.cacheHits + stats.cacheMisses);
+
+		// With 1 miss and 5 hits, hit rate should be approximately 0.83 (5/6)
+		expect(hitRate).to.be.greaterThan(0.8);
+	});
+});

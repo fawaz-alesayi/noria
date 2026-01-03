@@ -14,6 +14,15 @@ export interface BackupProgress {
   totalPages: number
   remainingPages: number
 }
+/** Cache statistics from the Noria dataflow engine */
+export interface CacheStats {
+  nodeCount: number
+  materializedNodes: number
+  totalRows: number
+  viewCount: number
+  cacheHits: number
+  cacheMisses: number
+}
 /** Column information from Statement#columns() */
 export interface ColumnInfo {
   name: string
@@ -62,6 +71,17 @@ export declare class Database {
   _exec(sql: string): void
   /** Close the database connection. */
   close(): void
+  /**
+   * Get cache statistics from the Noria dataflow engine.
+   * Returns an object with:
+   * - nodeCount: Number of nodes in the dataflow graph
+   * - materializedNodes: Number of materialized (cached) nodes
+   * - totalRows: Total rows across all materialized views
+   * - viewCount: Number of registered views
+   * - cacheHits: Number of cache hits (lookups that found data in cache)
+   * - cacheMisses: Number of cache misses (lookups that required upquery to SQLite)
+   */
+  cacheStats(): CacheStats
   /**
    * Toggle unsafe mode.
    * In unsafe mode, operations that would normally be blocked during iteration are allowed.

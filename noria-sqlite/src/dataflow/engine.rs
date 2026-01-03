@@ -10,6 +10,7 @@ use noria::DataType;
 use parking_lot::RwLock;
 use rusqlite::Connection;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::adapter::SqliteAdapter;
@@ -57,6 +58,10 @@ pub struct NoriaEngine {
     views: RwLock<HashMap<String, NoriaView>>,
     /// Reference to the SQLite connection for upqueries.
     conn: Arc<RwLock<Connection>>,
+    /// Counter for cache hits.
+    cache_hits: AtomicU64,
+    /// Counter for cache misses.
+    cache_misses: AtomicU64,
 }
 
 impl NoriaEngine {
@@ -67,6 +72,8 @@ impl NoriaEngine {
             sql_converter: RwLock::new(SqlConverter::new()),
             views: RwLock::new(HashMap::new()),
             conn,
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
         }
     }
 
@@ -170,11 +177,13 @@ impl NoriaEngine {
         {
             let adapter = self.adapter.read();
             if let Some(rows) = adapter.executor().lookup(&view.handle, key) {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(rows);
             }
         }
 
         // Cache miss - perform upquery
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
         self.upquery(view, key)
     }
 
@@ -360,6 +369,8 @@ impl NoriaEngine {
             materialized_nodes: executor_stats.materialized_nodes,
             total_rows: executor_stats.total_rows,
             view_count: views.len(),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
         }
     }
 
@@ -418,6 +429,8 @@ pub struct EngineStats {
     pub materialized_nodes: usize,
     pub total_rows: usize,
     pub view_count: usize,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
 }
 
 /// Normalize SQL for caching (simplified).

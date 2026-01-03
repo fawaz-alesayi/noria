@@ -203,6 +203,27 @@ impl Database {
         Ok(())
     }
 
+    /// Get cache statistics from the Noria dataflow engine.
+    /// Returns an object with:
+    /// - nodeCount: Number of nodes in the dataflow graph
+    /// - materializedNodes: Number of materialized (cached) nodes
+    /// - totalRows: Total rows across all materialized views
+    /// - viewCount: Number of registered views
+    /// - cacheHits: Number of cache hits (lookups that found data in cache)
+    /// - cacheMisses: Number of cache misses (lookups that required upquery to SQLite)
+    #[napi(js_name = "cacheStats")]
+    pub fn cache_stats(&self) -> CacheStats {
+        let stats = self.inner.cache_stats();
+        CacheStats {
+            node_count: stats.node_count as i64,
+            materialized_nodes: stats.materialized_nodes as i64,
+            total_rows: stats.total_rows as i64,
+            view_count: stats.view_count as i64,
+            cache_hits: stats.cache_hits as i64,
+            cache_misses: stats.cache_misses as i64,
+        }
+    }
+
     /// Toggle unsafe mode.
     /// In unsafe mode, operations that would normally be blocked during iteration are allowed.
     /// @param enabled - Whether to enable unsafe mode. If not provided, returns current state.
@@ -789,6 +810,23 @@ pub struct BackupProgress {
     pub total_pages: i32,
     #[napi(js_name = "remainingPages")]
     pub remaining_pages: i32,
+}
+
+/// Cache statistics from the Noria dataflow engine
+#[napi(object)]
+pub struct CacheStats {
+    #[napi(js_name = "nodeCount")]
+    pub node_count: i64,
+    #[napi(js_name = "materializedNodes")]
+    pub materialized_nodes: i64,
+    #[napi(js_name = "totalRows")]
+    pub total_rows: i64,
+    #[napi(js_name = "viewCount")]
+    pub view_count: i64,
+    #[napi(js_name = "cacheHits")]
+    pub cache_hits: i64,
+    #[napi(js_name = "cacheMisses")]
+    pub cache_misses: i64,
 }
 
 /// A prepared SQL statement.

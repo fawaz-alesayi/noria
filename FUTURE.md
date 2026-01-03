@@ -164,10 +164,10 @@ Therefore, `noria-sqlite` will use a **Bundled Strategy**:
 
 ### 8.3 Impact Assessment
 
-**Current Score: 8/10**
+**Current Score: 8.5/10**
 
 The library now provides:
-- ✅ A working better-sqlite3 drop-in replacement (93 tests passing)
+- ✅ A working better-sqlite3 drop-in replacement (101 tests passing)
 - ✅ Session-based CDC infrastructure (fully working)
 - ✅ Full dataflow operators (Filter, Project, Join, Aggregate)
 - ✅ Incremental update propagation for INSERT/UPDATE/DELETE operations
@@ -175,11 +175,11 @@ The library now provides:
 - ✅ Dynamic view synthesis from prepared statements
 - ✅ O(1) cache hits from evmap-backed views
 - ✅ CDC propagation correctly updates cached view entries
+- ✅ Introspection API for cache statistics (db.cacheStats())
 
 Remaining work:
 - Add transaction-aware CDC (only track on commit)
 - Implement random eviction with memory limits
-- Add introspection API for cache statistics
 
 **In essence**: The core Noria value proposition is now fully working. Parameterized SELECT
 queries are automatically accelerated with O(1) lookups on cache hits and transparent
@@ -278,21 +278,27 @@ Once the core is working, users should be able to configure:
 
 ---
 
-12. Introspection API
+12. Introspection API ✅
 
-For debugging and monitoring, expose:
+For debugging and monitoring, the `db.cacheStats()` method is now available:
 
 ```javascript
-const stats = db.noriaStats();
+const stats = db.cacheStats();
 // Returns:
 // {
-//   views: 5,                    // Number of materialized views
+//   nodeCount: 5,               // Nodes in dataflow graph
+//   materializedNodes: 3,       // Materialized view nodes
+//   totalRows: 150,             // Total rows across all views
+//   viewCount: 2,               // Number of registered views
 //   cacheHits: 1000,            // Reads served from cache
-//   cacheMisses: 50,            // Upqueries triggered
-//   memoryUsedMb: 45,           // Current memory usage
-//   pendingPropagation: 0,      // Changes waiting to propagate
-//   avgPropagationMs: 2.3       // Average propagation latency
+//   cacheMisses: 50             // Upqueries triggered
 // }
+```
+
+This enables calculating hit rates and monitoring cache effectiveness:
+```javascript
+const hitRate = stats.cacheHits / (stats.cacheHits + stats.cacheMisses);
+console.log(`Cache hit rate: ${(hitRate * 100).toFixed(1)}%`);
 ```
 
 ---
@@ -309,9 +315,9 @@ The user's assumption regarding views is technically correct but practically sol
 3. ~~Wire CDC changesets to dataflow graph injection~~ ✅
 4. ~~Implement dynamic view synthesis for prepared statements~~ ✅
 5. ~~Fix UPDATE/DELETE CDC propagation to cached view entries~~ ✅
+6. ~~Add introspection API for cache statistics (db.cacheStats())~~ ✅
 
 **Next Steps** (in priority order):
 1. Add transaction-aware CDC (capture changeset only on COMMIT)
 2. Implement random eviction with memory limits
-3. Add introspection API for cache statistics
-4. Support more complex SQL patterns (subqueries, window functions)
+3. Support more complex SQL patterns (subqueries, window functions)

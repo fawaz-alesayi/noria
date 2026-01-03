@@ -204,6 +204,11 @@ Database.prototype.close = function close() {
 	return this;
 };
 
+// Get cache statistics from the Noria dataflow engine
+Database.prototype.cacheStats = function cacheStats() {
+	return this[cppdb].cacheStats();
+};
+
 // Transaction helper (basic implementation)
 Database.prototype.transaction = function transaction(fn) {
 	if (typeof fn !== 'function') {
