@@ -172,6 +172,13 @@ export declare class Statement {
    * If the query is accelerated by Noria, tries the cache first with upquery fallback.
    */
   all(...params: any[]): Array<any>
+  /**
+   * Optimized version of get() that creates JS objects directly without JSON serialization.
+   * This provides better performance for high-throughput scenarios.
+   */
+  _getFast(params: Array<any>): unknown
+  /** Optimized version of all() that creates JS objects directly without JSON serialization. */
+  _allFast(params: Array<any>): unknown
   /** Execute the statement and return info about the execution. */
   run(...params: any[]): RunResult
   /** Enable pluck mode - return only the first column value. */

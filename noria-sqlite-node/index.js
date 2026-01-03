@@ -642,9 +642,19 @@ Statement.prototype.get = function get(...params) {
 		throw new TypeError('This statement does not return data. Use run() instead');
 	}
 	try {
-		const result = this[cppdb].get(convertParams(params));
-		if (result === null) return undefined;
-		return convertBigInts(result);
+		// Check if expand mode is enabled - need to use slow path for expand
+		// because the fast path doesn't support nested objects
+		if (this._expandMode) {
+			// Fall back to slow path for expand mode
+			const result = this[cppdb].get(convertParams(params));
+			if (result === null) return undefined;
+			return convertBigInts(result);
+		}
+		// Use fast path (direct NAPI object creation) - bypass JSON serialization
+		// The fast method creates JS objects/arrays/values directly
+		const result = this[cppdb]._getFast(convertParams(params));
+		// _getFast returns undefined for no rows, otherwise the row object
+		return result;
 	} catch (e) {
 		if (e.message && e.message.startsWith('SQLITE_')) {
 			const match = e.message.match(/^(SQLITE_\w+):\s*(.*)/);
@@ -662,8 +672,15 @@ Statement.prototype.all = function all(...params) {
 		throw new TypeError('This statement does not return data. Use run() instead');
 	}
 	try {
-		const results = this[cppdb].all(convertParams(params));
-		return results.map(convertBigInts);
+		// Check if expand mode is enabled - need to use slow path for expand
+		if (this._expandMode) {
+			// Fall back to slow path for expand mode
+			const results = this[cppdb].all(convertParams(params));
+			return results.map(convertBigInts);
+		}
+		// Use fast path (direct NAPI object creation) - bypass JSON serialization
+		const results = this[cppdb]._allFast(convertParams(params));
+		return results;
 	} catch (e) {
 		if (e.message && e.message.startsWith('SQLITE_')) {
 			const match = e.message.match(/^(SQLITE_\w+):\s*(.*)/);
@@ -682,6 +699,7 @@ Statement.prototype.pluck = function pluck(enabled) {
 
 Statement.prototype.expand = function expand(enabled) {
 	this[cppdb].expand(enabled);
+	this._expandMode = enabled !== false;
 	return this;
 };
 

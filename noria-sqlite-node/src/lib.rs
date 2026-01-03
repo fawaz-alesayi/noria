@@ -8,6 +8,7 @@ use napi::sys;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::NapiRaw;
 use napi::JsUnknown;
+use napi::{JsObject, JsNull};
 use napi_derive::napi;
 use noria::DataType;
 use noria_sqlite::{Database as NoriaDatabase, Statement as NoriaStatement};
@@ -1362,6 +1363,177 @@ impl Statement {
         Ok(results)
     }
 
+    /// Optimized version of get() that creates JS objects directly without JSON serialization.
+    /// This provides better performance for high-throughput scenarios.
+    #[napi(js_name = "_getFast")]
+    pub fn get_fast(&self, env: Env, params: Vec<serde_json::Value>) -> Result<JsUnknown> {
+        if !self.is_reader {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "This statement does not return data. Use run() instead",
+            ));
+        }
+
+        // Check if params were provided when already bound
+        if self.bound_params.is_some() && !params.is_empty() {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "This statement already has bound parameters",
+            ));
+        }
+
+        // Use bound params or provided params
+        let flat_params = if let Some(ref bound) = self.bound_params {
+            bound.clone()
+        } else {
+            flatten_params(&params)?
+        };
+        let param_values = convert_params(&flat_params);
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            param_values.iter().map(|b| b.as_ref()).collect();
+
+        let safe_ints = self.safe_ints;
+        let raw_env = env.raw();
+
+        // Execute the query and create JS object directly
+        let stmt = self.inner.lock();
+        let result = stmt.query_row(&param_refs, |row| {
+            unsafe {
+                if self.pluck_mode {
+                    // Return just the first column value
+                    sqlite_value_to_napi(raw_env, row.get_ref(0)?, safe_ints)
+                } else if self.raw_mode {
+                    // Return as array
+                    let count = row.as_ref().column_count();
+                    let mut arr: sys::napi_value = std::ptr::null_mut();
+                    sys::napi_create_array_with_length(raw_env, count, &mut arr);
+                    for i in 0..count {
+                        let val = sqlite_value_to_napi(raw_env, row.get_ref(i)?, safe_ints)?;
+                        sys::napi_set_element(raw_env, arr, i as u32, val);
+                    }
+                    Ok(arr)
+                } else {
+                    // Return as object
+                    let count = row.as_ref().column_count();
+                    let mut obj: sys::napi_value = std::ptr::null_mut();
+                    sys::napi_create_object(raw_env, &mut obj);
+                    for i in 0..count {
+                        let name = row.as_ref().column_name(i).unwrap_or("?");
+                        let val = sqlite_value_to_napi(raw_env, row.get_ref(i)?, safe_ints)?;
+                        let name_cstr = std::ffi::CString::new(name).unwrap();
+                        sys::napi_set_named_property(raw_env, obj, name_cstr.as_ptr(), val);
+                    }
+                    Ok(obj)
+                }
+            }
+        });
+
+        match result {
+            Ok(napi_val) => {
+                Ok(unsafe { JsUnknown::from_napi_value(raw_env, napi_val)? })
+            }
+            Err(noria_sqlite::Error::Sqlite(rusqlite::Error::QueryReturnedNoRows)) => {
+                env.get_undefined().map(|u| u.into_unknown())
+            }
+            Err(e) => Err(Error::new(
+                Status::GenericFailure,
+                format!("SQLITE_ERROR: {}", e),
+            )),
+        }
+    }
+
+    /// Optimized version of all() that creates JS objects directly without JSON serialization.
+    #[napi(js_name = "_allFast")]
+    pub fn all_fast(&self, env: Env, params: Vec<serde_json::Value>) -> Result<JsUnknown> {
+        // Check if params were provided when already bound
+        if self.bound_params.is_some() && !params.is_empty() {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "This statement already has bound parameters",
+            ));
+        }
+
+        // Use bound params or provided params
+        let flat_params = if let Some(ref bound) = self.bound_params {
+            bound.clone()
+        } else {
+            flatten_params(&params)?
+        };
+        let param_values = convert_params(&flat_params);
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            param_values.iter().map(|b| b.as_ref()).collect();
+
+        let safe_ints = self.safe_ints;
+        let raw_env = env.raw();
+
+        // Execute the query
+        let stmt = self.inner.lock();
+        let conn = self.db.connection().read();
+        let mut sqlite_stmt = conn.prepare(&self.sql)
+            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+
+        // Get column count and pre-allocate CStrings for column names (avoid per-row allocation)
+        let col_count = sqlite_stmt.column_count();
+        let col_name_cstrs: Vec<std::ffi::CString> = (0..col_count)
+            .map(|i| std::ffi::CString::new(sqlite_stmt.column_name(i).unwrap_or("?")).unwrap())
+            .collect();
+
+        // Create result array (pre-allocate with hint if we have one)
+        let result_arr = unsafe {
+            let mut arr: sys::napi_value = std::ptr::null_mut();
+            // Use regular array - it will grow as needed
+            sys::napi_create_array(raw_env, &mut arr);
+            arr
+        };
+
+        let mut row_idx = 0u32;
+        let mut rows = sqlite_stmt.query(rusqlite::params_from_iter(&param_refs))
+            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+
+        while let Some(row) = rows.next()
+            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?
+        {
+            let row_val = unsafe {
+                if self.pluck_mode {
+                    let ref_val = row.get_ref(0)
+                        .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+                    sqlite_value_to_napi(raw_env, ref_val, safe_ints)
+                        .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?
+                } else if self.raw_mode {
+                    let mut arr: sys::napi_value = std::ptr::null_mut();
+                    sys::napi_create_array_with_length(raw_env, col_count, &mut arr);
+                    for i in 0..col_count {
+                        let ref_val = row.get_ref(i)
+                            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+                        let val = sqlite_value_to_napi(raw_env, ref_val, safe_ints)
+                            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+                        sys::napi_set_element(raw_env, arr, i as u32, val);
+                    }
+                    arr
+                } else {
+                    let mut obj: sys::napi_value = std::ptr::null_mut();
+                    sys::napi_create_object(raw_env, &mut obj);
+                    for i in 0..col_count {
+                        let ref_val = row.get_ref(i)
+                            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+                        let val = sqlite_value_to_napi(raw_env, ref_val, safe_ints)
+                            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+                        // Use pre-allocated CString - no allocation per row
+                        sys::napi_set_named_property(raw_env, obj, col_name_cstrs[i].as_ptr(), val);
+                    }
+                    obj
+                }
+            };
+
+            unsafe {
+                sys::napi_set_element(raw_env, result_arr, row_idx, row_val);
+            }
+            row_idx += 1;
+        }
+
+        Ok(unsafe { JsUnknown::from_napi_value(raw_env, result_arr)? })
+    }
+
     /// Execute the statement and return info about the execution.
     #[napi(ts_args_type = "...params: any[]")]
     pub fn run(&self, params: Vec<serde_json::Value>) -> Result<RunResult> {
@@ -1913,40 +2085,16 @@ unsafe fn sqlite_value_to_napi(
             );
         }
         ValueRef::Blob(b) => {
-            // Call Buffer.from(Uint8Array) to create a proper Node.js Buffer
-            // First, create a Uint8Array with the blob data
-            let mut arraybuffer: sys::napi_value = std::ptr::null_mut();
-            let mut buffer_data: *mut std::ffi::c_void = std::ptr::null_mut();
-            let ab_status = sys::napi_create_arraybuffer(env, b.len(), &mut buffer_data, &mut arraybuffer);
-            if ab_status == sys::Status::napi_ok && !buffer_data.is_null() {
-                std::ptr::copy_nonoverlapping(b.as_ptr(), buffer_data as *mut u8, b.len());
-
-                // Create Uint8Array view
-                let mut uint8_array: sys::napi_value = std::ptr::null_mut();
-                sys::napi_create_typedarray(
-                    env,
-                    sys::TypedarrayType::uint8_array,
-                    b.len(),
-                    arraybuffer,
-                    0,
-                    &mut uint8_array,
-                );
-
-                // Get Buffer global
-                let mut global: sys::napi_value = std::ptr::null_mut();
-                sys::napi_get_global(env, &mut global);
-
-                let buffer_str = std::ffi::CString::new("Buffer").unwrap();
-                let mut buffer_ctor: sys::napi_value = std::ptr::null_mut();
-                sys::napi_get_named_property(env, global, buffer_str.as_ptr(), &mut buffer_ctor);
-
-                let from_str = std::ffi::CString::new("from").unwrap();
-                let mut buffer_from: sys::napi_value = std::ptr::null_mut();
-                sys::napi_get_named_property(env, buffer_ctor, from_str.as_ptr(), &mut buffer_from);
-
-                // Call Buffer.from(uint8_array)
-                sys::napi_call_function(env, buffer_ctor, buffer_from, 1, &uint8_array, &mut result);
-            }
+            // Use napi_create_buffer_copy for efficient Buffer creation
+            // This directly creates a Node.js Buffer with a copy of the data
+            let mut _buffer_data: *mut std::ffi::c_void = std::ptr::null_mut();
+            sys::napi_create_buffer_copy(
+                env,
+                b.len(),
+                b.as_ptr() as *const std::ffi::c_void,
+                &mut _buffer_data,
+                &mut result,
+            );
         }
     }
 
