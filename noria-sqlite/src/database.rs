@@ -335,9 +335,37 @@ impl Database {
     /// Execute multiple SQL statements.
     ///
     /// Useful for schema setup and migrations.
+    /// Also handles transaction control (COMMIT/ROLLBACK) for CDC event flushing.
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        let conn = self.conn.write();
-        conn.execute_batch(sql)?;
+        // Check for transaction control statements
+        let sql_upper = sql.trim().to_uppercase();
+        let is_commit = sql_upper.starts_with("COMMIT") || sql_upper.starts_with("END");
+        let is_rollback = sql_upper.starts_with("ROLLBACK");
+
+        // Check transaction state before executing
+        let was_in_transaction = {
+            let conn = self.conn.read();
+            !conn.is_autocommit()
+        };
+
+        // Execute the batch
+        {
+            let conn = self.conn.write();
+            conn.execute_batch(sql)?;
+        }
+
+        // Handle transaction-aware CDC
+        if is_rollback {
+            // ROLLBACK: discard all pending events
+            self.pending_events.lock().clear();
+        } else if is_commit && was_in_transaction {
+            // COMMIT: apply all pending events
+            let pending = std::mem::take(&mut *self.pending_events.lock());
+            if !pending.is_empty() {
+                self.apply_cdc_events(&pending);
+            }
+        }
+
         Ok(())
     }
 
