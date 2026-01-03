@@ -9,6 +9,7 @@ use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFun
 use napi::NapiRaw;
 use napi::JsUnknown;
 use napi_derive::napi;
+use noria::DataType;
 use noria_sqlite::{Database as NoriaDatabase, Statement as NoriaStatement};
 use parking_lot::Mutex;
 use rusqlite::functions::FunctionFlags;
@@ -125,18 +126,26 @@ impl Database {
             ));
         }
 
-        // Validate SQL at prepare time by calling SQLite's prepare
-        // This matches better-sqlite3 behavior of catching syntax errors early
-        {
+        // Validate SQL at prepare time and get column names
+        let column_names = {
             let conn = self.inner.connection().read();
-            conn.prepare(&sql)
+            let sqlite_stmt = conn.prepare(&sql)
                 .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
-        }
+
+            // Extract column names for SELECT queries
+            let count = sqlite_stmt.column_count();
+            (0..count)
+                .filter_map(|i| sqlite_stmt.column_name(i).ok().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        };
 
         let stmt = self
             .inner
             .prepare(&sql)
             .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+
+        // Check if the statement has a Noria view (is accelerated)
+        let is_cached = stmt.is_cached();
 
         // Determine statement type
         let sql_upper = sql.trim().to_uppercase();
@@ -164,6 +173,8 @@ impl Database {
             raw_mode: false,
             safe_ints: self.default_safe_integers,
             bound_params: None,
+            column_names,
+            is_cached,
         })
     }
 
@@ -793,6 +804,10 @@ pub struct Statement {
     raw_mode: bool,
     safe_ints: bool,
     bound_params: Option<Vec<serde_json::Value>>,
+    /// Column names for cached result conversion
+    column_names: Vec<String>,
+    /// Whether this statement has a Noria view (is accelerated)
+    is_cached: bool,
 }
 
 #[napi]
@@ -811,6 +826,8 @@ impl Statement {
 
     /// Execute the statement and return the first row.
     /// Throws if this is not a reader statement.
+    ///
+    /// If the query is accelerated by Noria, tries the cache first with upquery fallback.
     #[napi(ts_args_type = "...params: any[]")]
     pub fn get(&self, params: Vec<serde_json::Value>) -> Result<Option<serde_json::Value>> {
         if !self.is_reader {
@@ -839,6 +856,30 @@ impl Statement {
             param_values.iter().map(|b| b.as_ref()).collect();
 
         let safe_ints = self.safe_ints;
+
+        // Try cached path first if this query is accelerated
+        if self.is_cached {
+            let stmt = self.inner.lock();
+            if let Ok(Some(row)) = stmt.query_row_cached_or_upquery(&param_refs) {
+                // Convert cached DataType row to JSON
+                let json_value = if self.pluck_mode {
+                    // Return just the first column value
+                    row.first().map(|dt| datatype_to_json(dt, safe_ints))
+                        .unwrap_or(serde_json::Value::Null)
+                } else if self.raw_mode {
+                    // Return as array
+                    cached_row_to_json_array(&row, safe_ints)
+                } else {
+                    // Return as object
+                    cached_row_to_json_object(&row, &self.column_names, safe_ints)
+                };
+                return Ok(Some(json_value));
+            }
+            // If cached path returned None (no rows), return None
+            // If it returned an error, fall through to SQLite
+        }
+
+        // Fall back to SQLite path
         let stmt = self.inner.lock();
         let result = stmt.query_row(&param_refs, |row| {
             if self.pluck_mode {
@@ -875,6 +916,8 @@ impl Statement {
     }
 
     /// Execute the statement and return all rows.
+    ///
+    /// If the query is accelerated by Noria, tries the cache first with upquery fallback.
     #[napi(ts_args_type = "...params: any[]")]
     pub fn all(&self, params: Vec<serde_json::Value>) -> Result<Vec<serde_json::Value>> {
         // Check if params were provided when already bound
@@ -896,6 +939,29 @@ impl Statement {
             param_values.iter().map(|b| b.as_ref()).collect();
 
         let safe_ints = self.safe_ints;
+
+        // Try cached path first if this query is accelerated
+        if self.is_cached {
+            let stmt = self.inner.lock();
+            // Try cache lookup; returns Option<Vec<Vec<DataType>>>
+            if let Ok(Some(rows)) = stmt.query_map_cached(&param_refs) {
+                // Convert all cached rows to JSON
+                let json_results: Vec<serde_json::Value> = rows.iter().map(|row| {
+                    if self.pluck_mode {
+                        row.first().map(|dt| datatype_to_json(dt, safe_ints))
+                            .unwrap_or(serde_json::Value::Null)
+                    } else if self.raw_mode {
+                        cached_row_to_json_array(row, safe_ints)
+                    } else {
+                        cached_row_to_json_object(row, &self.column_names, safe_ints)
+                    }
+                }).collect();
+                return Ok(json_results);
+            }
+            // Cache miss - fall through to SQLite (which will populate cache via upquery)
+        }
+
+        // Fall back to SQLite path
         let stmt = self.inner.lock();
         let results = stmt
             .query_map(&param_refs, |row| {
@@ -1230,6 +1296,95 @@ fn convert_params(params: &[serde_json::Value]) -> Vec<Box<dyn rusqlite::ToSql>>
             Some(json_to_sql_value(v))
         })
         .collect()
+}
+
+/// Convert a noria::DataType to serde_json::Value.
+/// This allows returning cached results directly without going through rusqlite.
+fn datatype_to_json(dt: &DataType, safe_ints: bool) -> serde_json::Value {
+    match dt {
+        DataType::None => serde_json::Value::Null,
+        DataType::Int(i) => {
+            if safe_ints {
+                serde_json::json!({ "$bigint": i.to_string() })
+            } else {
+                serde_json::json!(*i as f64)
+            }
+        }
+        DataType::BigInt(i) => {
+            if safe_ints {
+                serde_json::json!({ "$bigint": i.to_string() })
+            } else {
+                serde_json::json!(*i as f64)
+            }
+        }
+        DataType::UnsignedInt(i) => {
+            if safe_ints {
+                serde_json::json!({ "$bigint": i.to_string() })
+            } else {
+                serde_json::json!(*i as f64)
+            }
+        }
+        DataType::UnsignedBigInt(i) => {
+            if safe_ints {
+                serde_json::json!({ "$bigint": i.to_string() })
+            } else {
+                serde_json::json!(*i as f64)
+            }
+        }
+        DataType::Real(int_part, frac_part) => {
+            let f = *int_part as f64 + (*frac_part as f64 / 1_000_000_000.0);
+            serde_json::json!(f)
+        }
+        DataType::Text(_) | DataType::TinyText(_) => {
+            let s: &str = dt.into();
+            serde_json::Value::String(s.to_string())
+        }
+        DataType::Timestamp(ts) => {
+            serde_json::Value::String(ts.to_string())
+        }
+    }
+}
+
+/// Convert a cached row (Vec<DataType>) to JSON object using column names.
+fn cached_row_to_json_object(
+    row: &[DataType],
+    column_names: &[String],
+    safe_ints: bool,
+) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    for (i, dt) in row.iter().enumerate() {
+        let name = column_names.get(i)
+            .map(|s| s.clone())
+            .unwrap_or_else(|| format!("col{}", i));
+        obj.insert(name, datatype_to_json(dt, safe_ints));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Convert a cached row to JSON array (for raw mode).
+fn cached_row_to_json_array(row: &[DataType], safe_ints: bool) -> serde_json::Value {
+    let arr: Vec<serde_json::Value> = row.iter().map(|dt| datatype_to_json(dt, safe_ints)).collect();
+    serde_json::Value::Array(arr)
+}
+
+/// Convert serde_json params to noria::DataType keys for cache lookup.
+fn params_to_datatype_key(params: &[Box<dyn rusqlite::ToSql>]) -> Vec<DataType> {
+    params.iter().map(|p| {
+        use rusqlite::types::ToSqlOutput;
+        match p.to_sql() {
+            Ok(ToSqlOutput::Borrowed(rusqlite::types::ValueRef::Integer(i))) => DataType::BigInt(i),
+            Ok(ToSqlOutput::Borrowed(rusqlite::types::ValueRef::Text(s))) => {
+                DataType::from(std::str::from_utf8(s).unwrap_or(""))
+            }
+            Ok(ToSqlOutput::Borrowed(rusqlite::types::ValueRef::Real(f))) => DataType::from(f),
+            Ok(ToSqlOutput::Borrowed(rusqlite::types::ValueRef::Null)) => DataType::None,
+            Ok(ToSqlOutput::Owned(rusqlite::types::Value::Integer(i))) => DataType::BigInt(i),
+            Ok(ToSqlOutput::Owned(rusqlite::types::Value::Text(s))) => DataType::from(s.as_str()),
+            Ok(ToSqlOutput::Owned(rusqlite::types::Value::Real(f))) => DataType::from(f),
+            Ok(ToSqlOutput::Owned(rusqlite::types::Value::Null)) => DataType::None,
+            _ => DataType::None,
+        }
+    }).collect()
 }
 
 /// Convert a rusqlite row value to JSON.

@@ -127,9 +127,15 @@ export declare class Statement {
   /**
    * Execute the statement and return the first row.
    * Throws if this is not a reader statement.
+   *
+   * If the query is accelerated by Noria, tries the cache first with upquery fallback.
    */
   get(...params: any[]): any | null
-  /** Execute the statement and return all rows. */
+  /**
+   * Execute the statement and return all rows.
+   *
+   * If the query is accelerated by Noria, tries the cache first with upquery fallback.
+   */
   all(...params: any[]): Array<any>
   /** Execute the statement and return info about the execution. */
   run(...params: any[]): RunResult
