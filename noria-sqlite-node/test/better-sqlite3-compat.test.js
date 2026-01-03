@@ -576,11 +576,12 @@ describe('Statement#bind()', function () {
 		stmt.bind('foobar', 25, null);
 		expect(() => stmt.bind('foobar', 25, null)).to.throw(TypeError);
 	});
-	it.skip('should throw with incorrect parameter count', function () {
-		// This requires parameter count validation which we don't have yet
+	it('should throw with incorrect parameter count', function () {
 		const stmt = this.db.prepare("INSERT INTO entries VALUES (?, ?, ?)");
-		expect(() => stmt.bind('foobar', 25)).to.throw(RangeError);
-		expect(() => stmt.bind('foobar', 25, null, null)).to.throw(RangeError);
+		// Note: better-sqlite3 throws RangeError, we throw Error with message
+		expect(() => stmt.bind('foobar', 25)).to.throw(/Expected 3 parameter.*got 2/);
+		const stmt2 = this.db.prepare("INSERT INTO entries VALUES (?, ?, ?)");
+		expect(() => stmt2.bind('foobar', 25, null, null)).to.throw(/Expected 3 parameter.*got 4/);
 	});
 });
 

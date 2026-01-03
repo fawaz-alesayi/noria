@@ -126,8 +126,8 @@ impl Database {
             ));
         }
 
-        // Validate SQL at prepare time and get column names and table origins
-        let (column_names, column_tables) = {
+        // Validate SQL at prepare time and get column names, table origins, and param count
+        let (column_names, column_tables, param_count) = {
             let conn = self.inner.connection().read();
             let sqlite_stmt = conn.prepare(&sql)
                 .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
@@ -141,7 +141,10 @@ impl Database {
                 .map(|col| col.table_name().map(|s| s.to_string()))
                 .collect();
 
-            (names, tables)
+            // Get parameter count
+            let param_count = sqlite_stmt.parameter_count();
+
+            (names, tables, param_count)
         };
 
         let stmt = self
@@ -181,6 +184,7 @@ impl Database {
             column_names,
             column_tables,
             is_cached,
+            param_count,
         })
     }
 
@@ -847,6 +851,8 @@ pub struct Statement {
     column_tables: Vec<Option<String>>,
     /// Whether this statement has a Noria view (is accelerated)
     is_cached: bool,
+    /// Number of parameters expected by this statement
+    param_count: usize,
 }
 
 #[napi]
@@ -1166,6 +1172,19 @@ impl Statement {
 
         // Flatten the params
         let flat_params = flatten_params(&params)?;
+
+        // Validate parameter count
+        if flat_params.len() != self.param_count {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "Expected {} parameter(s), got {}",
+                    self.param_count,
+                    flat_params.len()
+                ),
+            ));
+        }
+
         self.bound_params = Some(flat_params);
         Ok(self)
     }
