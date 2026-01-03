@@ -679,21 +679,21 @@ describe('Database#aggregate()', function () {
 		this.db.close();
 	});
 
-	it.skip('should throw if name is not a string', function () {
+	it('should throw if name is not a string', function () {
 		expect(() => this.db.aggregate(null, { step: () => {} })).to.throw(TypeError);
 	});
-	it.skip('should throw if options.step is not a function', function () {
+	it('should throw if options.step is not a function', function () {
 		expect(() => this.db.aggregate('foo', {})).to.throw(TypeError);
 		expect(() => this.db.aggregate('foo', { step: null })).to.throw(TypeError);
 	});
-	it.skip('should register an aggregate function', function () {
+	it('should register an aggregate function', function () {
 		this.db.aggregate('mysum', {
 			start: 0,
 			step: (acc, val) => acc + val,
 		});
 		expect(this.db.prepare('SELECT mysum(value) FROM entries').pluck().get()).to.equal(15);
 	});
-	it.skip('should support result transformer', function () {
+	it('should support result transformer', function () {
 		this.db.aggregate('myavg', {
 			start: () => ({ sum: 0, count: 0 }),
 			step: (acc, val) => { acc.sum += val; acc.count++; return acc; },
@@ -701,6 +701,7 @@ describe('Database#aggregate()', function () {
 		});
 		expect(this.db.prepare('SELECT myavg(value) FROM entries').pluck().get()).to.equal(3);
 	});
+	// Window functions require WindowAggregate trait in rusqlite which is more complex
 	it.skip('should support inverse for window functions', function () {
 		this.db.aggregate('movsum', {
 			start: 0,

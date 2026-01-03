@@ -104,6 +104,19 @@ export declare class Database {
    * directly without ThreadsafeFunction.
    */
   _registerFunction(callback: (...args: any[]) => any, name: string, argc: number, safeInts: number, deterministic: boolean, directOnly: boolean): void
+  /**
+   * Register a user-defined aggregate function.
+   * @param start - Initial accumulator value (or function that returns initial value)
+   * @param step - Function called for each row: step(accumulator, ...values)
+   * @param inverse - Optional function for window functions: inverse(accumulator, ...values)
+   * @param result - Optional function to transform final result: result(accumulator)
+   * @param name - SQL function name
+   * @param argc - Number of arguments (-1 for varargs)
+   * @param safe_ints - Whether to use BigInt for integers (0=false, 1=true, 2=inherit)
+   * @param deterministic - Whether function is deterministic
+   * @param direct_only - Whether function can only be called directly
+   */
+  _registerAggregate(start: unknown, step: (acc: any, ...args: any[]) => any, inverse: (...args: any[]) => any | undefined | null, resultFn: (...args: any[]) => any | undefined | null, name: string, argc: number, safeInts: number, deterministic: boolean, directOnly: boolean): void
 }
 /** A prepared SQL statement. */
 export declare class Statement {

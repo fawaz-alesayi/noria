@@ -376,6 +376,93 @@ Database.prototype.function = function defineFunction(name, options, fn) {
 	return this;
 };
 
+// Register a user-defined aggregate function
+Database.prototype.aggregate = function defineAggregate(name, options) {
+	// Validate arguments
+	if (typeof name !== 'string') throw new TypeError('Expected first argument to be a string');
+	if (typeof options !== 'object' || options === null) throw new TypeError('Expected second argument to be an options object');
+	if (!name) throw new TypeError('User-defined function name cannot be an empty string');
+
+	// Interpret options
+	const start = 'start' in options ? options.start : null;
+	const step = getFunctionOption(options, 'step', true);
+	const inverse = getFunctionOption(options, 'inverse', false);
+	const result = getFunctionOption(options, 'result', false);
+	const safeIntegers = 'safeIntegers' in options ? (getBooleanOption(options, 'safeIntegers') ? 1 : 0) : 2;
+	const deterministic = getBooleanOption(options, 'deterministic');
+	const directOnly = getBooleanOption(options, 'directOnly');
+	const varargs = getBooleanOption(options, 'varargs');
+	let argCount = -1;
+
+	// Determine argument count
+	if (!varargs) {
+		argCount = Math.max(getLength(step), inverse ? getLength(inverse) : 0);
+		if (argCount > 0) argCount -= 1;
+		if (argCount > 100) throw new RangeError('User-defined functions cannot have more than 100 arguments');
+	}
+
+	// Wrap step function to handle BigInt conversion
+	const wrapStep = function(acc, ...args) {
+		const convertedArgs = args.map(convertBigInts);
+		const newAcc = step.call(this, acc, ...convertedArgs);
+		return newAcc !== undefined ? newAcc : acc;
+	};
+
+	// Wrap inverse function if provided
+	const wrapInverse = inverse ? function(acc, ...args) {
+		const convertedArgs = args.map(convertBigInts);
+		const newAcc = inverse.call(this, acc, ...convertedArgs);
+		return newAcc !== undefined ? newAcc : acc;
+	} : null;
+
+	// Wrap result function if provided
+	const wrapResult = result ? function(acc) {
+		const res = result.call(this, acc);
+		if (typeof res === 'bigint') {
+			return { $bigint: res.toString() };
+		}
+		return res;
+	} : null;
+
+	try {
+		this[cppdb]._registerAggregate(
+			start,
+			wrapStep,
+			wrapInverse,
+			wrapResult,
+			name,
+			argCount,
+			safeIntegers,
+			deterministic,
+			directOnly
+		);
+	} catch (e) {
+		if (e.message && e.message.startsWith('SQLITE_')) {
+			const match = e.message.match(/^(SQLITE_\w+):\s*(.*)/);
+			if (match) {
+				throw new SqliteError(match[2] || match[1], match[1]);
+			}
+		}
+		throw e;
+	}
+	return this;
+};
+
+// Helper function to get a function option
+function getFunctionOption(options, key, required) {
+	const value = key in options ? options[key] : null;
+	if (typeof value === 'function') return value;
+	if (value != null) throw new TypeError(`Expected the "${key}" option to be a function`);
+	if (required) throw new TypeError(`Missing required option "${key}"`);
+	return null;
+}
+
+// Helper function to get function length
+function getLength({ length }) {
+	if (Number.isInteger(length) && length >= 0) return length;
+	throw new TypeError('Expected function.length to be a positive integer');
+}
+
 // Serialize the database to a Buffer
 Database.prototype.serialize = function serialize(options) {
 	if (options == null) options = {};

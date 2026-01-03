@@ -7,6 +7,7 @@ use napi::bindgen_prelude::*;
 use napi::sys;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::NapiRaw;
+use napi::JsUnknown;
 use napi_derive::napi;
 use noria_sqlite::{Database as NoriaDatabase, Statement as NoriaStatement};
 use parking_lot::Mutex;
@@ -464,6 +465,298 @@ impl Database {
             }
         })
         .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Register a user-defined aggregate function.
+    /// @param start - Initial accumulator value (or function that returns initial value)
+    /// @param step - Function called for each row: step(accumulator, ...values)
+    /// @param inverse - Optional function for window functions: inverse(accumulator, ...values)
+    /// @param result - Optional function to transform final result: result(accumulator)
+    /// @param name - SQL function name
+    /// @param argc - Number of arguments (-1 for varargs)
+    /// @param safe_ints - Whether to use BigInt for integers (0=false, 1=true, 2=inherit)
+    /// @param deterministic - Whether function is deterministic
+    /// @param direct_only - Whether function can only be called directly
+    #[napi(js_name = "_registerAggregate")]
+    pub fn register_aggregate(
+        &self,
+        env: Env,
+        start: JsUnknown,
+        #[napi(ts_arg_type = "(acc: any, ...args: any[]) => any")] step: JsFunction,
+        inverse: Option<JsFunction>,
+        result_fn: Option<JsFunction>,
+        name: String,
+        argc: i32,
+        safe_ints: i32,
+        deterministic: bool,
+        direct_only: bool,
+    ) -> Result<()> {
+        if !self.is_open {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "The database connection is not open",
+            ));
+        }
+
+        let raw_env = env.raw();
+
+        // Create references to prevent GC
+        let mut step_ref: sys::napi_ref = std::ptr::null_mut();
+        let mut inverse_ref: sys::napi_ref = std::ptr::null_mut();
+        let mut result_ref: sys::napi_ref = std::ptr::null_mut();
+        let mut start_ref: sys::napi_ref = std::ptr::null_mut();
+        let mut start_is_function = false;
+        let mut start_value: Option<rusqlite::types::Value> = None;
+
+        unsafe {
+            // Create reference for step function
+            let status = sys::napi_create_reference(raw_env, step.raw(), 1, &mut step_ref);
+            if status != sys::Status::napi_ok {
+                return Err(Error::new(Status::GenericFailure, "Failed to create step function reference"));
+            }
+
+            // Create reference for inverse function if provided
+            if let Some(ref inv) = inverse {
+                let status = sys::napi_create_reference(raw_env, inv.raw(), 1, &mut inverse_ref);
+                if status != sys::Status::napi_ok {
+                    return Err(Error::new(Status::GenericFailure, "Failed to create inverse function reference"));
+                }
+            }
+
+            // Create reference for result function if provided
+            if let Some(ref res) = result_fn {
+                let status = sys::napi_create_reference(raw_env, res.raw(), 1, &mut result_ref);
+                if status != sys::Status::napi_ok {
+                    return Err(Error::new(Status::GenericFailure, "Failed to create result function reference"));
+                }
+            }
+
+            // Check if start is a function or a primitive value
+            let mut value_type: sys::napi_valuetype = sys::ValueType::napi_undefined;
+            sys::napi_typeof(raw_env, start.raw(), &mut value_type);
+            start_is_function = value_type == sys::ValueType::napi_function;
+
+            if start_is_function || value_type == sys::ValueType::napi_object {
+                // Functions and objects can have references
+                let status = sys::napi_create_reference(raw_env, start.raw(), 1, &mut start_ref);
+                if status != sys::Status::napi_ok {
+                    return Err(Error::new(Status::GenericFailure, "Failed to create start reference"));
+                }
+            } else {
+                // Primitives (null, undefined, boolean, number, string, bigint) - convert to rusqlite Value
+                start_value = Some(napi_value_to_rusqlite_value(raw_env, start.raw())
+                    .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to convert start value: {}", e)))?);
+            }
+        }
+
+        // Determine safe_ints setting
+        let use_safe_ints = if safe_ints == 2 {
+            self.default_safe_integers
+        } else {
+            safe_ints == 1
+        };
+
+        // Build function flags
+        let mut flags = FunctionFlags::SQLITE_UTF8;
+        if deterministic {
+            flags |= FunctionFlags::SQLITE_DETERMINISTIC;
+        }
+        if direct_only {
+            flags |= FunctionFlags::SQLITE_DIRECTONLY;
+        }
+
+        // Context for aggregate - holds all JS function refs
+        struct AggregateContext {
+            raw_env: sys::napi_env,
+            start_ref: sys::napi_ref,       // null if start is primitive
+            start_is_function: bool,
+            start_primitive: Option<rusqlite::types::Value>,  // Some if start is primitive
+            step_ref: sys::napi_ref,
+            inverse_ref: sys::napi_ref,  // may be null
+            result_ref: sys::napi_ref,   // may be null
+            safe_ints: bool,
+        }
+
+        unsafe impl Send for AggregateContext {}
+        unsafe impl Sync for AggregateContext {}
+
+        // The accumulator is stored as a rusqlite Value (converted to/from JS as needed)
+        struct Accumulator {
+            value: rusqlite::types::Value,
+        }
+
+        struct JsAggregate {
+            ctx: Arc<AggregateContext>,
+        }
+
+        impl rusqlite::functions::Aggregate<Accumulator, rusqlite::types::Value> for JsAggregate {
+            fn init(&self, _: &mut rusqlite::functions::Context<'_>) -> rusqlite::Result<Accumulator> {
+                unsafe {
+                    let env = self.ctx.raw_env;
+
+                    let init_val = if let Some(ref primitive) = self.ctx.start_primitive {
+                        // Start is a primitive value - use it directly
+                        primitive.clone()
+                    } else {
+                        // Get start value from reference (function or object)
+                        let mut start_val: sys::napi_value = std::ptr::null_mut();
+                        sys::napi_get_reference_value(env, self.ctx.start_ref, &mut start_val);
+
+                        if self.ctx.start_is_function {
+                            // Call the start function
+                            let mut undefined: sys::napi_value = std::ptr::null_mut();
+                            sys::napi_get_undefined(env, &mut undefined);
+
+                            let mut result: sys::napi_value = std::ptr::null_mut();
+                            let status = sys::napi_call_function(env, undefined, start_val, 0, std::ptr::null(), &mut result);
+                            if status != sys::Status::napi_ok {
+                                return Err(rusqlite::Error::UserFunctionError(Box::new(
+                                    std::io::Error::new(std::io::ErrorKind::Other, "Failed to call start function"),
+                                )));
+                            }
+                            // Convert the JS result to rusqlite Value
+                            napi_value_to_rusqlite_value(env, result)?
+                        } else {
+                            // Object start value - convert to rusqlite Value
+                            napi_value_to_rusqlite_value(env, start_val)?
+                        }
+                    };
+
+                    Ok(Accumulator { value: init_val })
+                }
+            }
+
+            fn step(&self, sqlite_ctx: &mut rusqlite::functions::Context<'_>, acc: &mut Accumulator) -> rusqlite::Result<()> {
+                unsafe {
+                    let env = self.ctx.raw_env;
+
+                    // Get the step function
+                    let mut step_fn: sys::napi_value = std::ptr::null_mut();
+                    sys::napi_get_reference_value(env, self.ctx.step_ref, &mut step_fn);
+
+                    // Convert current accumulator to NAPI value
+                    let acc_napi = rusqlite_value_to_napi(env, &acc.value)?;
+
+                    // Build args: (accumulator, ...sqlite_values)
+                    let arg_count = sqlite_ctx.len() + 1;
+                    let mut napi_args: Vec<sys::napi_value> = Vec::with_capacity(arg_count);
+                    napi_args.push(acc_napi);
+
+                    for i in 0..sqlite_ctx.len() {
+                        let napi_val = sqlite_value_to_napi(env, sqlite_ctx.get_raw(i), self.ctx.safe_ints)?;
+                        napi_args.push(napi_val);
+                    }
+
+                    // Call step(acc, ...values)
+                    let mut undefined: sys::napi_value = std::ptr::null_mut();
+                    sys::napi_get_undefined(env, &mut undefined);
+
+                    let mut result: sys::napi_value = std::ptr::null_mut();
+                    let status = sys::napi_call_function(
+                        env,
+                        undefined,
+                        step_fn,
+                        arg_count,
+                        napi_args.as_ptr(),
+                        &mut result,
+                    );
+
+                    if status != sys::Status::napi_ok {
+                        let mut is_pending = false;
+                        sys::napi_is_exception_pending(env, &mut is_pending);
+                        if is_pending {
+                            let mut exception: sys::napi_value = std::ptr::null_mut();
+                            sys::napi_get_and_clear_last_exception(env, &mut exception);
+                        }
+                        return Err(rusqlite::Error::UserFunctionError(Box::new(
+                            std::io::Error::new(std::io::ErrorKind::Other, "Failed to call step function"),
+                        )));
+                    }
+
+                    // Update accumulator with new value (if step returned something)
+                    let mut value_type: sys::napi_valuetype = sys::ValueType::napi_undefined;
+                    sys::napi_typeof(env, result, &mut value_type);
+
+                    if value_type != sys::ValueType::napi_undefined {
+                        // Convert result back to rusqlite Value and update accumulator
+                        let new_value = napi_value_to_rusqlite_value(env, result)?;
+                        acc.value = new_value;
+                    }
+
+                    Ok(())
+                }
+            }
+
+            fn finalize(&self, _: &mut rusqlite::functions::Context<'_>, acc: Option<Accumulator>) -> rusqlite::Result<rusqlite::types::Value> {
+                unsafe {
+                    let env = self.ctx.raw_env;
+
+                    match acc {
+                        Some(a) => {
+                            // Get the final accumulator value
+                            let final_acc = a.value;
+
+                            // If we have a result function, call it
+                            if !self.ctx.result_ref.is_null() {
+                                // Convert accumulator to NAPI value
+                                let acc_napi = rusqlite_value_to_napi(env, &final_acc)?;
+
+                                let mut result_fn: sys::napi_value = std::ptr::null_mut();
+                                sys::napi_get_reference_value(env, self.ctx.result_ref, &mut result_fn);
+
+                                let mut undefined: sys::napi_value = std::ptr::null_mut();
+                                sys::napi_get_undefined(env, &mut undefined);
+
+                                let mut result: sys::napi_value = std::ptr::null_mut();
+                                let status = sys::napi_call_function(
+                                    env,
+                                    undefined,
+                                    result_fn,
+                                    1,
+                                    &acc_napi,
+                                    &mut result,
+                                );
+
+                                if status != sys::Status::napi_ok {
+                                    return Err(rusqlite::Error::UserFunctionError(Box::new(
+                                        std::io::Error::new(std::io::ErrorKind::Other, "Failed to call result function"),
+                                    )));
+                                }
+                                // Convert result back to rusqlite Value
+                                napi_value_to_rusqlite_value(env, result)
+                            } else {
+                                // Return accumulator directly
+                                Ok(final_acc)
+                            }
+                        }
+                        None => {
+                            // No rows - return null
+                            Ok(rusqlite::types::Value::Null)
+                        }
+                    }
+                }
+            }
+        }
+
+        let ctx = Arc::new(AggregateContext {
+            raw_env,
+            start_ref,
+            start_is_function,
+            start_primitive: start_value,
+            step_ref,
+            inverse_ref,
+            result_ref,
+            safe_ints: use_safe_ints,
+        });
+
+        let aggregate = JsAggregate { ctx };
+
+        // Register the aggregate function
+        let conn = self.inner.connection().write();
+        conn.create_aggregate_function(&name, argc, flags, aggregate)
+            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
 
         Ok(())
     }
@@ -1103,6 +1396,226 @@ unsafe fn napi_value_to_sqlite_result(
         }
         _ => Ok(ToSqlOutput::Owned(Value::Null)),
     }
+}
+
+/// Convert a raw NAPI value back to rusqlite Value (for aggregate finalize).
+unsafe fn napi_value_to_rusqlite_value(
+    env: sys::napi_env,
+    value: sys::napi_value,
+) -> rusqlite::Result<rusqlite::types::Value> {
+    use rusqlite::types::Value;
+
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+
+    let mut value_type: sys::napi_valuetype = sys::ValueType::napi_undefined;
+    sys::napi_typeof(env, value, &mut value_type);
+
+    match value_type {
+        sys::ValueType::napi_null | sys::ValueType::napi_undefined => {
+            Ok(Value::Null)
+        }
+        sys::ValueType::napi_boolean => {
+            let mut bool_val = false;
+            sys::napi_get_value_bool(env, value, &mut bool_val);
+            Ok(Value::Integer(if bool_val { 1 } else { 0 }))
+        }
+        sys::ValueType::napi_number => {
+            let mut num_val: f64 = 0.0;
+            sys::napi_get_value_double(env, value, &mut num_val);
+            // Check if it's an integer
+            if num_val.fract() == 0.0 && num_val >= i64::MIN as f64 && num_val <= i64::MAX as f64 {
+                Ok(Value::Integer(num_val as i64))
+            } else {
+                Ok(Value::Real(num_val))
+            }
+        }
+        sys::ValueType::napi_string => {
+            // Get string length
+            let mut str_len: usize = 0;
+            sys::napi_get_value_string_utf8(env, value, std::ptr::null_mut(), 0, &mut str_len);
+
+            // Allocate buffer and get string
+            let mut buf = vec![0u8; str_len + 1];
+            let mut copied: usize = 0;
+            sys::napi_get_value_string_utf8(
+                env,
+                value,
+                buf.as_mut_ptr() as *mut i8,
+                str_len + 1,
+                &mut copied,
+            );
+            buf.truncate(copied);
+            let s = String::from_utf8_lossy(&buf).into_owned();
+            Ok(Value::Text(s))
+        }
+        sys::ValueType::napi_bigint => {
+            let mut int_val: i64 = 0;
+            let mut lossless = true;
+            sys::napi_get_value_bigint_int64(env, value, &mut int_val, &mut lossless);
+            Ok(Value::Integer(int_val))
+        }
+        sys::ValueType::napi_object => {
+            // Check if it's a Buffer
+            let mut is_buffer = false;
+            sys::napi_is_buffer(env, value, &mut is_buffer);
+            if is_buffer {
+                let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+                let mut len: usize = 0;
+                sys::napi_get_buffer_info(env, value, &mut data, &mut len);
+                let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
+                return Ok(Value::Blob(bytes));
+            }
+            // Check if it's an Array
+            let mut is_array = false;
+            sys::napi_is_array(env, value, &mut is_array);
+            if is_array {
+                // Serialize array to JSON string with special marker
+                if let Ok(json) = napi_value_to_json(env, value) {
+                    return Ok(Value::Text(format!("\x00__ARRAY__{}", json)));
+                }
+            }
+            // Other objects - serialize to JSON string with special marker
+            if let Ok(json) = napi_value_to_json(env, value) {
+                return Ok(Value::Text(format!("\x00__OBJECT__{}", json)));
+            }
+            Ok(Value::Null)
+        }
+        _ => Ok(Value::Null),
+    }
+}
+
+/// Convert a NAPI object/array to JSON string.
+unsafe fn napi_value_to_json(
+    env: sys::napi_env,
+    value: sys::napi_value,
+) -> std::result::Result<String, ()> {
+    // Get the global object
+    let mut global: sys::napi_value = std::ptr::null_mut();
+    sys::napi_get_global(env, &mut global);
+
+    // Get JSON.stringify
+    let mut json_obj: sys::napi_value = std::ptr::null_mut();
+    let json_str = "JSON\0";
+    sys::napi_get_named_property(env, global, json_str.as_ptr() as *const i8, &mut json_obj);
+
+    let mut stringify_fn: sys::napi_value = std::ptr::null_mut();
+    let stringify_str = "stringify\0";
+    sys::napi_get_named_property(env, json_obj, stringify_str.as_ptr() as *const i8, &mut stringify_fn);
+
+    // Call JSON.stringify(value)
+    let mut result: sys::napi_value = std::ptr::null_mut();
+    let mut undefined: sys::napi_value = std::ptr::null_mut();
+    sys::napi_get_undefined(env, &mut undefined);
+
+    let status = sys::napi_call_function(env, json_obj, stringify_fn, 1, &value, &mut result);
+    if status != sys::Status::napi_ok {
+        return Err(());
+    }
+
+    // Get the string value
+    let mut str_len: usize = 0;
+    sys::napi_get_value_string_utf8(env, result, std::ptr::null_mut(), 0, &mut str_len);
+
+    let mut buf = vec![0u8; str_len + 1];
+    let mut copied: usize = 0;
+    sys::napi_get_value_string_utf8(
+        env,
+        result,
+        buf.as_mut_ptr() as *mut i8,
+        str_len + 1,
+        &mut copied,
+    );
+    buf.truncate(copied);
+    String::from_utf8(buf).map_err(|_| ())
+}
+
+/// Parse a JSON string back to a NAPI value.
+unsafe fn json_to_napi_value(
+    env: sys::napi_env,
+    json: &str,
+) -> std::result::Result<sys::napi_value, ()> {
+    // Get the global object
+    let mut global: sys::napi_value = std::ptr::null_mut();
+    sys::napi_get_global(env, &mut global);
+
+    // Get JSON.parse
+    let mut json_obj: sys::napi_value = std::ptr::null_mut();
+    let json_str = "JSON\0";
+    sys::napi_get_named_property(env, global, json_str.as_ptr() as *const i8, &mut json_obj);
+
+    let mut parse_fn: sys::napi_value = std::ptr::null_mut();
+    let parse_str = "parse\0";
+    sys::napi_get_named_property(env, json_obj, parse_str.as_ptr() as *const i8, &mut parse_fn);
+
+    // Create the JSON string as a NAPI value
+    let mut json_val: sys::napi_value = std::ptr::null_mut();
+    sys::napi_create_string_utf8(env, json.as_ptr() as *const i8, json.len(), &mut json_val);
+
+    // Call JSON.parse(json)
+    let mut result: sys::napi_value = std::ptr::null_mut();
+    let status = sys::napi_call_function(env, json_obj, parse_fn, 1, &json_val, &mut result);
+    if status != sys::Status::napi_ok {
+        return Err(());
+    }
+
+    Ok(result)
+}
+
+/// Convert a rusqlite Value to a raw NAPI value.
+unsafe fn rusqlite_value_to_napi(
+    env: sys::napi_env,
+    value: &rusqlite::types::Value,
+) -> rusqlite::Result<sys::napi_value> {
+    use rusqlite::types::Value;
+
+    let mut result: sys::napi_value = std::ptr::null_mut();
+
+    match value {
+        Value::Null => {
+            sys::napi_get_null(env, &mut result);
+        }
+        Value::Integer(i) => {
+            sys::napi_create_double(env, *i as f64, &mut result);
+        }
+        Value::Real(f) => {
+            sys::napi_create_double(env, *f, &mut result);
+        }
+        Value::Text(s) => {
+            // Check for special markers for serialized objects/arrays
+            if s.starts_with("\x00__OBJECT__") {
+                let json = &s[11..];
+                if let Ok(parsed) = json_to_napi_value(env, json) {
+                    return Ok(parsed);
+                }
+            } else if s.starts_with("\x00__ARRAY__") {
+                let json = &s[10..];
+                if let Ok(parsed) = json_to_napi_value(env, json) {
+                    return Ok(parsed);
+                }
+            }
+            // Regular string
+            sys::napi_create_string_utf8(
+                env,
+                s.as_ptr() as *const i8,
+                s.len(),
+                &mut result,
+            );
+        }
+        Value::Blob(b) => {
+            let mut buffer_data: *mut std::ffi::c_void = std::ptr::null_mut();
+            sys::napi_create_buffer_copy(
+                env,
+                b.len(),
+                b.as_ptr() as *const std::ffi::c_void,
+                &mut buffer_data,
+                &mut result,
+            );
+        }
+    }
+
+    Ok(result)
 }
 
 /// Convert a SQLite value (from function context) to JSON for JavaScript.
