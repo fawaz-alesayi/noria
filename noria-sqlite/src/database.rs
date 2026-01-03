@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::statement::Statement;
 use crate::Config;
 use noria::DataType;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 use std::sync::Arc;
@@ -27,6 +27,11 @@ pub struct Database {
 
     /// Configuration
     config: Config,
+
+    /// Pending CDC events during a transaction.
+    /// Events are buffered here during explicit transactions and only applied on COMMIT.
+    /// On ROLLBACK, these events are discarded.
+    pending_events: Arc<Mutex<Vec<CdcEvent>>>,
 }
 
 impl Database {
@@ -73,6 +78,7 @@ impl Database {
 
         // Create the Noria dataflow engine
         let engine = Arc::new(NoriaEngine::new(conn.clone()));
+        let pending_events = Arc::new(Mutex::new(Vec::new()));
 
         // Note: We don't use update_hook for dataflow propagation because
         // NoriaEngine contains types that aren't Sync. Instead, we trigger
@@ -85,6 +91,7 @@ impl Database {
             conn,
             engine,
             config,
+            pending_events,
         })
     }
 
@@ -151,18 +158,30 @@ impl Database {
     /// # Ok::<(), noria_sqlite::Error>(())
     /// ```
     pub fn execute<P: rusqlite::Params>(&self, sql: &str, params: P) -> Result<usize> {
+        // Detect transaction control statements
+        let sql_upper = sql.trim().to_uppercase();
+        let is_begin = sql_upper.starts_with("BEGIN");
+        let is_commit = sql_upper.starts_with("COMMIT") || sql_upper.starts_with("END");
+        let is_rollback = sql_upper.starts_with("ROLLBACK");
+
         // Extract events while holding the connection lock, then apply after releasing
-        let (rows_changed, events) = {
+        let (rows_changed, events, should_apply_pending) = {
             let conn = self.conn.write();
 
-            // Create a session to track changes
+            // Check if we're in a transaction BEFORE executing
+            let was_in_transaction = !conn.is_autocommit();
+
+            // Create a session to track changes for this statement
             let mut tracker = SessionTracker::new(&conn)?;
             tracker.attach_all()?;
 
             // Execute the statement
             let rows_changed = conn.execute(sql, params)?;
 
-            // Get the changeset and extract events while we still have the lock
+            // Check if we're in a transaction AFTER executing
+            let in_transaction = !conn.is_autocommit();
+
+            // Get CDC events for this statement
             let events = if rows_changed > 0 {
                 tracker
                     .changeset()
@@ -173,14 +192,42 @@ impl Database {
                 Vec::new()
             };
 
-            (rows_changed, events)
+            // Determine if we should apply pending events (transaction just ended)
+            let should_apply_pending = was_in_transaction && !in_transaction && is_commit;
+
+            (rows_changed, events, should_apply_pending)
             // Write lock is released here
         };
 
-        // Apply CDC events after releasing the connection lock
-        // This allows complete_row_from_db to acquire a read lock
-        if !events.is_empty() {
-            self.apply_cdc_events(&events);
+        // Handle transaction-aware CDC
+        if is_rollback {
+            // ROLLBACK: discard all pending events
+            self.pending_events.lock().clear();
+        } else if is_begin {
+            // BEGIN: clear pending events (start fresh)
+            self.pending_events.lock().clear();
+        } else if !events.is_empty() {
+            // Check if we're currently in a transaction
+            let in_transaction = {
+                let conn = self.conn.read();
+                !conn.is_autocommit()
+            };
+
+            if in_transaction {
+                // In transaction: buffer events for later
+                self.pending_events.lock().extend(events);
+            } else {
+                // Autocommit mode: apply events immediately
+                self.apply_cdc_events(&events);
+            }
+        }
+
+        // If transaction just committed, apply all pending events
+        if should_apply_pending {
+            let pending = std::mem::take(&mut *self.pending_events.lock());
+            if !pending.is_empty() {
+                self.apply_cdc_events(&pending);
+            }
         }
 
         Ok(rows_changed)

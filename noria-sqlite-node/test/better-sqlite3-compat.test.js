@@ -1338,9 +1338,8 @@ describe('Noria Acceleration', function () {
 		expect(query.get(3).name).to.equal('Charlie');
 	});
 
-	// TODO: Transaction rollback needs proper CDC integration
-	// Currently CDC tracks inserts before knowing if transaction commits
-	it.skip('should handle transaction rollback', function () {
+	// Test that transaction rollback doesn't leave phantom data in cache
+	it('should handle transaction rollback', function () {
 		const insert = this.db.prepare('INSERT INTO users VALUES (?, ?, ?)');
 		const query = this.db.prepare('SELECT * FROM users WHERE id = ?');
 
