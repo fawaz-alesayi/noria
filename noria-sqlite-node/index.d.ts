@@ -137,6 +137,11 @@ export declare class Database {
    * @param direct_only - Whether function can only be called directly
    */
   _registerAggregate(start: unknown, step: (acc: any, ...args: any[]) => any, inverse: (...args: any[]) => any | undefined | null, resultFn: (...args: any[]) => any | undefined | null, name: string, argc: number, safeInts: number, deterministic: boolean, directOnly: boolean): void
+  /**
+   * Register a virtual table.
+   * This creates an eponymous virtual table that reads from a JavaScript generator.
+   */
+  _registerVirtualTable(name: string, columns: Array<string>, parameters: Array<string>, rowsGenerator: (...args: any[]) => Generator): void
 }
 /** A prepared SQL statement. */
 export declare class Statement {

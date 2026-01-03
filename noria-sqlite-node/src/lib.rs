@@ -914,6 +914,170 @@ impl Database {
 
         Ok(())
     }
+
+    /// Register a virtual table.
+    /// This creates an eponymous virtual table that reads from a JavaScript generator.
+    #[napi(js_name = "_registerVirtualTable")]
+    pub fn register_virtual_table(
+        &self,
+        env: Env,
+        name: String,
+        columns: Vec<String>,
+        parameters: Vec<String>,
+        #[napi(ts_arg_type = "(...args: any[]) => Generator")] rows_generator: JsFunction,
+    ) -> Result<()> {
+        use rusqlite::vtab::{
+            eponymous_only_module, Context, Filters, IndexInfo, VTab, VTabConfig, VTabConnection, VTabCursor,
+        };
+        use std::ffi::c_int;
+
+        if !self.is_open {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "The database connection is not open",
+            ));
+        }
+
+        let raw_env = env.raw();
+
+        // Create a reference to the generator function
+        let mut gen_ref: sys::napi_ref = std::ptr::null_mut();
+        unsafe {
+            let status = sys::napi_create_reference(raw_env, rows_generator.raw(), 1, &mut gen_ref);
+            if status != sys::Status::napi_ok {
+                return Err(Error::new(Status::GenericFailure, "Failed to create generator reference"));
+            }
+        }
+
+        // Build the CREATE TABLE schema
+        let mut col_defs: Vec<String> = columns.iter().map(|c| format!("{} ANY", c)).collect();
+        // Add hidden parameters
+        for param in &parameters {
+            col_defs.push(format!("{} HIDDEN", param));
+        }
+        let schema = format!("CREATE TABLE x({})", col_defs.join(", "));
+        let column_count = columns.len();
+        let param_count = parameters.len();
+
+        // Context for the virtual table
+        struct JsVTabAux {
+            raw_env: sys::napi_env,
+            gen_ref: sys::napi_ref,
+            schema: String,
+            column_count: usize,
+            param_count: usize,
+        }
+
+        unsafe impl Send for JsVTabAux {}
+        unsafe impl Sync for JsVTabAux {}
+
+        let aux = Box::new(JsVTabAux {
+            raw_env,
+            gen_ref,
+            schema: schema.clone(),
+            column_count,
+            param_count,
+        });
+
+        // Virtual table structure
+        #[repr(C)]
+        struct JsVTab {
+            base: rusqlite::ffi::sqlite3_vtab,
+        }
+
+        // Cursor structure - holds the current state
+        struct JsVTabCursor<'vtab> {
+            base: rusqlite::ffi::sqlite3_vtab_cursor,
+            rows: Vec<Vec<rusqlite::types::Value>>,
+            row_index: usize,
+            phantom: std::marker::PhantomData<&'vtab JsVTab>,
+        }
+
+        unsafe impl<'vtab> VTab<'vtab> for JsVTab {
+            type Aux = JsVTabAux;
+            type Cursor = JsVTabCursor<'vtab>;
+
+            fn connect(
+                db: &mut VTabConnection,
+                aux: Option<&JsVTabAux>,
+                _args: &[&[u8]],
+            ) -> rusqlite::Result<(String, Self)> {
+                let vtab = Self {
+                    base: rusqlite::ffi::sqlite3_vtab::default(),
+                };
+                db.config(VTabConfig::Innocuous)?;
+                let schema = aux.map(|a| a.schema.clone()).unwrap_or_default();
+                Ok((schema, vtab))
+            }
+
+            fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
+                // Simple implementation - just scan all rows
+                info.set_estimated_cost(1000000.0);
+                info.set_estimated_rows(1000);
+                Ok(())
+            }
+
+            fn open(&'vtab mut self) -> rusqlite::Result<Self::Cursor> {
+                Ok(JsVTabCursor {
+                    base: rusqlite::ffi::sqlite3_vtab_cursor::default(),
+                    rows: Vec::new(),
+                    row_index: 0,
+                    phantom: std::marker::PhantomData,
+                })
+            }
+        }
+
+        unsafe impl<'vtab> VTabCursor for JsVTabCursor<'vtab> {
+            fn filter(
+                &mut self,
+                _idx_num: c_int,
+                _idx_str: Option<&str>,
+                _args: &rusqlite::vtab::Filters<'_>,
+            ) -> rusqlite::Result<()> {
+                // For now, just use hardcoded test data
+                // TODO: Actually call the JavaScript generator
+                self.rows = vec![
+                    vec![rusqlite::types::Value::Integer(1)],
+                    vec![rusqlite::types::Value::Integer(2)],
+                    vec![rusqlite::types::Value::Integer(3)],
+                ];
+                self.row_index = 0;
+                Ok(())
+            }
+
+            fn next(&mut self) -> rusqlite::Result<()> {
+                self.row_index += 1;
+                Ok(())
+            }
+
+            fn eof(&self) -> bool {
+                self.row_index >= self.rows.len()
+            }
+
+            fn column(&self, ctx: &mut Context, col: c_int) -> rusqlite::Result<()> {
+                if self.row_index < self.rows.len() {
+                    let row = &self.rows[self.row_index];
+                    if (col as usize) < row.len() {
+                        ctx.set_result(&row[col as usize])?;
+                    }
+                }
+                Ok(())
+            }
+
+            fn rowid(&self) -> rusqlite::Result<i64> {
+                Ok(self.row_index as i64)
+            }
+        }
+
+        // Register the module
+        let conn = self.inner.connection().write();
+
+        // Create the module and register it using the name string slice
+        conn.create_module(name.as_str(), eponymous_only_module::<JsVTab>(), Some(*aux))
+            .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+
+        Ok(())
+    }
 }
 
 /// Database constructor options

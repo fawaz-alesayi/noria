@@ -453,6 +453,65 @@ Database.prototype.aggregate = function defineAggregate(name, options) {
 	return this;
 };
 
+// Register a virtual table
+Database.prototype.table = function defineTable(name, definition) {
+	// Validate name
+	if (typeof name !== 'string') {
+		throw new TypeError('Expected first argument to be a string');
+	}
+	if (!name) {
+		throw new TypeError('Virtual table name cannot be an empty string');
+	}
+
+	// Validate definition
+	if (definition == null || typeof definition !== 'object') {
+		throw new TypeError('Expected second argument to be an options object');
+	}
+
+	// Validate columns
+	if (!Array.isArray(definition.columns)) {
+		throw new TypeError('Expected the "columns" option to be an array');
+	}
+	if (definition.columns.length === 0) {
+		throw new TypeError('Virtual tables must have at least one column');
+	}
+
+	// Validate rows - must be a generator function
+	const rows = definition.rows;
+	if (typeof rows !== 'function') {
+		throw new TypeError('Expected the "rows" option to be a generator function');
+	}
+	// Check if it's a generator function by checking for the GeneratorFunction constructor
+	const GeneratorFunction = Object.getPrototypeOf(function* () {}).constructor;
+	if (!(rows instanceof GeneratorFunction)) {
+		throw new TypeError('Expected the "rows" option to be a generator function');
+	}
+
+	// Get optional parameters
+	const parameters = definition.parameters || [];
+	if (!Array.isArray(parameters)) {
+		throw new TypeError('Expected the "parameters" option to be an array');
+	}
+
+	// Virtual tables require complex lifetime management in rusqlite
+	// that is difficult to implement with JS callbacks. For now, throw an error.
+	throw new Error('Virtual tables are not yet fully implemented. This feature requires complex native code integration with JavaScript generators.');
+
+	// TODO: Implement virtual table registration
+	// try {
+	// 	this[cppdb]._registerVirtualTable(name, definition.columns, parameters, rows);
+	// } catch (e) {
+	// 	if (e.message && e.message.startsWith('SQLITE_')) {
+	// 		const match = e.message.match(/^(SQLITE_\w+):\s*(.*)/);
+	// 		if (match) {
+	// 			throw new SqliteError(match[2] || match[1], match[1]);
+	// 		}
+	// 	}
+	// 	throw e;
+	// }
+	// return this;
+};
+
 // Helper function to get a function option
 function getFunctionOption(options, key, required) {
 	const value = key in options ? options[key] : null;

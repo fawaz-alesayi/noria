@@ -728,15 +728,17 @@ describe('Database#table()', function () {
 		this.db.close();
 	});
 
-	it.skip('should throw if name is not a string', function () {
-		expect(() => this.db.table(null, { columns: ['x'], *rows() {} })).to.throw(TypeError);
+	it('should throw if name is not a string', function () {
+		expect(() => this.db.table(null, { columns: ['x'], *rows() {} })).to.throw(TypeError, /Expected first argument to be a string/);
 	});
-	it.skip('should throw if columns is not an array', function () {
-		expect(() => this.db.table('foo', { *rows() {} })).to.throw(TypeError);
+	it('should throw if columns is not an array', function () {
+		expect(() => this.db.table('foo', { *rows() {} })).to.throw(TypeError, /columns/);
 	});
-	it.skip('should throw if rows is not a generator', function () {
-		expect(() => this.db.table('foo', { columns: ['x'], rows: () => [] })).to.throw(TypeError);
+	it('should throw if rows is not a generator', function () {
+		expect(() => this.db.table('foo', { columns: ['x'], rows: () => [] })).to.throw(TypeError, /generator/);
 	});
+	// Skip: Virtual tables require complex lifetime management in rusqlite
+	// that is difficult to implement with JS callbacks
 	it.skip('should register a virtual table', function () {
 		this.db.table('nums', {
 			columns: ['value'],
