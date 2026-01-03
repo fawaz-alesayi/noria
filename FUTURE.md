@@ -162,7 +162,7 @@ Therefore, `noria-sqlite` will use a **Bundled Strategy**:
 **Current Score: 9/10**
 
 The library now provides:
-- ✅ A working better-sqlite3 drop-in replacement (118 tests passing)
+- ✅ A working better-sqlite3 drop-in replacement (112 tests passing)
 - ✅ Session-based CDC infrastructure (fully working)
 - ✅ Full dataflow operators (Filter, Project, Join, Aggregate)
 - ✅ Incremental update propagation for INSERT/UPDATE/DELETE operations
