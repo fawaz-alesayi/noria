@@ -2,6 +2,11 @@
 resolver = "3"
 members = [
 	"noria",
+	"noria-sqlite",
+	"noria-sqlite-node",
+	"server/dataflow",
+	"server/common",
+	"server/mir",
 ]
 
 [profile.release]

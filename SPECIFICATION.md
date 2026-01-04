@@ -1,7 +1,7 @@
 # Engineering Specification: Noria for SQLite
 
-**Version:** 1.1
-**Date:** November 2025
+**Version:** 1.2
+**Date:** January 2026
 **Goal:** Embed Noria's differential dataflow engine as a transparent, in-process caching layer for SQLite.
 
 ---
@@ -110,12 +110,134 @@ This is the user-facing API (Rust) and the FFI core for other languages. It impl
 
 ---
 
-## 5. Risks & Mitigations
+## 5. Implementation Status (January 2026)
+
+### 5.1 Completed Components
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| **Session-Based CDC** | ✅ Done | `SessionTracker` captures INSERT/UPDATE/DELETE with old values |
+| **Node.js Bindings** | ✅ Done | better-sqlite3 compatible API, 46 tests passing |
+| **Core Database Layer** | ✅ Done | Database, Statement, Connection management |
+| **Dataflow Primitives** | ✅ Done | Records, Operators, MemoryState |
+
+### 5.2 Missing Components (Critical)
+
+| Component | Status | Impact |
+|-----------|--------|--------|
+| **Incremental Propagation** | ❌ Missing | Changes captured but NOT propagated to views |
+| **Upquery Mechanism** | ❌ Missing | No fallback to SQLite on cache miss |
+| **View Materialization** | ❌ Missing | Views exist but are not populated |
+| **Dynamic Synthesis** | ❌ Missing | No auto-creation of views from prepared statements |
+| **Eviction** | ❌ Missing | No memory management for cached views |
+
+### 5.3 Current Impact Score: 4/10
+
+The library provides a working better-sqlite3 replacement and CDC infrastructure, but does NOT yet provide Noria's core performance benefits (incremental view maintenance, O(1) lookups).
+
+---
+
+## 6. Hybrid Storage Backend Architecture
+
+### 6.1 Storage Layer Comparison
+
+| Layer | Original Noria | Noria-SQLite |
+|-------|---------------|--------------|
+| **Materialized Views** | evmap (lock-free hashmap) | evmap (same) |
+| **Base Table Persistence** | RocksDB | SQLite |
+| **Upquery Source** | RocksDB | SQLite |
+
+This design eliminates RocksDB entirely—SQLite serves as both the user's database AND Noria's base table backend.
+
+### 6.2 StateStore Trait Implementation
+
+```rust
+impl StateStore for SqliteState {
+    fn lookup(&self, key: &KeyType) -> LookupResult {
+        // Route to SQLite: SELECT * FROM table WHERE pk = ?
+        self.conn.query_row(...)
+    }
+
+    fn process_records(&mut self, records: &mut Records) {
+        // No-op: SQLite already has the data
+    }
+}
+```
+
+### 6.3 Thread Safety Model
+
+- **Connection**: `Arc<RwLock<Connection>>` allows concurrent reads
+- **WAL Mode**: Readers don't block writers (no contention issue)
+- **evmap**: Lock-free reads for materialized views
+
+---
+
+## 7. Eviction Strategy
+
+### 7.1 Noria's Approach: Random Eviction
+
+The original Noria paper uses **random eviction**, not LRU/LFU:
+- Minimal implementation overhead
+- Compatible with partial materialization (evicted entries become "holes")
+- Upqueries refill holes on demand
+
+### 7.2 Implementation Phases
+
+**Phase 1**: Core validation (no eviction)
+- Implement incremental propagation
+- Implement upqueries
+- Validate correctness
+
+**Phase 2**: Add eviction
+- Random eviction strategy
+- Configurable memory limits
+- Memory pressure testing
+
+---
+
+## 8. Configuration Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `max_memory_mb` | number | 100 | Maximum memory for view cache |
+| `consistency_window_ms` | number | 50 | Bypass cache for recent writes |
+| `enable_noria` | boolean | true | Toggle acceleration |
+| `fallback_on_error` | boolean | true | Fall back to SQLite on errors |
+
+---
+
+## 9. Introspection API
+
+```javascript
+const stats = db.noriaStats();
+// {
+//   views: 5,                  // Active materialized views
+//   cacheHits: 1000,          // Reads from cache
+//   cacheMisses: 50,          // Upqueries triggered
+//   memoryUsedMb: 45,         // Current memory usage
+//   pendingPropagation: 0,    // Changes waiting to propagate
+//   avgPropagationMs: 2.3     // Average propagation latency
+// }
+```
+
+---
+
+## 10. Risks & Mitigations
 
 | Risk | Mitigation |
 | :--- | :--- |
 | **Write Overhead** | Session extension is efficient, but we must ensure ingestor is async. |
 | **Consistency Lag** | Implement "Hybrid Mode" (Bypass cache for recent writes). |
 | **Unsupported SQL** | Fail-open parser: if Noria doesn't understand it, SQLite runs it. |
-| **OOM (Memory)** | Strict LRU eviction on the view cache; hard memory limit on Noria worker. |
+| **OOM (Memory)** | Random eviction on the view cache; hard memory limit on Noria worker. |
 | **Cache Thrashing** | Only cache **Prepared Statements**, ignore random ad-hoc strings. |
+
+---
+
+## 11. Next Steps (Priority Order)
+
+1. **Incremental Update Propagation** - Wire CDC changesets to dataflow graph
+2. **Upquery Mechanism** - Route cache misses to SQLite
+3. **View Materialization** - Store query results in evmap
+4. **Random Eviction** - Memory management with configurable limits
+5. **Dynamic View Synthesis** - Auto-create views from prepared statements

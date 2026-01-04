@@ -14,12 +14,16 @@ keywords = ["internal"]
 [badges]
 maintenance = { status = "experimental" }
 
+[features]
+default = []
+persistent = ["rocksdb"]
+
 [target.'cfg(not(target_env="msvc"))'.dependencies]
 jemallocator = "0.3"
 
 [dependencies]
 bincode = "1.0.0"
-evmap = { version = "=11.0.0-alpha.1", features = ["eviction"] }
+evmap = { version = "11.0", features = ["eviction"] }
 hashbag = "0.1.2"
 ahash = "0.3"
 futures-util = "0.3.0"
@@ -40,9 +44,9 @@ tempfile = "3.0.2"
 petgraph = { version = "0.5", features = ["serde-1"] }
 serde = { version = "1.0.8", features = ["rc"] }
 timekeeper = { version = "0.3.2", default-features = false }
-rocksdb = {version = "0.19.0", default-features = false, features = ["lz4"] }
-rusqlite = { version = "0.32.1", features = ["bundled", "session"] }
+rocksdb = { version = "0.19.0", default-features = false, features = ["lz4"], optional = true }
+rusqlite = { version = "0.38.0", features = ["bundled", "session"] }
 
 # local deps
 common = { version = "0.7.0", path = "../common", package = "noria-common" }
-noria = { version = "0.7.0" }
+noria = { version = "0.7.0", path = "../../noria" }
