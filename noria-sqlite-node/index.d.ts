@@ -182,6 +182,12 @@ export declare class Statement {
    * Uses cached raw SQLite statement and direct NAPI value extraction.
    */
   _allFast(params: object): unknown
+  /**
+   * Ultra-fast version that returns a flat array of values.
+   * Format: [val1, val2, ..., valN, val1, val2, ..., valN, ...]
+   * JS wrapper converts to objects. Minimizes NAPI call overhead.
+   */
+  _allRaw(params: object): unknown
   /** Execute the statement and return info about the execution. */
   run(...params: any[]): RunResult
   /** Fast version of run() - bypasses rusqlite and serde_json entirely. */

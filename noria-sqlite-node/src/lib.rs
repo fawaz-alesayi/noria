@@ -1591,6 +1591,85 @@ impl Statement {
         Ok(unsafe { JsUnknown::from_napi_value(raw_env, result_arr)? })
     }
 
+    /// Ultra-fast version that returns a flat array of values.
+    /// Format: [val1, val2, ..., valN, val1, val2, ..., valN, ...]
+    /// JS wrapper converts to objects. Minimizes NAPI call overhead.
+    #[napi(js_name = "_allRaw")]
+    pub fn all_raw(&self, env: Env, params: napi::JsObject) -> Result<JsUnknown> {
+        let safe_ints = self.safe_ints;
+        let raw_env = env.raw();
+        let col_count = self.column_name_cstrs.len() as i32;
+
+        // Use cached db handle
+        let db_handle = self.db_handle.0;
+
+        // Get or create cached raw statement
+        let mut raw_stmt_guard = self.raw_stmt.lock();
+        let raw_stmt = if let Some(ref cached) = *raw_stmt_guard {
+            unsafe { ffi::sqlite3_reset(cached.0); }
+            cached.0
+        } else {
+            let mut stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+            let rc = unsafe {
+                ffi::sqlite3_prepare_v2(
+                    db_handle,
+                    self.sql_cstr.as_ptr(),
+                    -1,
+                    &mut stmt,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc != ffi::SQLITE_OK {
+                return Err(Error::new(Status::GenericFailure,
+                    format!("SQLITE_ERROR: prepare failed ({})", rc)));
+            }
+            *raw_stmt_guard = Some(RawStmt(stmt));
+            stmt
+        };
+
+        // Bind parameters
+        let params_raw = unsafe { params.raw() };
+        let param_count = self.param_count;
+        for i in 0..param_count {
+            let mut element: sys::napi_value = std::ptr::null_mut();
+            unsafe {
+                sys::napi_get_element(raw_env, params_raw, i as u32, &mut element);
+            }
+            bind_napi_value_raw(raw_env, raw_stmt, (i + 1) as i32, element)?;
+        }
+
+        // Collect NAPI values first, then batch create array
+        let mut values: Vec<sys::napi_value> = Vec::with_capacity(1024);
+
+        loop {
+            let rc = unsafe { ffi::sqlite3_step(raw_stmt) };
+            if rc == ffi::SQLITE_DONE {
+                break;
+            }
+            if rc != ffi::SQLITE_ROW {
+                return Err(Error::new(Status::GenericFailure,
+                    format!("SQLITE_ERROR: step failed ({})", rc)));
+            }
+
+            for i in 0..col_count {
+                let val = unsafe { raw_sqlite_column_to_napi(raw_env, raw_stmt, i, safe_ints) };
+                values.push(val);
+            }
+        }
+
+        // Create pre-sized array and populate
+        let result_arr = unsafe {
+            let mut arr: sys::napi_value = std::ptr::null_mut();
+            sys::napi_create_array_with_length(raw_env, values.len(), &mut arr);
+            for (idx, val) in values.iter().enumerate() {
+                sys::napi_set_element(raw_env, arr, idx as u32, *val);
+            }
+            arr
+        };
+
+        Ok(unsafe { JsUnknown::from_napi_value(raw_env, result_arr)? })
+    }
+
     /// Execute the statement and return info about the execution.
     #[napi(ts_args_type = "...params: any[]")]
     pub fn run(&self, params: Vec<serde_json::Value>) -> Result<RunResult> {

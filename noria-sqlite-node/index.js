@@ -683,13 +683,54 @@ Statement.prototype.all = function all(...params) {
 			const results = this[cppdb].all(convertParams(params));
 			return results.map(convertBigInts);
 		}
-		// Fast path: pass raw params array directly (no JSON serialization)
+
 		// Handle bind([array]) case
 		let rawParams = params;
 		if (params.length === 1 && Array.isArray(params[0]) && !Buffer.isBuffer(params[0])) {
 			rawParams = params[0];
 		}
-		const results = this[cppdb]._allFast(rawParams);
+
+		// Check for pluck mode - use existing fast path
+		if (this._pluckMode) {
+			return this[cppdb]._allFast(rawParams);
+		}
+
+		// Check for raw mode - use existing fast path
+		if (this._rawMode) {
+			return this[cppdb]._allFast(rawParams);
+		}
+
+		// Ultra-fast path: get flat array from native, convert to objects in JS
+		// V8's JIT is highly optimized for object creation
+		const flat = this[cppdb]._allRaw(rawParams);
+
+		// Cache column names on first call
+		if (!this._colNames) {
+			this._colNames = this[cppdb].columns().map(c => c.name);
+			// Pre-create an object factory function for this shape
+			// V8 optimizes objects with the same shape (hidden class)
+			const names = this._colNames;
+			const colCount = names.length;
+			// Generate optimized factory code
+			let factoryCode = 'return function(f,i){return{';
+			for (let c = 0; c < colCount; c++) {
+				if (c > 0) factoryCode += ',';
+				factoryCode += JSON.stringify(names[c]) + ':f[i+' + c + ']';
+			}
+			factoryCode += '};}';
+			this._rowFactory = new Function(factoryCode)();
+		}
+
+		const colCount = this._colNames.length;
+		const len = flat.length;
+		const rowCount = (len / colCount) | 0;
+		const results = new Array(rowCount);
+		const factory = this._rowFactory;
+
+		for (let r = 0, i = 0; r < rowCount; r++, i += colCount) {
+			results[r] = factory(flat, i);
+		}
+
 		return results;
 	} catch (e) {
 		if (e.message && e.message.startsWith('SQLITE_')) {
@@ -704,6 +745,7 @@ Statement.prototype.all = function all(...params) {
 
 Statement.prototype.pluck = function pluck(enabled) {
 	this[cppdb].pluck(enabled);
+	this._pluckMode = enabled !== false;
 	return this;
 };
 
@@ -715,6 +757,7 @@ Statement.prototype.expand = function expand(enabled) {
 
 Statement.prototype.raw = function raw(enabled) {
 	this[cppdb].raw(enabled);
+	this._rawMode = enabled !== false;
 	return this;
 };
 
