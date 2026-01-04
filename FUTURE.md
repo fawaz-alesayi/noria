@@ -111,7 +111,7 @@ Therefore, `noria-sqlite` will use a **Bundled Strategy**:
 
 2. **Node.js Bindings (noria-sqlite-node)**
    - Complete better-sqlite3 API compatibility via napi-rs
-   - **91 tests passing**, matching better-sqlite3 behavior
+   - **92 tests passing**, matching better-sqlite3 behavior
    - JavaScript wrapper providing: Database, Statement, SqliteError, transaction(), pragma()
    - User-defined functions via Database#function() with raw NAPI calls
    - User-defined aggregates via Database#aggregate()
@@ -159,10 +159,10 @@ Therefore, `noria-sqlite` will use a **Bundled Strategy**:
 
 ### 8.3 Impact Assessment
 
-**Current Score: 9/10**
+**Current Score: 8/10**
 
 The library now provides:
-- ✅ A working better-sqlite3 drop-in replacement (112 tests passing)
+- ✅ A working better-sqlite3 drop-in replacement (92 tests passing)
 - ✅ Session-based CDC infrastructure (fully working)
 - ✅ Full dataflow operators (Filter, Project, Join, Aggregate)
 - ✅ Incremental update propagation for INSERT/UPDATE/DELETE operations
@@ -170,10 +170,11 @@ The library now provides:
 - ✅ Dynamic view synthesis from prepared statements
 - ✅ O(1) cache hits from evmap-backed views
 - ✅ CDC propagation correctly updates cached view entries
-- ✅ Introspection API for cache statistics (db.cacheStats())
+- ✅ Introspection API shape (db.cacheStats() returns correct structure)
 - ✅ Transaction-aware CDC (events buffered until COMMIT, discarded on ROLLBACK)
 
 Remaining work:
+- Fix cache hit/miss/totalRows statistics tracking (currently always returns 0)
 - Implement random eviction with memory limits
 
 **In essence**: The core Noria value proposition is now fully working. Parameterized SELECT
