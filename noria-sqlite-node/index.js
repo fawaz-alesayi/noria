@@ -621,12 +621,30 @@ Object.defineProperties(Statement.prototype, {
 // Statement methods - all take variadic parameters
 Statement.prototype.run = function run(...params) {
 	try {
-		// Fast path: pass raw params array directly (no JSON serialization)
-		let rawParams = params;
-		if (params.length === 1 && Array.isArray(params[0]) && !Buffer.isBuffer(params[0])) {
-			rawParams = params[0];
+		// Check if statement has bound parameters
+		if (this._bound) {
+			// If params passed after bind, throw TypeError
+			if (params.length > 0) {
+				throw new TypeError('This statement already has bound parameters');
+			}
+			// Use slow path which reads bound params from native (pass empty array)
+			return this[cppdb].run([]);
 		}
-		return this[cppdb]._runFast(rawParams);
+
+		// Check for named parameters (first param is plain object like {name: 'Alice'})
+		// Handle bind([array]) case
+		let effectiveParams = params;
+		if (params.length === 1 && Array.isArray(params[0]) && !Buffer.isBuffer(params[0])) {
+			effectiveParams = params[0];
+		}
+
+		// If first effective param is a plain object, use fast named params path
+		if (effectiveParams.length > 0 && isPlainObject(effectiveParams[0])) {
+			return this[cppdb]._runFastNamed(effectiveParams[0]);
+		}
+
+		// Fast path: pass raw params array directly (no JSON serialization)
+		return this[cppdb]._runFast(effectiveParams);
 	} catch (e) {
 		if (e.message && e.message.includes('already has bound parameters')) {
 			throw new TypeError('This statement already has bound parameters');
@@ -647,6 +665,17 @@ Statement.prototype.get = function get(...params) {
 		throw new TypeError('This statement does not return data. Use run() instead');
 	}
 	try {
+		// Check if statement has bound parameters
+		if (this._bound) {
+			if (params.length > 0) {
+				throw new TypeError('This statement already has bound parameters');
+			}
+			// Use slow path which reads bound params from native
+			const result = this[cppdb].get([]);
+			if (result === null) return undefined;
+			return convertBigInts(result);
+		}
+
 		// Check if expand mode is enabled - need to use slow path for expand
 		// because the fast path doesn't support nested objects
 		if (this._expandMode) {
@@ -655,11 +684,23 @@ Statement.prototype.get = function get(...params) {
 			if (result === null) return undefined;
 			return convertBigInts(result);
 		}
-		// Use fast path (direct NAPI object creation) - bypass JSON serialization
-		// The fast method creates JS objects/arrays/values directly
-		const result = this[cppdb]._getFast(convertParams(params));
-		// _getFast returns undefined for no rows, otherwise the row object
-		return result;
+
+		// Handle bind([array]) case - extract array from wrapper
+		let rawParams = params;
+		if (params.length === 1 && Array.isArray(params[0]) && !Buffer.isBuffer(params[0])) {
+			rawParams = params[0];
+		}
+
+		// Check for named parameters - use slow path
+		if (rawParams.length > 0 && isPlainObject(rawParams[0])) {
+			const result = this[cppdb].get(convertParams(params));
+			if (result === null) return undefined;
+			return convertBigInts(result);
+		}
+
+		// Ultra-fast path: use raw FFI with cached CStrings
+		// _getRaw uses direct sqlite3_step and cached column name CStrings
+		return this[cppdb]._getRaw(rawParams);
 	} catch (e) {
 		if (e.message && e.message.startsWith('SQLITE_')) {
 			const match = e.message.match(/^(SQLITE_\w+):\s*(.*)/);
@@ -677,6 +718,16 @@ Statement.prototype.all = function all(...params) {
 		throw new TypeError('This statement does not return data. Use run() instead');
 	}
 	try {
+		// Check if statement has bound parameters
+		if (this._bound) {
+			if (params.length > 0) {
+				throw new TypeError('This statement already has bound parameters');
+			}
+			// Use slow path which reads bound params from native
+			const results = this[cppdb].all([]);
+			return results.map(convertBigInts);
+		}
+
 		// Check if expand mode is enabled - need to use slow path for expand
 		if (this._expandMode) {
 			// Fall back to slow path for expand mode
@@ -688,6 +739,12 @@ Statement.prototype.all = function all(...params) {
 		let rawParams = params;
 		if (params.length === 1 && Array.isArray(params[0]) && !Buffer.isBuffer(params[0])) {
 			rawParams = params[0];
+		}
+
+		// Check for named parameters - use slow path
+		if (rawParams.length > 0 && isPlainObject(rawParams[0])) {
+			const results = this[cppdb].all(convertParams(params));
+			return results.map(convertBigInts);
 		}
 
 		// Check for pluck mode - use existing fast path
@@ -772,6 +829,12 @@ function isPrimitive(v) {
 	return v === null || t === 'number' || t === 'string' || t === 'boolean' || v === undefined;
 }
 
+// Check if value is a plain object (for named params detection)
+// Returns true for {name: 'Alice'}, false for [], Buffer, null, etc.
+function isPlainObject(v) {
+	return v !== null && typeof v === 'object' && !Array.isArray(v) && !Buffer.isBuffer(v);
+}
+
 // Convert params for native binding (handle Buffers and BigInt specially)
 function convertValue(p) {
 	if (Buffer.isBuffer(p)) {
@@ -845,6 +908,7 @@ function convertBigInts(value) {
 Statement.prototype.bind = function bind(...params) {
 	try {
 		this[cppdb].bind(convertParams(params));
+		this._bound = true; // Track that params are bound
 	} catch (e) {
 		// Convert to TypeError for better-sqlite3 compat
 		if (e.message && e.message.includes('already has bound parameters')) {

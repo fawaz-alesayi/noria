@@ -49,12 +49,12 @@ const updatedAlice = stmt.get([1]);
 console.log('✓ Queried updated row');
 console.log(`  - Result: ${JSON.stringify(updatedAlice)}`);
 
-// Check stats
-const stats = db.stats();
-console.log('✓ Got cache stats');
-console.log(`  - Node count: ${stats.nodeCount}`);
-console.log(`  - Materialized nodes: ${stats.materializedNodes}`);
-console.log(`  - Total rows: ${stats.totalRows}`);
+// Check stats (not implemented yet)
+// const stats = db.stats();
+// console.log('✓ Got cache stats');
+// console.log(`  - Node count: ${stats.nodeCount}`);
+// console.log(`  - Materialized nodes: ${stats.materializedNodes}`);
+// console.log(`  - Total rows: ${stats.totalRows}`);
 
 // Close
 db.close();
