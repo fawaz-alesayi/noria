@@ -374,6 +374,11 @@ impl NoriaEngine {
         }
     }
 
+    /// Get the number of views in the engine.
+    pub fn view_count(&self) -> usize {
+        self.views.read().len()
+    }
+
     /// Extract table names from SQL (simplified).
     fn extract_tables(&self, sql: &str) -> Vec<String> {
         let upper = sql.to_uppercase();

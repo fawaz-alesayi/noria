@@ -638,6 +638,12 @@ Statement.prototype.run = function run(...params) {
 			effectiveParams = params[0];
 		}
 
+		// If there are views, use slow path to ensure CDC propagation
+		// The fast path bypasses Noria CDC, so writes wouldn't update cached views
+		if (this[cppdb].hasViews) {
+			return this[cppdb].run(effectiveParams);
+		}
+
 		// If first effective param is a plain object, use fast named params path
 		if (effectiveParams.length > 0 && isPlainObject(effectiveParams[0])) {
 			return this[cppdb]._runFastNamed(effectiveParams[0]);

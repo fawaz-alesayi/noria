@@ -1267,6 +1267,13 @@ impl Statement {
         self.is_cached
     }
 
+    /// Whether there are any views in the engine.
+    /// Used to determine if writes should use the slow CDC path.
+    #[napi(getter, js_name = "hasViews")]
+    pub fn has_views(&self) -> bool {
+        self.db.engine().view_count() > 0
+    }
+
     /// Execute the statement and return the first row.
     /// Throws if this is not a reader statement.
     ///
