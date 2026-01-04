@@ -379,6 +379,15 @@ impl NoriaEngine {
         self.views.read().len()
     }
 
+    /// Check if a table has any views depending on it.
+    pub fn table_has_views(&self, table_name: &str) -> bool {
+        let views = self.views.read();
+        let table_lower = table_name.to_lowercase();
+        views.values().any(|view| {
+            view.tables.iter().any(|t| t.to_lowercase() == table_lower)
+        })
+    }
+
     /// Extract table names from SQL (simplified).
     fn extract_tables(&self, sql: &str) -> Vec<String> {
         let upper = sql.to_uppercase();

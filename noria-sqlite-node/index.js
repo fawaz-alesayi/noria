@@ -638,9 +638,9 @@ Statement.prototype.run = function run(...params) {
 			effectiveParams = params[0];
 		}
 
-		// If there are views, use slow path to ensure CDC propagation
+		// If this statement's target table has views, use slow path for CDC
 		// The fast path bypasses Noria CDC, so writes wouldn't update cached views
-		if (this[cppdb].hasViews) {
+		if (this[cppdb].needsCdc) {
 			return this[cppdb].run(effectiveParams);
 		}
 

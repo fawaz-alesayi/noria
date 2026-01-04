@@ -1267,11 +1267,45 @@ impl Statement {
         self.is_cached
     }
 
-    /// Whether there are any views in the engine.
+    /// Whether this statement's target table has any views depending on it.
     /// Used to determine if writes should use the slow CDC path.
-    #[napi(getter, js_name = "hasViews")]
-    pub fn has_views(&self) -> bool {
-        self.db.engine().view_count() > 0
+    /// Only returns true if the write targets a table with materialized views.
+    #[napi(getter, js_name = "needsCdc")]
+    pub fn needs_cdc(&self) -> bool {
+        // Extract target table from SQL (for INSERT/UPDATE/DELETE)
+        if let Some(table) = self.extract_target_table() {
+            self.db.engine().table_has_views(&table)
+        } else {
+            false
+        }
+    }
+
+    /// Extract the target table from INSERT/UPDATE/DELETE SQL.
+    fn extract_target_table(&self) -> Option<String> {
+        let sql_upper = self.sql.to_uppercase();
+
+        // INSERT INTO table_name
+        if let Some(pos) = sql_upper.find("INSERT INTO ") {
+            let after = &self.sql[pos + 12..];
+            return after.split_whitespace().next()
+                .map(|t| t.trim_matches('`').trim_matches('"').trim_matches('(').to_string());
+        }
+
+        // UPDATE table_name SET
+        if let Some(pos) = sql_upper.find("UPDATE ") {
+            let after = &self.sql[pos + 7..];
+            return after.split_whitespace().next()
+                .map(|t| t.trim_matches('`').trim_matches('"').to_string());
+        }
+
+        // DELETE FROM table_name
+        if let Some(pos) = sql_upper.find("DELETE FROM ") {
+            let after = &self.sql[pos + 12..];
+            return after.split_whitespace().next()
+                .map(|t| t.trim_matches('`').trim_matches('"').to_string());
+        }
+
+        None
     }
 
     /// Execute the statement and return the first row.
