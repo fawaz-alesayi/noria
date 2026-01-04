@@ -130,7 +130,7 @@ This is the user-facing API (Rust) and the FFI core for other languages. It impl
 
 | Component | Status | Impact |
 |-----------|--------|--------|
-| **Cache Statistics** | ⚠️ Partial | `cacheHits`, `cacheMisses`, `totalRows` always return 0 |
+| **Cache Statistics** | ✅ Done | `cacheHits`, `cacheMisses`, `totalRows` correctly tracked |
 | **Eviction** | ❌ Missing | No memory management for cached views |
 | **Complex Queries** | ⚠️ Limited | JOINs work but subqueries/window functions not supported |
 
@@ -220,16 +220,12 @@ const stats = db.cacheStats();
 // {
 //   nodeCount: 5,             // Nodes in dataflow graph
 //   materializedNodes: 3,     // Materialized view nodes
-//   totalRows: 150,           // Total rows across views (currently broken - returns 0)
+//   totalRows: 150,           // Total rows across views
 //   viewCount: 2,             // Number of registered views
-//   cacheHits: 1000,          // Reads from cache (currently broken - returns 0)
-//   cacheMisses: 50           // Upqueries triggered (currently broken - returns 0)
+//   cacheHits: 1000,          // Reads from cache
+//   cacheMisses: 50           // Upqueries triggered
 // }
 ```
-
-**Note:** The `cacheHits`, `cacheMisses`, and `totalRows` fields currently always return 0.
-This is a known issue - the statistics tracking is not wired up, but the underlying
-caching functionality works correctly (verified by functional tests).
 
 ---
 
@@ -251,6 +247,6 @@ caching functionality works correctly (verified by functional tests).
 2. ~~**Upquery Mechanism**~~ ✅ Done - Cache misses route to SQLite
 3. ~~**View Materialization**~~ ✅ Done - Query results stored in evmap
 4. ~~**Dynamic View Synthesis**~~ ✅ Done - Prepared statements auto-create views
-5. **Fix Cache Statistics** - Wire up cacheHits/cacheMisses/totalRows tracking
+5. ~~**Fix Cache Statistics** - Wire up cacheHits/cacheMisses/totalRows tracking~~ ✅
 6. **Random Eviction** - Memory management with configurable limits
 7. **Complex Query Support** - Subqueries, window functions

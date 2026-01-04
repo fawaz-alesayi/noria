@@ -174,7 +174,7 @@ The library now provides:
 - ✅ Transaction-aware CDC (events buffered until COMMIT, discarded on ROLLBACK)
 
 Remaining work:
-- Fix cache hit/miss/totalRows statistics tracking (currently always returns 0)
+- ~~Fix cache hit/miss/totalRows statistics tracking (currently always returns 0)~~ ✅
 - Implement random eviction with memory limits
 
 **In essence**: The core Noria value proposition is now fully working. Parameterized SELECT
