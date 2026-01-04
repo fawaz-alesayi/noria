@@ -196,6 +196,32 @@ impl Database {
         // Pre-allocate SQL CString for raw operations
         let sql_cstr = std::ffi::CString::new(sql.as_str()).unwrap();
 
+        // Cache parameter name to index mappings for fast named parameter binding
+        let (param_name_indices, param_name_cstrs) = {
+            let conn = self.inner.connection().read();
+            let sqlite_stmt = conn.prepare(&sql)
+                .map_err(|e| Error::new(Status::GenericFailure, format!("SQLITE_ERROR: {}", e)))?;
+            let mut indices = std::collections::HashMap::new();
+            let mut cstrs = Vec::new();
+            for i in 1..=param_count {
+                let name = sqlite_stmt.parameter_name(i);
+                if let Some(name_str) = name {
+                    // Store without prefix (strip @, $, :)
+                    let clean_name = if name_str.starts_with('@') || name_str.starts_with('$') || name_str.starts_with(':') {
+                        &name_str[1..]
+                    } else {
+                        name_str
+                    };
+                    indices.insert(clean_name.to_string(), i as i32);
+                    // Also cache CString for fast NAPI property access
+                    if let Ok(cstr) = std::ffi::CString::new(clean_name) {
+                        cstrs.push((cstr, i as i32));
+                    }
+                }
+            }
+            (indices, cstrs)
+        };
+
         // Cache the raw db handle for fast operations (avoids RwLock read on each call)
         let db_handle = {
             let conn = self.inner.connection().read();
@@ -221,6 +247,8 @@ impl Database {
             param_count,
             raw_stmt: Mutex::new(None),
             db_handle,
+            param_name_indices,
+            param_name_cstrs,
         })
     }
 
@@ -1211,6 +1239,12 @@ pub struct Statement {
     raw_stmt: Mutex<Option<RawStmt>>,
     /// Cached raw database handle for fast operations (avoids RwLock read)
     db_handle: RawDb,
+    /// Cached parameter name to index mappings (without prefix, e.g., "name" -> 1)
+    /// Enables fast named parameter binding without repeated lookups
+    param_name_indices: std::collections::HashMap<String, i32>,
+    /// Cached CStrings for parameter names (for napi_get_named_property)
+    /// Each tuple is (CString of param name, SQLite param index)
+    param_name_cstrs: Vec<(std::ffi::CString, i32)>,
 }
 
 #[napi]
@@ -1670,6 +1704,96 @@ impl Statement {
         Ok(unsafe { JsUnknown::from_napi_value(raw_env, result_arr)? })
     }
 
+    /// Ultra-fast version of get() - returns single row using raw FFI.
+    /// Uses cached raw statement and column name CStrings.
+    /// Returns undefined for no rows (matches better-sqlite3).
+    #[napi(js_name = "_getRaw")]
+    pub fn get_raw(&self, env: Env, params: napi::JsObject) -> Result<JsUnknown> {
+        let safe_ints = self.safe_ints;
+        let raw_env = env.raw();
+        let col_name_cstrs = &self.column_name_cstrs;
+        let col_count = col_name_cstrs.len() as i32;
+
+        // Use cached db handle
+        let db_handle = self.db_handle.0;
+
+        // Get or create cached raw statement
+        let mut raw_stmt_guard = self.raw_stmt.lock();
+        let raw_stmt = if let Some(ref cached) = *raw_stmt_guard {
+            unsafe { ffi::sqlite3_reset(cached.0); }
+            cached.0
+        } else {
+            let mut stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+            let rc = unsafe {
+                ffi::sqlite3_prepare_v2(
+                    db_handle,
+                    self.sql_cstr.as_ptr(),
+                    -1,
+                    &mut stmt,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc != ffi::SQLITE_OK {
+                return Err(Error::new(Status::GenericFailure,
+                    format!("SQLITE_ERROR: prepare failed ({})", rc)));
+            }
+            *raw_stmt_guard = Some(RawStmt(stmt));
+            stmt
+        };
+
+        // Bind parameters
+        let params_raw = unsafe { params.raw() };
+        let param_count = self.param_count;
+        for i in 0..param_count {
+            let mut element: sys::napi_value = std::ptr::null_mut();
+            unsafe {
+                sys::napi_get_element(raw_env, params_raw, i as u32, &mut element);
+            }
+            bind_napi_value_raw(raw_env, raw_stmt, (i + 1) as i32, element)?;
+        }
+
+        // Execute - get first row only
+        let rc = unsafe { ffi::sqlite3_step(raw_stmt) };
+
+        if rc == ffi::SQLITE_DONE {
+            // No rows - return undefined
+            return env.get_undefined().map(|u| u.into_unknown());
+        }
+
+        if rc != ffi::SQLITE_ROW {
+            return Err(Error::new(Status::GenericFailure,
+                format!("SQLITE_ERROR: step failed ({})", rc)));
+        }
+
+        // Create result object with cached column name CStrings
+        let result = unsafe {
+            if self.pluck_mode {
+                // Return just the first column value
+                raw_sqlite_column_to_napi(raw_env, raw_stmt, 0, safe_ints)
+            } else if self.raw_mode {
+                // Return as array
+                let mut arr: sys::napi_value = std::ptr::null_mut();
+                sys::napi_create_array_with_length(raw_env, col_count as usize, &mut arr);
+                for i in 0..col_count {
+                    let val = raw_sqlite_column_to_napi(raw_env, raw_stmt, i, safe_ints);
+                    sys::napi_set_element(raw_env, arr, i as u32, val);
+                }
+                arr
+            } else {
+                // Return as object - use cached CStrings
+                let mut obj: sys::napi_value = std::ptr::null_mut();
+                sys::napi_create_object(raw_env, &mut obj);
+                for i in 0..col_count {
+                    let val = raw_sqlite_column_to_napi(raw_env, raw_stmt, i, safe_ints);
+                    sys::napi_set_named_property(raw_env, obj, col_name_cstrs[i as usize].as_ptr(), val);
+                }
+                obj
+            }
+        };
+
+        Ok(unsafe { JsUnknown::from_napi_value(raw_env, result)? })
+    }
+
     /// Execute the statement and return info about the execution.
     #[napi(ts_args_type = "...params: any[]")]
     pub fn run(&self, params: Vec<serde_json::Value>) -> Result<RunResult> {
@@ -1778,6 +1902,87 @@ impl Statement {
                 sys::napi_get_element(raw_env, params_raw, i as u32, &mut element);
             }
             bind_napi_value_raw(raw_env, raw_stmt, (i + 1) as i32, element)?;
+        }
+
+        // Execute
+        let rc = unsafe { ffi::sqlite3_step(raw_stmt) };
+        if rc != ffi::SQLITE_DONE && rc != ffi::SQLITE_ROW {
+            return Err(Error::new(Status::GenericFailure,
+                format!("SQLITE_ERROR: step failed ({})", rc)));
+        }
+
+        // Get changes and last rowid
+        let changes = unsafe { ffi::sqlite3_changes(db_handle) } as i64;
+        let last_rowid = unsafe { ffi::sqlite3_last_insert_rowid(db_handle) };
+
+        let final_changes = if self.is_ddl { 0 } else { changes };
+        let final_rowid = if self.is_ddl { 0 } else { last_rowid };
+
+        Ok(RunResult {
+            changes: final_changes,
+            last_insert_rowid: final_rowid,
+        })
+    }
+
+    /// Fast version of run() for named parameters - bypasses serde_json.
+    /// Takes a JS object with named params like {name: 'Alice', age: 30}.
+    /// Uses cached parameter name to index mappings for speed.
+    #[napi(js_name = "_runFastNamed")]
+    pub fn run_fast_named(&self, env: Env, params: napi::JsObject) -> Result<RunResult> {
+        let raw_env = env.raw();
+
+        // Use cached db handle
+        let db_handle = self.db_handle.0;
+
+        // Get or create cached raw statement
+        let mut raw_stmt_guard = self.raw_stmt.lock();
+        let raw_stmt = if let Some(ref cached) = *raw_stmt_guard {
+            unsafe { ffi::sqlite3_reset(cached.0); }
+            cached.0
+        } else {
+            let mut stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+            let rc = unsafe {
+                ffi::sqlite3_prepare_v2(
+                    db_handle,
+                    self.sql_cstr.as_ptr(),
+                    -1,
+                    &mut stmt,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc != ffi::SQLITE_OK {
+                return Err(Error::new(Status::GenericFailure,
+                    format!("SQLITE_ERROR: prepare failed ({})", rc)));
+            }
+            *raw_stmt_guard = Some(RawStmt(stmt));
+            stmt
+        };
+
+        // Use cached CStrings to directly get properties without enumeration
+        let params_raw = unsafe { params.raw() };
+
+        // Iterate through cached parameter names and get values directly
+        for (param_cstr, param_idx) in &self.param_name_cstrs {
+            let mut value: sys::napi_value = std::ptr::null_mut();
+
+            // Use napi_get_named_property with cached CString (no allocation!)
+            let status = unsafe {
+                sys::napi_get_named_property(
+                    raw_env,
+                    params_raw,
+                    param_cstr.as_ptr(),
+                    &mut value,
+                )
+            };
+
+            // Only bind if property exists (status == napi_ok and value is not undefined)
+            if status == sys::Status::napi_ok {
+                let mut value_type: i32 = 0;
+                unsafe { sys::napi_typeof(raw_env, value, &mut value_type) };
+                if value_type != NAPI_UNDEFINED {
+                    bind_napi_value_raw(raw_env, raw_stmt, *param_idx, value)?;
+                }
+            }
         }
 
         // Execute
@@ -2281,7 +2486,7 @@ unsafe fn sqlite_value_to_napi(
             let text = std::str::from_utf8(s).unwrap_or("");
             sys::napi_create_string_utf8(
                 env,
-                text.as_ptr() as *const i8,
+                text.as_ptr() as *const u8,
                 text.len(),
                 &mut result,
             );
@@ -2348,7 +2553,7 @@ unsafe fn napi_value_to_sqlite_result(
             sys::napi_get_value_string_utf8(
                 env,
                 value,
-                buf.as_mut_ptr() as *mut i8,
+                buf.as_mut_ptr() as *mut u8,
                 str_len + 1,
                 &mut copied,
             );
@@ -2424,7 +2629,7 @@ unsafe fn napi_value_to_rusqlite_value(
             sys::napi_get_value_string_utf8(
                 env,
                 value,
-                buf.as_mut_ptr() as *mut i8,
+                buf.as_mut_ptr() as *mut u8,
                 str_len + 1,
                 &mut copied,
             );
@@ -2480,11 +2685,11 @@ unsafe fn napi_value_to_json(
     // Get JSON.stringify
     let mut json_obj: sys::napi_value = std::ptr::null_mut();
     let json_str = "JSON\0";
-    sys::napi_get_named_property(env, global, json_str.as_ptr() as *const i8, &mut json_obj);
+    sys::napi_get_named_property(env, global, json_str.as_ptr() as *const u8, &mut json_obj);
 
     let mut stringify_fn: sys::napi_value = std::ptr::null_mut();
     let stringify_str = "stringify\0";
-    sys::napi_get_named_property(env, json_obj, stringify_str.as_ptr() as *const i8, &mut stringify_fn);
+    sys::napi_get_named_property(env, json_obj, stringify_str.as_ptr() as *const u8, &mut stringify_fn);
 
     // Call JSON.stringify(value)
     let mut result: sys::napi_value = std::ptr::null_mut();
@@ -2505,7 +2710,7 @@ unsafe fn napi_value_to_json(
     sys::napi_get_value_string_utf8(
         env,
         result,
-        buf.as_mut_ptr() as *mut i8,
+        buf.as_mut_ptr() as *mut u8,
         str_len + 1,
         &mut copied,
     );
@@ -2525,15 +2730,15 @@ unsafe fn json_to_napi_value(
     // Get JSON.parse
     let mut json_obj: sys::napi_value = std::ptr::null_mut();
     let json_str = "JSON\0";
-    sys::napi_get_named_property(env, global, json_str.as_ptr() as *const i8, &mut json_obj);
+    sys::napi_get_named_property(env, global, json_str.as_ptr() as *const u8, &mut json_obj);
 
     let mut parse_fn: sys::napi_value = std::ptr::null_mut();
     let parse_str = "parse\0";
-    sys::napi_get_named_property(env, json_obj, parse_str.as_ptr() as *const i8, &mut parse_fn);
+    sys::napi_get_named_property(env, json_obj, parse_str.as_ptr() as *const u8, &mut parse_fn);
 
     // Create the JSON string as a NAPI value
     let mut json_val: sys::napi_value = std::ptr::null_mut();
-    sys::napi_create_string_utf8(env, json.as_ptr() as *const i8, json.len(), &mut json_val);
+    sys::napi_create_string_utf8(env, json.as_ptr() as *const u8, json.len(), &mut json_val);
 
     // Call JSON.parse(json)
     let mut result: sys::napi_value = std::ptr::null_mut();
@@ -2580,7 +2785,7 @@ unsafe fn rusqlite_value_to_napi(
             // Regular string
             sys::napi_create_string_utf8(
                 env,
-                s.as_ptr() as *const i8,
+                s.as_ptr() as *const u8,
                 s.len(),
                 &mut result,
             );
@@ -2721,7 +2926,7 @@ fn bind_value_raw(stmt: *mut ffi::sqlite3_stmt, idx: i32, val: &serde_json::Valu
                 ffi::sqlite3_bind_text(
                     stmt,
                     idx,
-                    s.as_ptr() as *const i8,
+                    s.as_ptr() as *const u8,
                     s.len() as i32,
                     ffi::SQLITE_TRANSIENT(),
                 )
@@ -2797,7 +3002,7 @@ unsafe fn raw_sqlite_column_to_napi(
             let len = ffi::sqlite3_column_bytes(stmt, col);
             sys::napi_create_string_utf8(
                 env,
-                ptr as *const i8,
+                ptr as *const u8,
                 len as usize,
                 &mut result,
             );
@@ -2867,11 +3072,11 @@ fn bind_napi_value_raw(
                 sys::napi_get_value_string_utf8(env, value, std::ptr::null_mut(), 0, &mut len);
                 let mut buf = vec![0u8; len + 1];
                 let mut copied: usize = 0;
-                sys::napi_get_value_string_utf8(env, value, buf.as_mut_ptr() as *mut i8, len + 1, &mut copied);
+                sys::napi_get_value_string_utf8(env, value, buf.as_mut_ptr() as *mut u8, len + 1, &mut copied);
                 ffi::sqlite3_bind_text(
                     stmt,
                     idx,
-                    buf.as_ptr() as *const i8,
+                    buf.as_ptr() as *const u8,
                     copied as i32,
                     ffi::SQLITE_TRANSIENT(),
                 )
