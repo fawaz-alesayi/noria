@@ -1261,6 +1261,12 @@ impl Statement {
         self.sql.clone()
     }
 
+    /// Whether this statement is accelerated by a Noria view.
+    #[napi(getter)]
+    pub fn cached(&self) -> bool {
+        self.is_cached
+    }
+
     /// Execute the statement and return the first row.
     /// Throws if this is not a reader statement.
     ///
@@ -1393,8 +1399,8 @@ impl Statement {
         // Try cached path first if this query is accelerated
         if self.is_cached {
             let stmt = self.inner.lock();
-            // Try cache lookup; returns Option<Vec<Vec<DataType>>>
-            if let Ok(Some(rows)) = stmt.query_map_cached(&param_refs) {
+            // Try cache lookup with upquery fallback (records hits/misses for stats)
+            if let Ok(rows) = stmt.query_map_cached_or_upquery(&param_refs) {
                 // Convert all cached rows to JSON
                 let json_results: Vec<serde_json::Value> = rows.iter().map(|row| {
                     if self.pluck_mode {
@@ -1410,7 +1416,7 @@ impl Statement {
                 }).collect();
                 return Ok(json_results);
             }
-            // Cache miss - fall through to SQLite (which will populate cache via upquery)
+            // Error case - fall through to SQLite
         }
 
         // Capture column_tables for closure

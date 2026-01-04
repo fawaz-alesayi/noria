@@ -698,6 +698,14 @@ Statement.prototype.get = function get(...params) {
 			return convertBigInts(result);
 		}
 
+		// If statement is cached by Noria, use slow path to record cache statistics
+		// This ensures hits/misses are tracked for cached queries
+		if (this[cppdb].cached) {
+			const result = this[cppdb].get(convertParams(params));
+			if (result === null) return undefined;
+			return convertBigInts(result);
+		}
+
 		// Ultra-fast path: use raw FFI with cached CStrings
 		// _getRaw uses direct sqlite3_step and cached column name CStrings
 		return this[cppdb]._getRaw(rawParams);
@@ -743,6 +751,13 @@ Statement.prototype.all = function all(...params) {
 
 		// Check for named parameters - use slow path
 		if (rawParams.length > 0 && isPlainObject(rawParams[0])) {
+			const results = this[cppdb].all(convertParams(params));
+			return results.map(convertBigInts);
+		}
+
+		// If statement is cached by Noria, use slow path to record cache statistics
+		// This ensures hits/misses are tracked for cached queries
+		if (this[cppdb].cached) {
 			const results = this[cppdb].all(convertParams(params));
 			return results.map(convertBigInts);
 		}

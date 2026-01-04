@@ -187,6 +187,29 @@ impl Statement {
         }
     }
 
+    /// Query for multiple rows with upquery support.
+    ///
+    /// Like query_row_cached_or_upquery but returns all matching rows.
+    /// Records cache hits/misses for statistics tracking.
+    pub fn query_map_cached_or_upquery<P>(&self, params: P) -> Result<Vec<Vec<DataType>>>
+    where
+        P: IntoIterator,
+        P::Item: rusqlite::ToSql,
+    {
+        let view = self.view.as_ref().ok_or_else(|| {
+            Error::NotCacheable("Query is not cacheable".to_string())
+        })?;
+
+        let params: Vec<_> = params.into_iter().collect();
+        let key = params_to_key(&params);
+
+        // Try lookup, upquery on miss (this records cache hits/misses)
+        match self.engine.lookup_or_upquery(view, &key) {
+            Ok(rows) => Ok(rows),
+            Err(e) => Err(Error::Dataflow(e.to_string())),
+        }
+    }
+
     /// Check if this statement is accelerated by a view.
     pub fn is_cached(&self) -> bool {
         self.view.is_some()
