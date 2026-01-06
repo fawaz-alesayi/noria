@@ -3,7 +3,7 @@ resolver = "3"
 members = [
 	"noria",
 	"noria-sqlite",
-	"noria-sqlite-node",
+	"noria-better-sqlite3/noria-ffi",
 	"server/dataflow",
 	"server/common",
 	"server/mir",
