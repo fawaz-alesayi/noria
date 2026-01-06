@@ -18,7 +18,7 @@ pub use executor::{LocalExecutor, ViewHandle};
 pub use ops::{AggregateFunc, AggregateOp, FilterCondition, FilterOp, Operator, OperatorType, ProjectOp};
 pub use session::{CdcEvent, SessionTracker};
 pub use sql::{SqlConverter, SqlError, SqlResult, TableSchema};
-pub use state::{LookupResult, MemoryState, State};
+pub use state::{LookupResult, MemoryState, State, StateKey};
 
 use noria::DataType;
 

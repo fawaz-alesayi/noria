@@ -156,59 +156,56 @@ impl SqlConverter {
             );
         }
 
-        // Apply GROUP BY (Aggregation)
-        if let Some(ref group_by_exprs) = group_by {
-            // Get group by column indices
-            let group_indices: Vec<usize> = group_by_exprs
-                .iter()
-                .filter_map(|expr| self.get_column_index_from_expr(expr, &current_columns))
-                .collect();
+        let agg_info = self.extract_aggregate(columns, &current_columns)?;
+        let has_aggregate = agg_info.is_some();
 
-            // Check for aggregate functions in the SELECT
-            if let Some(agg_info) = self.extract_aggregate(columns, &current_columns)? {
-                let agg_op =
-                    AggregateOp::new(group_indices.clone(), agg_info.func, group_indices.clone());
-
-                // Update columns to be: group_by columns + aggregate result
-                let mut new_columns: Vec<String> = group_indices
+        if let Some(agg_info) = agg_info {
+            let group_indices: Vec<usize> = if let Some(ref group_by_exprs) = group_by {
+                group_by_exprs
                     .iter()
-                    .map(|i| current_columns[*i].clone())
-                    .collect();
-                new_columns.push(agg_info.alias);
+                    .filter_map(|expr| self.get_column_index_from_expr(expr, &current_columns))
+                    .collect()
+            } else {
+                self.extract_key_columns(
+                    where_clause.as_ref().map(|b| b.as_ref()),
+                    &current_columns,
+                )
+            };
 
-                current_node = executor.add_operator(
-                    &format!("{}_agg", primary_table),
-                    OperatorType::Aggregate(agg_op),
-                    vec![current_node],
-                    new_columns.clone(),
-                );
-                current_columns = new_columns;
-            }
+            let agg_op =
+                AggregateOp::new(group_indices.clone(), agg_info.func, group_indices.clone());
+
+            let mut new_columns: Vec<String> = group_indices
+                .iter()
+                .map(|i| current_columns[*i].clone())
+                .collect();
+            new_columns.push(agg_info.alias);
+
+            current_node = executor.add_operator(
+                &format!("{}_agg", primary_table),
+                OperatorType::Aggregate(agg_op),
+                vec![current_node],
+                new_columns.clone(),
+            );
+            current_columns = new_columns;
         }
 
-        // Extract key columns from WHERE clause BEFORE projection
-        // so we can ensure they're included in the output
         let pre_projection_key_columns = self.extract_key_columns(
             where_clause.as_ref().map(|b| b.as_ref()),
             &current_columns,
         );
 
-        // Apply projection if columns are explicitly selected (not *)
         let needs_projection = !columns.iter().any(|c| matches!(c, ResultColumn::Star));
 
-        let key_columns = if needs_projection && group_by.is_none() {
+        let key_columns = if needs_projection && !has_aggregate {
             if let Some((mut emit_indices, mut new_columns)) =
                 self.get_projection(columns, &current_columns)?
             {
-                // Ensure key columns are included in the projection
-                // Track where each original key column ends up in the new projection
                 let mut final_key_columns = Vec::new();
                 for &key_idx in &pre_projection_key_columns {
-                    // Check if this key column is already in the projection
                     if let Some(pos) = emit_indices.iter().position(|&i| i == key_idx) {
                         final_key_columns.push(pos);
                     } else {
-                        // Key column not in projection - add it
                         let new_pos = emit_indices.len();
                         emit_indices.push(key_idx);
                         new_columns.push(current_columns[key_idx].clone());
@@ -236,19 +233,15 @@ impl SqlConverter {
             pre_projection_key_columns
         };
 
-        // Materialize the final node
         let view = executor.materialize(current_node, key_columns);
-
         Ok(view)
     }
 
-    /// Build dataflow nodes from a FROM clause, handling JOINs.
     fn build_from_clause(
         &self,
         from: &FromClause,
         executor: &mut LocalExecutor,
     ) -> SqlResult<(NodeIndex, Vec<String>)> {
-        // Start with the first table
         let select_table = from
             .select
             .as_ref()
@@ -256,20 +249,21 @@ impl SqlConverter {
         let (mut current_node, mut current_columns) =
             self.build_select_table(select_table.as_ref(), executor)?;
 
-        // Process any JOINs
         if let Some(ref joins) = from.joins {
             for join in joins {
                 let (right_node, right_columns) =
                     self.build_select_table(&join.table, executor)?;
 
-                // Get join key columns from ON clause
                 let (left_key, right_key) = self.extract_join_keys(
                     join.constraint.as_ref(),
                     &current_columns,
                     &right_columns,
                 )?;
 
-                // Determine join type
+                // Materialize base tables so JOIN can look up matching rows during CDC
+                executor.materialize(current_node, vec![left_key]);
+                executor.materialize(right_node, vec![right_key]);
+
                 let join_type = match &join.operator {
                     JoinOperator::TypedJoin(Some(jt)) => {
                         if jt.contains(JoinType::LEFT) {
@@ -284,7 +278,6 @@ impl SqlConverter {
                     JoinOperator::Comma => DataflowJoinType::Inner,
                 };
 
-                // Create joined columns (left columns + right columns, excluding join key from right)
                 let mut joined_columns = current_columns.clone();
                 for (i, col) in right_columns.iter().enumerate() {
                     if i != right_key {
@@ -292,8 +285,6 @@ impl SqlConverter {
                     }
                 }
 
-                // Create emit mapping: (is_left, col_idx)
-                // All left columns, then right columns except join key
                 let mut emit: Vec<(bool, usize)> = (0..current_columns.len())
                     .map(|i| (true, i))
                     .collect();
@@ -303,13 +294,12 @@ impl SqlConverter {
                     }
                 }
 
-                // Create join operator
                 let join_op = JoinOp::new(
                     join_type,
                     left_key,
                     right_key,
                     emit,
-                    vec![0], // Key column for output
+                    vec![0],
                     current_columns.len(),
                     right_columns.len(),
                 );

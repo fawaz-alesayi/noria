@@ -32,8 +32,6 @@ evmap = "11.0"
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 
-# Hashing
-ahash = "0.8"
 
 # Error handling
 thiserror = "1.0"

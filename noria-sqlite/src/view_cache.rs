@@ -6,10 +6,10 @@
 use crate::error::Result;
 use crate::worker::Worker;
 use crate::Config;
-use ahash::RandomState;
 use noria::DataType;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -61,7 +61,7 @@ impl CachedRow {
 /// Thread-safe view cache using evmap for concurrent access.
 pub struct ViewCache {
     /// Map from normalized SQL -> view handle
-    views: RwLock<HashMap<String, ViewHandle>>,
+    views: RwLock<FxHashMap<String, ViewHandle>>,
 
     /// Maximum memory budget
     max_memory: usize,
@@ -75,7 +75,7 @@ impl ViewCache {
     /// Create a new view cache with the specified memory limit.
     pub fn new(max_memory: usize) -> Self {
         Self {
-            views: RwLock::new(HashMap::new()),
+            views: RwLock::new(FxHashMap::default()),
             max_memory,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -190,7 +190,7 @@ impl ViewHandle {
     pub fn new(tables: Vec<String>, key_columns: Vec<usize>, result_columns: Vec<String>) -> Self {
         // evmap 11.0: construct() returns (WriteHandle, ReadHandle)
         // SAFETY: with_hasher is unsafe because the hasher must be deterministic.
-        // ahash::RandomState produces deterministic hashes for the same input.
+        // std::collections::hash_map::RandomState produces deterministic hashes per instance.
         let (writer, reader) = unsafe {
             evmap::Options::default()
                 .with_hasher(RandomState::new())

@@ -7,6 +7,33 @@ use std::collections::HashMap;
 use noria::DataType;
 use super::{Record, Records};
 
+/// Key storage - specialized for common single-column case to avoid Vec overhead.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StateKey {
+    Single(DataType),
+    Multi(Vec<DataType>),
+}
+
+impl StateKey {
+    /// Create a key from a row and key column indices.
+    pub fn from_row(row: &[DataType], key_columns: &[usize]) -> Self {
+        if key_columns.len() == 1 {
+            StateKey::Single(row[key_columns[0]].clone())
+        } else {
+            StateKey::Multi(key_columns.iter().map(|&c| row[c].clone()).collect())
+        }
+    }
+
+    /// Create a key from a slice of values (for lookups).
+    pub fn from_slice(key: &[DataType]) -> Self {
+        if key.len() == 1 {
+            StateKey::Single(key[0].clone())
+        } else {
+            StateKey::Multi(key.to_vec())
+        }
+    }
+}
+
 /// Result of a state lookup.
 #[derive(Debug)]
 pub enum LookupResult<'a> {
@@ -49,8 +76,8 @@ pub trait State: Send {
 pub struct MemoryState {
     /// The key columns for the primary index.
     key_columns: Vec<usize>,
-    /// Data stored by key.
-    data: HashMap<Vec<DataType>, Vec<Vec<DataType>>>,
+    /// Data stored by key (uses FxHashMap + StateKey for speed).
+    data: HashMap<StateKey, Vec<Vec<DataType>>>,
     /// Total row count.
     row_count: usize,
 }
@@ -58,21 +85,23 @@ pub struct MemoryState {
 /// A read-only snapshot of state data, used for join lookups.
 /// This owns its data so it can be passed across borrow boundaries.
 pub struct StateSnapshot {
-    data: HashMap<Vec<DataType>, Vec<Vec<DataType>>>,
+    key_columns: Vec<usize>,
+    data: HashMap<StateKey, Vec<Vec<DataType>>>,
 }
 
 impl StateSnapshot {
     /// Create an empty snapshot.
     pub fn empty() -> Self {
         Self {
+            key_columns: vec![],
             data: HashMap::new(),
         }
     }
 }
 
 impl State for StateSnapshot {
-    fn add_key(&mut self, _columns: Vec<usize>) {
-        // No-op for snapshots
+    fn add_key(&mut self, columns: Vec<usize>) {
+        self.key_columns = columns;
     }
 
     fn process_records(&mut self, _records: &mut Records) {
@@ -80,7 +109,8 @@ impl State for StateSnapshot {
     }
 
     fn lookup(&self, key: &[DataType]) -> LookupResult {
-        match self.data.get(key) {
+        let state_key = StateKey::from_slice(key);
+        match self.data.get(&state_key) {
             Some(rows) if rows.is_empty() => LookupResult::Empty,
             Some(rows) => LookupResult::Some(rows.iter().map(|r| r.as_slice()).collect()),
             None => LookupResult::Missing,
@@ -97,6 +127,7 @@ impl State for StateSnapshot {
 
     fn snapshot(&self) -> Box<dyn State> {
         Box::new(StateSnapshot {
+            key_columns: self.key_columns.clone(),
             data: self.data.clone(),
         })
     }
@@ -115,16 +146,14 @@ impl MemoryState {
     /// Create a read-only snapshot of this state.
     pub fn snapshot(&self) -> StateSnapshot {
         StateSnapshot {
+            key_columns: self.key_columns.clone(),
             data: self.data.clone(),
         }
     }
 
-    /// Extract key from a row.
-    fn extract_key(&self, row: &[DataType]) -> Vec<DataType> {
-        self.key_columns
-            .iter()
-            .map(|&col| row.get(col).cloned().unwrap_or(DataType::None))
-            .collect()
+    /// Extract key from a row using StateKey for efficiency.
+    fn extract_key(&self, row: &[DataType]) -> StateKey {
+        StateKey::from_row(row, &self.key_columns)
     }
 }
 
@@ -173,7 +202,8 @@ impl State for MemoryState {
     }
 
     fn lookup(&self, key: &[DataType]) -> LookupResult {
-        match self.data.get(key) {
+        let state_key = StateKey::from_slice(key);
+        match self.data.get(&state_key) {
             Some(rows) if rows.is_empty() => LookupResult::Empty,
             Some(rows) => LookupResult::Some(rows.iter().map(|r| r.as_slice()).collect()),
             None => LookupResult::Missing,
@@ -191,6 +221,7 @@ impl State for MemoryState {
 
     fn snapshot(&self) -> Box<dyn State> {
         Box::new(StateSnapshot {
+            key_columns: self.key_columns.clone(),
             data: self.data.clone(),
         })
     }

@@ -51,7 +51,7 @@ pub struct LocalExecutor {
     /// All nodes in the graph.
     nodes: Vec<Node>,
     /// Map from table name to base table node.
-    base_tables: HashMap<String, NodeIndex>,
+    base_tables: FxHashMap<String, NodeIndex>,
 }
 
 impl LocalExecutor {
@@ -59,7 +59,7 @@ impl LocalExecutor {
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
-            base_tables: HashMap::new(),
+            base_tables: FxHashMap::default(),
         }
     }
 
@@ -183,10 +183,10 @@ impl LocalExecutor {
             state.process_records(&mut records_for_state);
         }
 
-        // Get children to propagate to
-        let children: Vec<NodeIndex> = self.nodes[from].children.clone();
-
-        for child in children {
+        // Iterate by index to avoid cloning the children Vec
+        let num_children = self.nodes[from].children.len();
+        for i in 0..num_children {
+            let child = self.nodes[from].children[i];
             // Find which parent index we are for the child
             let parent_idx = self.nodes[child]
                 .parents
