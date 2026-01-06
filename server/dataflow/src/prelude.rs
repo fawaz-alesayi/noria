@@ -7,9 +7,9 @@ use petgraph;
 use std::cell;
 use std::collections::HashMap;
 
-// core types
-pub(crate) use crate::processing::Ingredient;
-pub(crate) use crate::processing::{
+// core types - exported for local execution in noria-sqlite
+pub use crate::processing::Ingredient;
+pub use crate::processing::{
     Lookup, Miss, ProcessingResult, RawProcessingResult, ReplayContext,
 };
 pub(crate) type Edge = ();
@@ -18,12 +18,12 @@ pub(crate) type Edge = ();
 pub(crate) use crate::payload::{ReplayPathSegment, SourceChannelIdentifier};
 pub(crate) use noria::Input;
 
-// domain local state
-pub(crate) use crate::state::{
-    LookupResult, MemoryState, PersistentState, RecordResult, Row, Rows, State,
-};
-pub(crate) type StateMap = Map<Box<dyn State>>;
-pub(crate) type DomainNodes = Map<cell::RefCell<Node>>;
+// domain local state - exported for local execution in noria-sqlite
+pub use crate::state::{LookupResult, MemoryState, RecordResult, Row, Rows, State};
+#[cfg(feature = "persistent")]
+pub use crate::state::PersistentState;
+pub type StateMap = Map<Box<dyn State>>;
+pub type DomainNodes = Map<cell::RefCell<Node>>;
 pub(crate) type ReplicaAddr = (DomainIndex, usize);
 
 // public exports

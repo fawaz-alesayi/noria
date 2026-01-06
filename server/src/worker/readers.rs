@@ -18,6 +18,7 @@ use std::time;
 use std::{future::Future, task::Poll};
 use stream_cancel::Valve;
 use tokio::task_local;
+use tokio_stream::wrappers::TcpListenerStream;
 use tokio_tower::multiplex::server;
 use tower::service_fn;
 
@@ -61,7 +62,7 @@ pub(super) async fn listen(
     mut on: tokio::net::TcpListener,
     readers: Readers,
 ) {
-    let mut stream = valve.wrap(on.incoming()).into_stream();
+    let mut stream = valve.wrap(TcpListenerStream::new(on));
     while let Some(stream) = stream.next().await {
         if let Err(_) = stream {
             // io error from client: just ignore it
@@ -78,38 +79,19 @@ pub(super) async fn listen(
         let (mut tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(BlockingRead, Ack)>();
 
         let retries = READERS.scope(Default::default(), async move {
-            use async_timer::Oneshot;
-            let mut retry = async_timer::oneshot::Timer::new(RETRY_TIMEOUT);
             let mut pending = None::<(BlockingRead, Ack)>;
             loop {
                 if let Some((ref mut blocking, _)) = pending {
-                    // we have a pending read — see if it can complete
                     if let Poll::Ready(res) = blocking.check() {
-                        // it did! let's tell the caller.
                         let (_, ack) = pending.take().expect("we matched on Some above");
-                        // if this errors, the client just went away
                         let _ = ack.send(res);
-                    // the loop will take care of looking for the next request
                     } else {
-                        // we have a pending request, but it is still blocked
-                        // time for us to wait...
-                        futures_util::future::poll_fn(|cx| {
-                            // we need the poll_fn so we can get the waker
-                            retry.restart(RETRY_TIMEOUT, cx.waker());
-                            Poll::Ready(())
-                        })
-                        .await;
-                        // we need `(&mut )` here so that we can re-use it
-                        (&mut retry).await;
+                        tokio::time::sleep(RETRY_TIMEOUT).await;
                     }
+                } else if let Some(read) = rx.next().await {
+                    pending = Some(read);
                 } else {
-                    // no point in waiting for a timer if we've got nothing to wait for
-                    // so let's get another request
-                    if let Some(read) = rx.next().await {
-                        pending = Some(read);
-                    } else {
-                        break;
-                    }
+                    break;
                 }
             }
         });

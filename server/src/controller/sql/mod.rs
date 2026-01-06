@@ -1024,7 +1024,7 @@ mod tests {
         hasher.finish()
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_parses() {
         // set up graph
         let mut g = integration::start_simple("it_parses").await;
@@ -1057,7 +1057,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_simple_join() {
         // set up graph
         let mut g = integration::start_simple("it_incorporates_simple_join").await;
@@ -1112,7 +1112,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_simple_selection() {
         // set up graph
         let mut g = integration::start_simple("it_incorporates_simple_selection").await;
@@ -1153,7 +1153,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_aggregation() {
         // set up graph
         let mut g = integration::start_simple("it_incorporates_aggregation").await;
@@ -1205,7 +1205,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_does_not_reuse_if_disabled() {
         // set up graph
         let mut g = integration::start_simple("it_does_not_reuse_if_disabled").await;
@@ -1234,7 +1234,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_orders_parameter_columns() {
         // set up graph
         let mut g = integration::start_simple("it_orders_parameter_columns").await;
@@ -1266,7 +1266,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_reuses_identical_query() {
         // set up graph
         let mut g = integration::start_simple("it_reuses_identical_query").await;
@@ -1311,7 +1311,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_reuses_with_different_parameter() {
         // set up graph
         let mut g = integration::start_simple("it_reuses_with_different_parameter").await;
@@ -1383,7 +1383,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_reuses_by_extending_existing_query() {
         use super::sql_parser;
         // set up graph
@@ -1435,7 +1435,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_aggregation_no_group_by() {
         // set up graph
         let mut g = integration::start_simple("it_incorporates_aggregation_no_group_by").await;
@@ -1487,7 +1487,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_aggregation_count_star() {
         // set up graph
         let mut g = integration::start_simple("it_incorporates_aggregation_count_star").await;
@@ -1539,7 +1539,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_aggregation_filter_count() {
         use nom_sql::{ConditionBase, ConditionExpression, ConditionTree, Operator};
         // set up graph
@@ -1602,7 +1602,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_aggregation_filter_sum() {
         use nom_sql::{ConditionBase, ConditionExpression, ConditionTree, Operator};
         // set up graph
@@ -1665,7 +1665,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_aggregation_filter_sum_else() {
         use nom_sql::{ConditionBase, ConditionExpression, ConditionTree, Operator};
         // set up graph
@@ -1728,7 +1728,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_merges_filter_and_sum() {
         // set up graph
         let mut g = integration::start_simple("it_merges_filter_and_sum").await;
@@ -1785,7 +1785,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_merges_filter_and_sum_on_filter_column() {
         // set up graph
         let mut g = integration::start_simple("it_merges_filter_and_sum_on_filter_column").await;
@@ -1818,7 +1818,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_doesnt_merge_sum_and_filter_on_sum_result() {
         // set up graph
         let mut g = integration::start_simple("it_doesnt_merge_sum_and_filter_on_sum_result").await;
@@ -1880,7 +1880,7 @@ mod tests {
     // (in particular, any complex operation that might involve multiple filter conditions
     // is currently unimplemented for filter-aggregations (TODO (jamb)))
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_aggregation_filter_logical_op() {
         use nom_sql::{ConditionBase, ConditionExpression, ConditionTree, Operator};
         // set up graph
@@ -1953,7 +1953,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_explicit_multi_join() {
         // set up graph
         let mut g = integration::start_simple("it_incorporates_explicit_multi_join").await;
@@ -2005,7 +2005,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_implicit_multi_join() {
         // set up graph
         let mut g = integration::start_simple("it_incorporates_implicit_multi_join").await;
@@ -2066,7 +2066,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn it_incorporates_join_projecting_join_columns() {
         // set up graph
@@ -2112,7 +2112,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_self_join() {
         // set up graph
         let mut g = integration::start_simple("it_incorporates_self_join").await;
@@ -2136,7 +2136,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_literal_projection() {
         // set up graph
         let mut g = integration::start_simple("it_incorporates_literal_projection").await;
@@ -2157,7 +2157,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_arithmetic_projection() {
         // set up graph
         let mut g = integration::start_simple("it_incorporates_arithmetic_projection").await;
@@ -2185,7 +2185,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_join_with_nested_query() {
         let mut g = integration::start_simple("it_incorporates_join_with_nested_query").await;
         g.migrate(|mig| {
@@ -2229,7 +2229,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_incorporates_compound_selection() {
         // set up graph
         let mut g = integration::start_simple("it_incorporates_compound_selection").await;
@@ -2258,7 +2258,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn it_distinguishes_predicates() {
         // set up graph
         let mut g = integration::start_simple("it_distinguishes_predicates").await;
@@ -2292,7 +2292,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn it_queries_over_aliased_view() {
         let mut g = integration::start_simple("it_queries_over_aliased_view").await;

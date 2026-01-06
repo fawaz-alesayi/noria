@@ -163,12 +163,11 @@ fn main() {
         builder.log_with(log);
     }
 
-    let mut rt = tokio::runtime::Builder::new();
+    let mut rt = tokio::runtime::Builder::new_multi_thread();
     rt.enable_all();
-    rt.threaded_scheduler();
     rt.thread_name("worker");
     if let Some(threads) = None {
-        rt.core_threads(threads);
+        rt.worker_threads(threads);
     }
     let mut rt = rt.build().unwrap();
     let (_server, done) = rt.block_on(builder.start(Arc::new(authority))).unwrap();

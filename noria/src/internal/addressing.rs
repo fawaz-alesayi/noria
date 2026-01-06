@@ -1,7 +1,5 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
-
 #[derive(Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DomainIndex(usize);
 

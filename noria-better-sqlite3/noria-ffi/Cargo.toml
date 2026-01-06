@@ -1,0 +1,18 @@
+[package]
+name = "noria-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+
+# Noria dataflow engine
+noria-sqlite = { path = "../../noria-sqlite" }
+noria = { path = "../../noria" }
+
+# For tracing/logging
+tracing = "0.1"

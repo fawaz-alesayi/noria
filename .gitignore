@@ -33,3 +33,4 @@ plots_files/
 .Rhistory
 
 *.swp
+better-sqlite3/

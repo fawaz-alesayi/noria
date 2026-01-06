@@ -25,6 +25,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 mod readers;
 mod replica;
+mod timer;
 
 type ChannelCoordinator = channel::ChannelCoordinator<ReplicaAddr, Box<Packet>>;
 

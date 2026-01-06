@@ -290,7 +290,7 @@ async fn check_query(
         }
     }
 
-    tokio::time::delay_for(time::Duration::from_millis(300)).await;
+    tokio::time::sleep(time::Duration::from_millis(300)).await;
 
     let mut getter = g.view(query_name).await.unwrap();
 

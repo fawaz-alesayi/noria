@@ -23,6 +23,7 @@ use std::thread::{self, JoinHandle};
 use std::time;
 use stream_cancel::Valve;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio_stream::wrappers::TcpListenerStream;
 
 mod domain_handle;
 mod inner;
@@ -184,7 +185,7 @@ async fn listen_domain_replies(
     reply_tx: UnboundedSender<ControlReplyPacket>,
     mut on: tokio::net::TcpListener,
 ) {
-    let mut incoming = valve.wrap(on.incoming());
+    let mut incoming = valve.wrap(TcpListenerStream::new(on));
     while let Some(sock) = incoming.next().await {
         match sock {
             Err(e) => {

@@ -18,11 +18,11 @@ pub mod node;
 pub mod ops;
 pub mod payload; // it makes me _really_ sad that this has to be pub
 pub mod prelude;
-pub(crate) mod state;
+pub mod state;  // exported for local execution in noria-sqlite
 
 mod domain;
 mod group_commit;
-mod processing;
+pub mod processing;  // exported for local execution in noria-sqlite
 
 use std::collections::HashMap;
 use std::path::PathBuf;

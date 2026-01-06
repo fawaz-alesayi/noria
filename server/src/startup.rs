@@ -21,6 +21,7 @@ use std::{
 };
 use stream_cancel::Valve;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio_stream::wrappers::TcpListenerStream;
 
 use crate::handle::Handle;
 use crate::Config;
@@ -187,9 +188,9 @@ async fn listen_internal(
     valve: Valve,
     log: slog::Logger,
     event_tx: UnboundedSender<Event>,
-    mut on: tokio::net::TcpListener,
+    on: tokio::net::TcpListener,
 ) {
-    let mut rx = valve.wrap(on.incoming());
+    let mut rx = valve.wrap(TcpListenerStream::new(on));
     while let Some(r) = rx.next().await {
         match r {
             Err(e) => {
@@ -228,10 +229,10 @@ async fn listen_external<A: Authority + 'static>(
     alive: tokio::sync::mpsc::Sender<()>,
     valve: Valve,
     event_tx: UnboundedSender<Event>,
-    mut on: tokio::net::TcpListener,
+    on: tokio::net::TcpListener,
     authority: Arc<A>,
 ) -> Result<(), hyper::Error> {
-    let on = valve.wrap(on.incoming());
+    let on = valve.wrap(TcpListenerStream::new(on));
     use hyper::{service::make_service_fn, Body, Request, Response};
     use tower::Service;
     impl<A: Authority> Clone for ExternalServer<A> {
