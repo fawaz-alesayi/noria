@@ -6,110 +6,170 @@ Embed Noria's differential dataflow engine as a transparent, in-process caching 
 
 - **Drop-in better-sqlite3 replacement** with automatic query acceleration
 - **Zero configuration**: No external processes, no schema files, no manual view definitions
-- **Future targets**: rqlite (distributed SQLite) and litestream (SQLite replication)
+- **Database-agnostic core**: `noria-core` enables future support for MySQL, Postgres, and more
+- **Future targets**: rqlite (distributed SQLite), litestream (SQLite replication)
 
 ## Core Principles
 
-1. **Single Source of Truth**: SQLite owns disk, Noria owns RAM cache
-2. **Eventual Consistency**: Async CDC propagation (matches distributed target architecture)
+1. **Single Source of Truth**: Database owns disk, Noria owns RAM cache
+2. **Eventual Consistency**: Async batch CDC propagation (matches original Noria paper)
 3. **`{ fresh: true }` Escape Hatch**: Strong reads when needed
-4. **Fail-Safe**: Falls back to SQLite on errors or unsupported queries
+4. **Fail-Safe**: Falls back to database on errors or unsupported queries
 
 ---
 
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          Application                                 │
-│                    (Node.js via noria-better-sqlite3)               │
-├─────────────────────────────────────────────────────────────────────┤
-│  db.prepare("SELECT * FROM users WHERE id = ?")                     │
-│       ↓                                                             │
-│  ┌─────────────────────┐      ┌─────────────────────────────────┐  │
-│  │   Dynamic View      │      │     Statement Execution         │  │
-│  │   Synthesis         │      │  ┌─────────┐    ┌───────────┐   │  │
-│  │  (on first prepare) │      │  │ Cache   │ OR │ Upquery   │   │  │
-│  │                     │      │  │ Hit O(1)│    │ (SQLite)  │   │  │
-│  └─────────────────────┘      │  └─────────┘    └───────────┘   │  │
-├─────────────────────────────────────────────────────────────────────┤
-│                   C++ Noria Wrapper (noria.cpp)                     │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌─────────────────┐   │
-│  │ View Registration│  │ Cache Lookup     │  │ CDC Processing  │   │
-│  │ (RegisterView)   │  │ (LookupOrUpquery)│  │ (NotifyChange)  │   │
-│  └──────────────────┘  └──────────────────┘  └─────────────────┘   │
-├─────────────────────────────────────────────────────────────────────┤
-│                    Rust FFI Layer (noria-ffi)                       │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  noria-sqlite dataflow engine with evmap-backed views        │  │
-│  │  Filter, Project, Join, Aggregate operators                  │  │
-│  │  Incremental view maintenance via CDC                        │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-├─────────────────────────────────────────────────────────────────────┤
-│                    SQLite (Source of Truth)                         │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  Session Extension captures INSERT/UPDATE/DELETE changes    │   │
-│  │  Transaction-aware: changes only applied after COMMIT       │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            Application                                   │
+│                   (Node.js via noria-better-sqlite3)                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│  db.prepare("SELECT * FROM users WHERE id = ?")                         │
+│       ↓                                                                 │
+│  ┌─────────────────────┐      ┌─────────────────────────────────┐      │
+│  │   Dynamic View      │      │     Statement Execution         │      │
+│  │   Synthesis         │      │  ┌─────────┐    ┌───────────┐   │      │
+│  │  (on first prepare) │      │  │ Cache   │ OR │ Upquery   │   │      │
+│  │                     │      │  │ Hit O(1)│    │ (SQLite)  │   │      │
+│  └─────────────────────┘      │  └─────────┘    └───────────┘   │      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                     C++ Noria Wrapper (noria.cpp)                       │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────────┐     │
+│  │ View Registration│  │ Cache Lookup     │  │ Batch CDC Queue   │     │
+│  │ (RegisterView)   │  │ (LookupOrUpquery)│  │ (queue + flush)   │     │
+│  └──────────────────┘  └──────────────────┘  └───────────────────┘     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                      Rust FFI Layer (noria-ffi)                         │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  Write queue with batch processing (async CDC from Noria paper)  │  │
+│  │  noria_queue_insert/delete/update → noria_flush()                │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                         noria-core (Rust)                               │
+│  ┌────────────────┐ ┌────────────────┐ ┌────────────────────────────┐  │
+│  │ LocalExecutor  │ │ SqlConverter   │ │ DatabaseAdapter trait      │  │
+│  │ (dataflow DAG) │ │ (sqlparser-rs) │ │ CdcSource trait            │  │
+│  ├────────────────┤ ├────────────────┤ ├────────────────────────────┤  │
+│  │ Operators:     │ │ Multi-dialect: │ │ Implementations:           │  │
+│  │ Filter,Project │ │ SQLite,Postgres│ │ - SqliteAdapter (current)  │  │
+│  │ Join,Aggregate │ │ MySQL,Generic  │ │ - PostgresAdapter (future) │  │
+│  └────────────────┘ └────────────────┘ │ - MySqlAdapter (future)    │  │
+│                                        └────────────────────────────┘  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                    Database (Source of Truth)                           │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  SQLite: Session Extension captures INSERT/UPDATE/DELETE        │   │
+│  │  Postgres (future): Logical replication / pg_notify             │   │
+│  │  MySQL (future): Binlog replication                             │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Data Flow
 
-**Write Path (CDC)**:
+**Write Path (Async Batch CDC)**:
 ```
-db.run("INSERT...") → SQLite execute → Session changeset → propagate through dataflow → return
+db.run("INSERT...") → Database execute → Queue CDC event → Transaction commit
+                                                         → noria_flush() batches all events
+                                                         → Propagate through dataflow
 ```
 
 **Read Path**:
 ```
-stmt.get(key) → Check view cache → Hit: return O(1) | Miss: upquery SQLite → populate cache → return
+stmt.get(key) → Check view cache → Hit: return O(1) | Miss: upquery DB → populate cache → return
 ```
 
 **Transaction Path**:
 ```
-BEGIN → statements execute (CDC deferred) → COMMIT → process changeset → cache updated
-                                          → ROLLBACK → changeset discarded → cache unchanged
+BEGIN → statements execute (CDC queued) → COMMIT → flush queue → batch propagate
+                                        → ROLLBACK → discard queue → cache unchanged
 ```
 
 ---
 
-## Directory Structure
+## Crate Architecture
 
 ```
 noria/
-├── CLAUDE.md                    # This file (context for Claude sessions)
-├── noria-sqlite/               # Core Rust dataflow library
+├── noria-core/                    # Database-agnostic dataflow engine
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs                 # Public exports, prelude
+│       ├── adapter.rs             # DatabaseAdapter, CdcSource traits
+│       ├── view_cache.rs          # evmap-backed caching
+│       ├── dataflow/
+│       │   ├── mod.rs             # Record, Records types
+│       │   ├── executor.rs        # LocalExecutor (DAG propagation)
+│       │   ├── ops.rs             # Filter, Project, Join, Aggregate
+│       │   └── state.rs           # MemoryState, StateKey
+│       └── sql/
+│           ├── mod.rs             # SqlConverter
+│           └── parser.rs          # sqlparser-rs integration
+│
+├── noria-sqlite/                  # SQLite-specific adapter
+│   ├── Cargo.toml                 # depends on noria-core
+│   └── src/
+│       ├── lib.rs                 # Re-exports + SQLite API
+│       ├── database.rs            # NoriaDatabase wrapper
+│       ├── statement.rs           # Prepared statements
+│       └── adapter/
+│           ├── mod.rs             # SqliteAdapter impl
+│           └── session.rs         # CDC via session extension
+│
+├── noria-better-sqlite3/          # Node.js bindings (C++ FFI)
+│   ├── noria-ffi/                 # Rust FFI layer
+│   │   └── src/lib.rs             # Write queue, batch flush
 │   ├── src/
-│   │   ├── lib.rs              # Public API, Config struct
-│   │   ├── database.rs         # Connection wrapper
-│   │   ├── statement.rs        # Prepared statement handling
-│   │   ├── error.rs            # Error types
-│   │   └── dataflow/
-│   │       ├── engine.rs       # NoriaEngine: views, upqueries, CDC apply
-│   │       ├── executor.rs     # LocalExecutor: graph propagation
-│   │       ├── sql.rs          # SQL parser → dataflow graph
-│   │       ├── ops.rs          # Operators: Filter, Project, Join, Aggregate
-│   │       └── state.rs        # State trait, MemoryState (evmap-backed)
-│   └── tests/
-│       ├── integration.rs      # Rust integration tests
-│       └── differential.rs     # Differential correctness tests
-├── noria-better-sqlite3/       # PRIMARY: C++ FFI integration with better-sqlite3
-│   ├── src/
-│   │   ├── better_sqlite3.cpp  # Main entry point
-│   │   ├── objects/
-│   │   │   ├── database.cpp    # Database class with Noria integration
-│   │   │   └── statement.cpp   # Statement with cache lookup + CDC
-│   │   └── util/
-│   │       └── noria.cpp       # Noria C++ wrapper class
-│   ├── noria-ffi/
-│   │   └── src/lib.rs          # Rust FFI: wraps noria-sqlite for C++ access
-│   ├── lib/                    # JavaScript API (better-sqlite3 compatible)
-│   ├── test/
-│   │   └── 60.noria-acceleration.js  # Noria-specific tests
-│   └── binding.gyp             # Build configuration
-└── better-sqlite3/             # Reference implementation for API compatibility
+│   │   ├── util/noria.cpp         # C++ wrapper
+│   │   └── objects/               # Database/Statement integration
+│   └── lib/                       # JavaScript API
+│
+└── noria/                         # Original Noria DataType crate
 ```
+
+---
+
+## Database Adapter Traits
+
+The `noria-core` crate defines traits for pluggable database backends:
+
+```rust
+// noria-core/src/adapter.rs
+
+/// Trait for database adapters (schema discovery, upqueries)
+pub trait DatabaseAdapter {
+    type Error: std::error::Error;
+
+    fn table_schema(&self, table: &str) -> Result<Option<TableSchema>, Self::Error>;
+    fn upquery(&self, sql: &str, params: &[DataType]) -> Result<Vec<Vec<DataType>>, Self::Error>;
+    fn list_tables(&self) -> Result<Vec<String>, Self::Error>;
+}
+
+/// Trait for Change Data Capture sources
+pub trait CdcSource {
+    fn poll(&mut self) -> Vec<CdcEvent>;
+    fn track_table(&mut self, table: &str);
+    fn is_active(&self) -> bool;
+    fn reset(&mut self);
+}
+
+/// CDC event types
+pub enum CdcEvent {
+    Insert { table: String, row: Vec<DataType> },
+    Delete { table: String, row: Vec<DataType> },
+    Update { table: String, old: Vec<DataType>, new: Vec<DataType> },
+}
+```
+
+### Future Database Support
+
+| Database | Adapter | CDC Mechanism | Status |
+|----------|---------|---------------|--------|
+| SQLite | `SqliteAdapter` | Session extension | **Implemented** |
+| PostgreSQL | `PostgresAdapter` | Logical replication / LISTEN/NOTIFY | Planned |
+| MySQL | `MySqlAdapter` | Binlog replication | Planned |
+| Generic | `GenericAdapter` | Polling (fallback) | Planned |
 
 ---
 
@@ -117,14 +177,74 @@ noria/
 
 | File | Purpose | Key Functions |
 |------|---------|---------------|
-| `noria-better-sqlite3/src/util/noria.cpp` | C++ Noria wrapper | `RegisterView()`, `LookupOrUpquery()`, `ProcessSessionChangeset()` |
-| `noria-better-sqlite3/src/objects/database.cpp` | Database with Noria | `JS_exec()`, `JS_prepare()`, `CloseHandles()` |
-| `noria-better-sqlite3/src/objects/statement.cpp` | Statement + CDC | `JS_get()`, `JS_run()`, `NotifyCdc()` |
-| `noria-better-sqlite3/noria-ffi/src/lib.rs` | Rust FFI layer | `noria_create()`, `noria_lookup()`, `noria_apply_insert()` |
-| `noria-sqlite/src/dataflow/engine.rs` | Dataflow engine | `create_view()`, `lookup_or_upquery()`, `apply_insert_row()` |
-| `noria-sqlite/src/dataflow/executor.rs` | Graph execution | `propagate()`, `apply_write()`, `lookup()` |
-| `noria-sqlite/src/dataflow/ops.rs` | Operators | `FilterOp`, `JoinOp`, `AggregateOp` |
-| `noria-sqlite/src/dataflow/state.rs` | View state storage | `StateKey`, `MemoryState`, `lookup()` |
+| `noria-core/src/adapter.rs` | Database adapter traits | `DatabaseAdapter`, `CdcSource`, `CdcEvent` |
+| `noria-core/src/dataflow/executor.rs` | Graph execution | `propagate()`, `apply_write()`, `lookup()` |
+| `noria-core/src/dataflow/ops.rs` | Operators | `FilterOp`, `JoinOp`, `AggregateOp`, `needs_state()` |
+| `noria-core/src/sql/mod.rs` | SQL parsing | `SqlConverter`, `SqlDialect` |
+| `noria-ffi/src/lib.rs` | Rust FFI layer | `noria_queue_*()`, `noria_flush()`, write queue |
+| `noria.cpp` | C++ wrapper | `RegisterView()`, `LookupOrUpquery()`, `ProcessSessionChangeset()` |
+
+---
+
+## Async Batch Processing
+
+Implements the async batch processing from the original Noria paper (OSDI'18):
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Write Queue (per transaction)                │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐               │
+│  │ INSERT  │ │ INSERT  │ │ UPDATE  │ │ DELETE  │  ...          │
+│  │ votes   │ │ votes   │ │ users   │ │ comments│               │
+│  └─────────┘ └─────────┘ └─────────┘ └─────────┘               │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ noria_flush()
+┌─────────────────────────────────────────────────────────────────┐
+│                     Batch by Table                               │
+│  votes: [+row1, +row2]    users: [-old, +new]    comments: [-r] │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ Single propagate() per table
+┌─────────────────────────────────────────────────────────────────┐
+│                     Dataflow Propagation                         │
+│  Aggregate operators batch updates for same group key            │
+│  Reduces retraction overhead (emit old/new once per final state) │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Benefits**:
+- Single lock acquisition per table (not per write)
+- Aggregate operators batch updates for same group key
+- Reduces retraction overhead
+
+---
+
+## Performance
+
+### Lobsters Benchmark (vs better-sqlite3)
+
+Simulates a link aggregator (HN/Lobsters) with stories, users, votes, comments.
+- **Reads**: story lookup, vote count (aggregate), user profile, story+author (join)
+- **Writes**: add vote, add comment (triggers aggregate view updates)
+
+| Scenario | better-sqlite3 | noria | Speedup |
+|----------|----------------|-------|---------|
+| Single-key read | 325,000 ops/sec | 800,000 ops/sec | **2.5x** |
+| Read-only mixed | 295,000 ops/sec | 510,000 ops/sec | **1.7x** |
+| Read 99% / Write 1% | 200,000 ops/sec | 290,000 ops/sec | **1.4x** |
+| Read 95% / Write 5% | 110,000 ops/sec | 110,000 ops/sec | 1.0x |
+| Read 90% / Write 10% | 63,000 ops/sec | 57,000 ops/sec | 0.9x |
+
+**Trade-offs**: Beneficial for read-heavy workloads (95%+ reads). At 95/5, parity. Write-heavy workloads with aggregate views are slower due to incremental maintenance.
+
+### Alignment with Original Noria Paper
+
+| Metric | Original Noria | Noria-SQLite | Notes |
+|--------|---------------|--------------|-------|
+| Target workload | 95%+ reads | 95%+ reads | Same |
+| Speedup vs baseline | 5-7x vs MySQL | 1.7-2.5x vs SQLite | SQLite baseline is faster |
+| Design | Distributed | In-process | Simpler, lower latency |
 
 ---
 
@@ -138,39 +258,91 @@ npm run build-release
 # Run all tests (348 passing)
 npm test
 
-# Run specific Noria tests
-npm test -- --grep "Noria"
+# Run Lobsters benchmark
+npm run bench:lobsters
 
 # Rust tests
+cd noria-core && cargo test
 cd noria-sqlite && cargo test
-
-# FFI tests
 cd noria-better-sqlite3/noria-ffi && cargo test
 ```
 
-### Key Test Files
-- `noria-better-sqlite3/test/60.noria-acceleration.js` - Noria cache behavior tests
-- `noria-better-sqlite3/test/99.benchmark.js` - Performance comparison vs better-sqlite3
-- `noria-sqlite/tests/integration.rs` - Rust integration tests
-- `noria-sqlite/tests/differential.rs` - Correctness tests for dataflow
+---
+
+## Profiling
+
+Use Linux `perf` for accurate performance profiling. It provides hardware-sampled profiling with <1% overhead, which is far more accurate than instrumented profiling.
+
+### Quick Start
+
+```bash
+cd noria-better-sqlite3
+
+# Record a profiling session
+sudo perf record -g -F 999 -- node benchmark/lobsters.js
+
+# Generate a report (top functions)
+sudo perf report --stdio --no-children --percent-limit=0.5
+
+# Clean up
+rm perf.data
+```
+
+### Profiling Tips
+
+1. **Use the lobsters benchmark** for realistic workloads:
+   ```bash
+   npm run bench:lobsters
+   ```
+
+2. **Use perf-target.js** for focused cache profiling:
+   ```bash
+   sudo perf record -g -F 999 -- node benchmark/perf-target.js
+   ```
+
+3. **Interpret the results** by category:
+   - `sqlite3*` functions: SQLite execution (expected for writes/upqueries)
+   - `v8::*` functions: V8/JavaScript overhead (object creation, string handling)
+   - `noria_*` / Rust functions: Noria cache operations
+   - `malloc`/`free`: Memory allocation overhead
+
+### Current Bottleneck Breakdown
+
+| Category | Overhead | Notes |
+|----------|----------|-------|
+| SQLite | ~11% | VdbeExec, BtreeMoveto, WAL checksums |
+| V8/JS | ~8% | Object::New, StringTable, AllocateRaw |
+| Kernel | ~7% | syscalls, memory operations |
+| Noria | ~3% | Cache lookups, state management |
+| malloc | ~3% | Shared across all components |
+
+### Runtime Metrics
+
+Use `db.cacheStats()` for runtime cache metrics (no overhead):
+
+```javascript
+const stats = db.cacheStats();
+// {
+//   cacheHits: 1000,
+//   cacheMisses: 5,
+//   totalRows: 500,
+//   viewCount: 3,
+//   nodeCount: 10
+// }
+```
 
 ---
 
 ## Current Status (January 2026)
 
 ### Completed
-- **Core Dataflow Engine**: Filter, Project, Join, Aggregate operators
-- **Session-Based CDC**: INSERT/UPDATE/DELETE captured with transaction semantics
-- **better-sqlite3 Integration**: Full API compatibility via C++ FFI
-- **Incremental Propagation**: Changes flow through graph to update views
-- **Partial Materialization**: O(1) cache hits, upqueries on miss
-- **Dynamic View Synthesis**: `prepare()` auto-creates Noria views
-- **Transaction-Aware CDC**: Events buffered until COMMIT, discarded on ROLLBACK
-- **Cache Statistics**: `cacheHits`, `cacheMisses`, `totalRows` tracking
-- **Memory Management**: Configurable limits with random eviction
-- **JOIN CDC**: Base table changes propagate to JOIN views
-- **Aggregate CDC**: Incremental aggregate updates (COUNT, SUM, AVG)
-- **StateKey Optimization**: Single-column keys avoid Vec allocation overhead
+- **noria-core separation**: Database-agnostic dataflow engine
+- **Adapter traits**: `DatabaseAdapter`, `CdcSource` for pluggable backends
+- **Async batch processing**: Write queue + flush (from Noria paper)
+- **`needs_state()` optimization**: Skip snapshot for operators that don't need it
+- **Core operators**: Filter, Project, Join, Aggregate with incremental maintenance
+- **SQLite integration**: Session extension CDC, transaction-aware
+- **better-sqlite3 compatibility**: Full API compatibility via C++ FFI
 
 ### Test Results
 - **Node.js Tests**: 348 passing
@@ -179,53 +351,56 @@ cd noria-better-sqlite3/noria-ffi && cargo test
 
 ### Not Yet Implemented
 - Subqueries and window functions
-- Named parameter CDC path optimization
+- PostgreSQL adapter (logical replication)
+- MySQL adapter (binlog)
+- Named parameter CDC optimization
 
 ---
 
 ## Design Decisions
 
-### 1. C++ FFI over NAPI-RS
-- **Decision**: Use C++ wrapper calling Rust FFI instead of direct NAPI-RS bindings
-- **Rationale**: Integrates with existing better-sqlite3 codebase; simpler build; better performance
+### 1. noria-core Separation
+- **Decision**: Extract database-agnostic code into `noria-core` crate
+- **Rationale**: Enables future support for Postgres, MySQL without duplicating dataflow logic
+- **Key abstractions**: `DatabaseAdapter` trait, `CdcSource` trait, `SqlDialect` enum
+
+### 2. Async Batch Processing
+- **Decision**: Queue CDC events, batch-process on flush
+- **Rationale**: Matches original Noria paper; reduces lock contention and aggregate overhead
+- **Implementation**: `noria_queue_*()` → `noria_flush()` in FFI layer
+
+### 3. C++ FFI over NAPI-RS
+- **Decision**: Use C++ wrapper calling Rust FFI
+- **Rationale**: Integrates with existing better-sqlite3 codebase; simpler build
 - **Trade-off**: More complex FFI boundary; manual memory management
 
-### 2. Session Extension for CDC
+### 4. Session Extension for SQLite CDC
 - **Decision**: Use `sqlite3session` for change capture
 - **Rationale**: Transaction-aware; captures old values; efficient
 - **Requirement**: SQLite compiled with `-DSQLITE_ENABLE_SESSION`
-- **Note**: Pre-update hook conflicts with session; rely on session alone
 
-### 3. Transaction-Aware Processing
-- **Decision**: Only process CDC changeset when autocommit=1 (not in transaction)
-- **Rationale**: Ensures ROLLBACK properly discards changes from cache
-- **Implementation**: Check `sqlite3_get_autocommit()` before processing
-
-### 4. Session Recreation
-- **Decision**: Recreate session after extracting changeset
-- **Rationale**: Session transitions to FINISHED state after `sqlite3session_changeset()`
-- **Implementation**: Delete and recreate session to continue recording
+### 5. `needs_state()` Operator Trait
+- **Decision**: Add method to skip snapshot creation for operators that don't need it
+- **Rationale**: Aggregates maintain internal state; no need for expensive view snapshots
+- **Impact**: Significant performance improvement for aggregate-heavy workloads
 
 ---
 
-## Introspection API
+## Theoretical Background
 
-```javascript
-const Database = require('noria-better-sqlite3');
-const db = new Database('app.db');
+### Noria's Partially-Stateful Dataflow
+- **Push-based**: Writes propagate through DAG, not pulled on read
+- **Partial materialization**: Views can be sparse; upqueries fill holes
+- **Differential updates**: Positive (insert) and negative (retraction) records
+- **Async batch processing**: Queue writes, propagate in batches
 
-const stats = db.cacheStats();
-// {
-//   cacheHits: 1000,      // Reads from cache
-//   cacheMisses: 50,      // Upqueries triggered
-//   totalRows: 150,       // Total rows across views
-//   viewCount: 2,         // Number of registered views
-//   nodeCount: 5          // Nodes in dataflow graph
-// }
-
-const hitRate = stats.cacheHits / (stats.cacheHits + stats.cacheMisses);
-console.log(`Cache hit rate: ${(hitRate * 100).toFixed(1)}%`);
-```
+### Storage Architecture
+| Layer | Original Noria | Noria-SQLite |
+|-------|---------------|--------------|
+| Materialized Views | evmap | evmap (same) |
+| Base Table Storage | RocksDB | SQLite (or Postgres/MySQL) |
+| Upquery Source | RocksDB | Database via adapter |
+| CDC | Custom | Database-specific (session/binlog/replication) |
 
 ---
 
@@ -242,7 +417,7 @@ db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
 // Prepare creates a Noria view automatically
 const stmt = db.prepare('SELECT * FROM users WHERE id = ?');
 
-// Insert data - CDC propagates to view
+// Insert data - CDC queued, propagates on flush
 db.exec("INSERT INTO users VALUES (1, 'Alice')");
 
 // Cache hit - O(1) lookup
@@ -252,51 +427,7 @@ const user = stmt.get(1);  // { id: 1, name: 'Alice' }
 db.exec("UPDATE users SET name = 'Bob' WHERE id = 1");
 stmt.get(1);  // { id: 1, name: 'Bob' }
 
-// Delete removes from cache
-db.exec("DELETE FROM users WHERE id = 1");
-stmt.get(1);  // undefined
+// Cache stats
+const stats = db.cacheStats();
+// { cacheHits: 2, cacheMisses: 0, totalRows: 1, viewCount: 1, nodeCount: 2 }
 ```
-
----
-
-## Theoretical Background
-
-### Noria's Partially-Stateful Dataflow
-- **Push-based**: Writes propagate through DAG, not pulled on read
-- **Partial materialization**: Views can be sparse; upqueries fill holes
-- **Differential updates**: Positive (insert) and negative (retraction) records
-
-### SQLite Integration
-- **Consistency**: SQLite is strongly consistent; Noria provides eventual consistency for reads
-- **CDC**: SQLite Session Extension captures changes with transaction semantics
-
-### Storage Architecture
-| Layer | Original Noria | Noria-SQLite |
-|-------|---------------|--------------|
-| Materialized Views | evmap | evmap (same) |
-| Base Table Storage | RocksDB | SQLite |
-| Upquery Source | RocksDB | SQLite |
-
-This eliminates RocksDB entirely—SQLite serves as both user database AND Noria's base table backend.
-
----
-
-## Performance
-
-### Benchmark Results (vs better-sqlite3)
-
-| Operation | Improvement |
-|-----------|-------------|
-| Read single row (cache hit) | **+42%** |
-| Read 100 rows | +2% |
-| Insert single row | -3% (CDC overhead) |
-| Insert 100 in transaction | -2% |
-| Cache hit throughput | **>1M ops/sec** |
-| Cache hit rate | 100% (for repeated queries) |
-
-Run benchmarks: `npm test -- --grep benchmark`
-
-### Performance Characteristics
-- **Read-heavy workloads**: Significant speedup from cache hits
-- **Write-heavy workloads**: Small overhead from CDC propagation
-- **Mixed workloads**: Net positive for typical 90% read / 10% write patterns

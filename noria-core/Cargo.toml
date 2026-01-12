@@ -1,0 +1,39 @@
+[package]
+name = "noria-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Noria Contributors"]
+license = "MIT OR Apache-2.0"
+description = "Database-agnostic dataflow engine for caching"
+repository = "https://github.com/mit-pdos/noria.git"
+keywords = ["database", "cache", "dataflow"]
+categories = ["database", "caching"]
+
+[dependencies]
+# Noria core (for DataType)
+noria = { path = "../noria" }
+
+# SQL parser (multi-dialect: SQLite, Postgres, MySQL)
+sqlparser = "0.40"
+
+# Lock-free concurrent map for view storage
+evmap = "11.0"
+
+# Error handling
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+
+# Parking lot for efficient synchronization primitives
+parking_lot = "0.12"
+
+# Date/time (same version as noria uses)
+chrono = "0.4"
+
+[features]
+default = []
+
+[dev-dependencies]
+tempfile = "3.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

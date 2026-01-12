@@ -10,6 +10,14 @@ Noria-SQLite puts a dataflow engine in front of SQLite. When you `prepare()` a S
 
 It's a drop-in replacement for better-sqlite3, based on the [Noria research system](https://pdos.csail.mit.edu/papers/noria:osdi18.pdf) from MIT PDOS. The original Noria uses ZooKeeper and distributed workers; this version runs entirely in-process.
 
+## Why
+
+SQLite works well for small web apps. Most web apps are read-heavy. Eventually your app gets slow because SQLite can't keep up with reads.
+
+The usual answer is "add caching." So you either roll your own or bring in Redis. Both are complicated. You're writing cache invalidation logic instead of building features.
+
+Noria handles this for you. Swap your require, and reads get served from a cache that stays in sync with your data. The goal is 5-10x read throughput without thinking about caching. Thanks to [Jon Gjengset](https://thesquareplanet.com/) for the research that made this possible.
+
 ## Architecture
 
 ```
@@ -59,16 +67,33 @@ stmt.get(1);  // cache hit
 
 ## Performance
 
-vs better-sqlite3 (100k iterations):
+Tested on OCI VM.Standard.A1.Flex (4 OCPU ARM, 24GB RAM), Ubuntu 22.04.
 
-| Operation | Difference |
-|-----------|------------|
-| Read single row (cache hit) | +42% |
-| Read 100 rows | +2% |
-| Insert single row | -3% |
-| Bulk insert (100 rows) | -2% |
+### Lobsters benchmark
 
-Reads are faster. Writes have CDC overhead.
+Simulates a link aggregator (HN/Lobsters style) with stories, users, votes, and comments.
+- **Reads**: story lookup, vote count (aggregate), user profile, story+author (join)
+- **Writes**: add vote, add comment (triggers aggregate view updates)
+
+| Scenario | better-sqlite3 | noria-better-sqlite3 | Speedup |
+|----------|----------------|----------------------|---------|
+| Single-key read | 325,000 ops/sec | 800,000 ops/sec | **2.5x** |
+| Read-only mixed | 295,000 ops/sec | 510,000 ops/sec | **1.7x** |
+| Read 99% / Write 1% | 200,000 ops/sec | 290,000 ops/sec | **1.4x** |
+| Read 95% / Write 5% | 110,000 ops/sec | 110,000 ops/sec | 1.0x |
+| Read 90% / Write 10% | 63,000 ops/sec | 57,000 ops/sec | 0.9x |
+
+**Trade-offs**: Beneficial for read-heavy workloads (99%+ reads). At 95/5, performance is at parity. Write-heavy workloads with aggregate views are slower due to incremental maintenance overhead.
+
+### Parity (operations that bypass cache)
+
+| Benchmark | better-sqlite3 | noria-better-sqlite3 | Difference |
+|-----------|----------------|----------------------|------------|
+| Range query (100 rows) | 16,600 ops/sec | 16,100 ops/sec | -3% |
+| Insert single row | 461,000 ops/sec | 441,000 ops/sec | -4% |
+| Insert 100 rows (txn) | 7,100 ops/sec | 6,800 ops/sec | -4% |
+
+Reads are faster. Writes have ~4% CDC overhead.
 
 ## Papers
 

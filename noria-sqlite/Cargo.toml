@@ -21,6 +21,9 @@ rusqlite = { version = "0.38.0", features = ["session", "bundled", "column_declt
 # Noria core (for DataType, etc.)
 noria = { path = "../noria" }
 
+# Noria core dataflow engine
+noria-core = { path = "../noria-core" }
+
 # SQL parser (SQLite-specific, more complete than nom-sql)
 sqlite3-parser = "0.15"
 fallible-iterator = "0.3"

@@ -4,9 +4,9 @@
 
 use std::collections::HashMap;
 use noria::DataType;
-use noria_core::dataflow::{Record, Records};
-use noria_core::dataflow::{State, DynamicState, LookupResult};
+use super::{Record, Records};
 use super::ops::{Operator, OperatorType, ProcessingResult};
+use super::state::{State, DynamicState, LookupResult};
 
 /// Index into the node array.
 pub type NodeIndex = usize;
@@ -123,12 +123,11 @@ impl LocalExecutor {
     }
 
     /// Materialize a node's output with the given key columns.
-    ///
     /// Uses DynamicState which auto-detects key type and chooses optimal implementation:
     /// - IntegerArrayState for O(1) integer lookups (common for primary keys)
-    /// - MemoryState for other key types (HashMap-based)
+    /// - MemoryState with HashMap for other key types
     pub fn materialize(&mut self, node: NodeIndex, key_columns: Vec<usize>) -> ViewHandle {
-        // DynamicState auto-detects key type on first insert and chooses optimal impl
+        // DynamicState auto-detects key type on first insert
         let state: Box<dyn State> = Box::new(DynamicState::new(key_columns.clone()));
         self.nodes[node].state = Some(state);
 
@@ -140,27 +139,14 @@ impl LocalExecutor {
 
     /// Look up rows from a materialized view.
     pub fn lookup(&self, view: &ViewHandle, key: &[DataType]) -> Option<Vec<Vec<DataType>>> {
-
-        // Access node
-        let node = {
-            &self.nodes[view.node]
-        };
-
+        let node = &self.nodes[view.node];
         match &node.state {
-            Some(state) => {
-                // State lookup (includes HashMap access)
-                let lookup_result = {
-                    state.lookup(key)
-                };
-
-                match lookup_result {
-                    LookupResult::Some(rows) => {
-                        // Result collection - this clones data!
-                        Some(rows.into_iter().map(|r| r.to_vec()).collect())
-                    }
-                    LookupResult::Empty => Some(vec![]),
-                    LookupResult::Missing => None,
+            Some(state) => match state.lookup(key) {
+                LookupResult::Some(rows) => {
+                    Some(rows.into_iter().map(|r| r.to_vec()).collect())
                 }
+                LookupResult::Empty => Some(vec![]),
+                LookupResult::Missing => None,
             },
             None => None,
         }
@@ -214,8 +200,8 @@ impl LocalExecutor {
                 .unwrap_or(0);
 
             // Determine what state to pass to the operator.
-            // Only create snapshots if the operator actually needs state.
-            // This avoids expensive snapshot() calls for operators like Aggregate
+            // Only create expensive snapshots if the operator actually needs state.
+            // This avoids cloning the entire HashMap for operators like Aggregate
             // that have their own internal state.
             let needs_state = self.nodes[child]
                 .operator
@@ -243,21 +229,13 @@ impl LocalExecutor {
             };
 
             // Process through the operator
-            // Avoid cloning records if this is the last child
-            let is_last_child = i == num_children - 1;
-            let records_for_child = if is_last_child {
-                records.clone() // Still need to clone because we consumed records for state above
-            } else {
-                records.clone()
-            };
-
             let output = if self.nodes[child].operator.is_some() {
                 let node = &mut self.nodes[child];
                 let op = node.operator.as_mut().unwrap();
 
-                op.process(parent_idx, records_for_child, state_for_op.as_deref())
+                op.process(parent_idx, records.clone(), state_for_op.as_deref())
             } else {
-                ProcessingResult { results: records_for_child, lookups_needed: vec![] }
+                ProcessingResult { results: records.clone(), lookups_needed: vec![] }
             };
 
             // Continue propagation to children

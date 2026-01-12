@@ -18,6 +18,158 @@
 #include <cctype>
 #include <map>
 #include <utility>
+// ============================================================================
+// C++ Profiling Infrastructure
+// ============================================================================
+// Uses clock_gettime instead of <chrono> to avoid conflicts with
+// the better-sqlite3 macros (#define first() 0 in macros.cpp).
+
+// C++ profiling: disabled by default for production performance.
+// To enable, build with: npm run build-release -- --DNORIA_CPP_PROFILING=1
+// Or use: sudo perf record -g node your-benchmark.js (recommended)
+#ifndef NORIA_CPP_PROFILING
+#define NORIA_CPP_PROFILING 0
+#endif
+
+#if NORIA_CPP_PROFILING
+
+#include <time.h>
+#include <stdint.h>
+#include <pthread.h>
+
+// Simple mutex wrapper using pthread (avoids <mutex> header)
+class SimpleMutex {
+public:
+    SimpleMutex() { pthread_mutex_init(&mutex_, nullptr); }
+    ~SimpleMutex() { pthread_mutex_destroy(&mutex_); }
+    void lock() { pthread_mutex_lock(&mutex_); }
+    void unlock() { pthread_mutex_unlock(&mutex_); }
+private:
+    pthread_mutex_t mutex_;
+};
+
+class SimpleLockGuard {
+public:
+    explicit SimpleLockGuard(SimpleMutex& m) : mutex_(m) { mutex_.lock(); }
+    ~SimpleLockGuard() { mutex_.unlock(); }
+private:
+    SimpleMutex& mutex_;
+};
+
+// Get current time in nanoseconds
+static inline uint64_t get_time_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+// Timing statistics for a single span
+struct CppTimingStats {
+    uint64_t total_ns;
+    uint64_t call_count;
+    uint64_t max_ns;
+    uint64_t min_ns;
+
+    CppTimingStats() : total_ns(0), call_count(0), max_ns(0), min_ns(UINT64_MAX) {}
+};
+
+// Global timing data storage
+class CppProfiler {
+public:
+    static CppProfiler& instance() {
+        static CppProfiler profiler;
+        return profiler;
+    }
+
+    void record(const char* name, uint64_t elapsed_ns) {
+        SimpleLockGuard lock(mutex_);
+
+        // Find or create stats entry
+        int idx = find_or_create(name);
+        if (idx < 0) return;
+
+        CppTimingStats& stats = stats_[idx];
+        stats.total_ns += elapsed_ns;
+        stats.call_count++;
+        if (elapsed_ns > stats.max_ns) stats.max_ns = elapsed_ns;
+        if (elapsed_ns < stats.min_ns) stats.min_ns = elapsed_ns;
+    }
+
+    void reset() {
+        SimpleLockGuard lock(mutex_);
+        count_ = 0;
+    }
+
+    std::string report() {
+        SimpleLockGuard lock(mutex_);
+
+        std::string result = "\n╔══════════════════════════════════════════════════════════════════════╗\n";
+        result += "║                     C++ LAYER TIMING PROFILE                         ║\n";
+        result += "╚══════════════════════════════════════════════════════════════════════╝\n\n";
+        result += "Span                          │ Calls    │   Total    │    Avg    │    Max\n";
+        result += "──────────────────────────────┼──────────┼────────────┼───────────┼───────────\n";
+
+        for (int i = 0; i < count_; i++) {
+            const CppTimingStats& stats = stats_[i];
+            double avg = stats.call_count > 0 ? (double)stats.total_ns / stats.call_count : 0;
+
+            char line[256];
+            snprintf(line, sizeof(line), "%-29s │ %8lu │ %8.2fms │ %7.1fμs │ %7.1fμs\n",
+                     names_[i],
+                     (unsigned long)stats.call_count,
+                     stats.total_ns / 1e6,
+                     avg / 1e3,
+                     stats.max_ns / 1e3);
+            result += line;
+        }
+        return result;
+    }
+
+private:
+    static const int MAX_SPANS = 64;
+    SimpleMutex mutex_;
+    const char* names_[MAX_SPANS];
+    CppTimingStats stats_[MAX_SPANS];
+    int count_ = 0;
+
+    int find_or_create(const char* name) {
+        // Linear search (acceptable for small number of spans)
+        for (int i = 0; i < count_; i++) {
+            if (strcmp(names_[i], name) == 0) return i;
+        }
+        // Create new entry
+        if (count_ >= MAX_SPANS) return -1;
+        names_[count_] = name;
+        stats_[count_] = CppTimingStats();
+        return count_++;
+    }
+};
+
+// RAII timing guard
+class CppProfileGuard {
+public:
+    explicit CppProfileGuard(const char* name) : name_(name), start_(get_time_ns()) {}
+
+    ~CppProfileGuard() {
+        uint64_t elapsed = get_time_ns() - start_;
+        CppProfiler::instance().record(name_, elapsed);
+    }
+
+private:
+    const char* name_;
+    uint64_t start_;
+};
+
+#define CPP_PROFILE(name) CppProfileGuard _cpp_guard_##__LINE__(name)
+#define CPP_PROFILE_RESET() CppProfiler::instance().reset()
+#define CPP_PROFILE_REPORT() CppProfiler::instance().report()
+
+#else
+// No-op when profiling disabled
+#define CPP_PROFILE(name)
+#define CPP_PROFILE_RESET()
+#define CPP_PROFILE_REPORT() std::string("")
+#endif
 
 // Forward declaration of Noria class for callback
 class Noria;
@@ -221,18 +373,26 @@ public:
         void** out_rows,
         int* out_row_count
     ) {
+        CPP_PROFILE("cpp_execute_upquery");
+
         if (!db_ || !sql) {
             return -1;
         }
 
         sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-            return -1;
+        {
+            CPP_PROFILE("cpp_upquery_prepare");
+            if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+                return -1;
+            }
         }
 
         // Bind parameters
-        for (int i = 0; i < param_count; i++) {
-            BindNoriaValue(stmt, i + 1, params[i]);
+        {
+            CPP_PROFILE("cpp_upquery_bind");
+            for (int i = 0; i < param_count; i++) {
+                BindNoriaValue(stmt, i + 1, params[i]);
+            }
         }
 
         // Create rows container using Rust FFI
@@ -245,18 +405,21 @@ public:
         int row_count = 0;
 
         // Execute and collect rows
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            int col_count = sqlite3_column_count(stmt);
+        {
+            CPP_PROFILE("cpp_upquery_execute");
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                int col_count = sqlite3_column_count(stmt);
 
-            // Build row values - must add immediately since SQLite pointers are transient
-            std::vector<NoriaValue> row_values(col_count);
-            for (int c = 0; c < col_count; c++) {
-                row_values[c] = SqliteColumnToNoriaValue(stmt, c);
+                // Build row values - must add immediately since SQLite pointers are transient
+                std::vector<NoriaValue> row_values(col_count);
+                for (int c = 0; c < col_count; c++) {
+                    row_values[c] = SqliteColumnToNoriaValue(stmt, c);
+                }
+
+                // Add row to container (Rust will copy string/blob data)
+                noria_rows_add_row(rows_container, row_values.data(), col_count);
+                row_count++;
             }
-
-            // Add row to container (Rust will copy string/blob data)
-            noria_rows_add_row(rows_container, row_values.data(), col_count);
-            row_count++;
         }
 
         sqlite3_finalize(stmt);
@@ -292,13 +455,23 @@ public:
 
     // Register a view for a SELECT statement, returns view_id or -1 on failure
     int RegisterView(const char* sql) {
+        CPP_PROFILE("cpp_register_view");
+
         if (!IsEnabled()) return -1;
 
         // First, extract table names from SQL and register their schemas
         // This ensures the SQL converter knows about the tables before creating views
-        RegisterTablesFromSql(sql);
+        {
+            CPP_PROFILE("cpp_register_tables_from_sql");
+            RegisterTablesFromSql(sql);
+        }
 
-        int result = noria_register_view(handle_, sql);
+        int result;
+        {
+            CPP_PROFILE("cpp_register_view_ffi");
+            result = noria_register_view(handle_, sql);
+        }
+
         if (result >= 0) {
             has_any_views_ = true;  // Update cached state
 #if USE_SESSION_CDC
@@ -429,6 +602,8 @@ public:
 
     // Extract CDC events from session changeset and apply incremental updates
     void ProcessSessionChangeset() {
+        CPP_PROFILE("cpp_process_changeset");
+
         if (!session_ || !has_any_views_) return;
 
         // Only process changeset when NOT in a transaction.
@@ -443,9 +618,12 @@ public:
         int changeset_size = 0;
 
         // Get changeset (this clears recorded changes)
-        if (sqlite3session_changeset(session_, &changeset_size, &changeset) != SQLITE_OK) {
-            ClearBufferedOldRows();
-            return;
+        {
+            CPP_PROFILE("cpp_changeset_extract");
+            if (sqlite3session_changeset(session_, &changeset_size, &changeset) != SQLITE_OK) {
+                ClearBufferedOldRows();
+                return;
+            }
         }
 
         if (changeset_size == 0 || !changeset) {
@@ -491,7 +669,7 @@ public:
                             new_values[i].value_type = NORIA_NULL;
                         }
                     }
-                    noria_apply_insert(handle_, table_name, new_values.data(), n_cols);
+                    noria_queue_insert(handle_, table_name, new_values.data(), n_cols);
                     break;
                 }
                 case SQLITE_DELETE: {
@@ -509,7 +687,7 @@ public:
                     BufferedOldRow* buffered = GetBufferedOldRow(table_name, rowid);
                     if (buffered && buffered->values.size() == static_cast<size_t>(n_cols)) {
                         // Use buffered full row values
-                        noria_apply_delete(handle_, table_name, buffered->values.data(), n_cols);
+                        noria_queue_delete(handle_, table_name, buffered->values.data(), n_cols);
                     } else {
                         // Fallback to session values (may be partial)
                         for (int i = 0; i < n_cols; i++) {
@@ -520,7 +698,7 @@ public:
                                 old_values[i].value_type = NORIA_NULL;
                             }
                         }
-                        noria_apply_delete(handle_, table_name, old_values.data(), n_cols);
+                        noria_queue_delete(handle_, table_name, old_values.data(), n_cols);
                     }
                     break;
                 }
@@ -562,7 +740,7 @@ public:
                             new_values[i] = old_values[i];
                         }
                     }
-                    noria_apply_update(handle_, table_name, old_values.data(), new_values.data(), n_cols);
+                    noria_queue_update(handle_, table_name, old_values.data(), new_values.data(), n_cols);
                     break;
                 }
             }
@@ -571,6 +749,12 @@ public:
         sqlite3changeset_finalize(iter);
         sqlite3_free(changeset);
         ClearBufferedOldRows();  // Clear buffer after processing
+
+        // Batch process all queued changes through the dataflow graph.
+        // This implements async batch processing from the original Noria paper:
+        // - All changes from this transaction are processed together
+        // - Reduces lock contention and aggregate operator overhead
+        noria_flush(handle_);
 
         // After sqlite3session_changeset(), the session needs to be recreated
         // to continue recording changes. Delete the old session and create a new one.
@@ -647,6 +831,8 @@ public:
 
     // Lookup in cache only (no SQLite fallback)
     NoriaLookupResult Lookup(int view_id, const NoriaValue* keys, int key_count) {
+        CPP_PROFILE("cpp_lookup");
+
         if (!IsEnabled()) {
             return NoriaLookupResult{0, 0, nullptr};
         }
@@ -655,6 +841,8 @@ public:
 
     // Lookup with upquery fallback to SQLite
     NoriaLookupResult LookupOrUpquery(int view_id, const NoriaValue* keys, int key_count) {
+        CPP_PROFILE("cpp_lookup_or_upquery");
+
         if (!IsEnabled()) {
             return NoriaLookupResult{0, 0, nullptr};
         }
@@ -675,6 +863,29 @@ public:
     static void FreeRows(void* rows) {
         if (rows) {
             noria_free_rows(rows);
+        }
+    }
+
+    // Batch lookup - lookup multiple keys in a single FFI call
+    // This amortizes lock acquisition and FFI crossing overhead
+    NoriaBatchLookupResult LookupBatch(int view_id, const NoriaValue** keys, const int* key_counts, int num_keys) {
+        CPP_PROFILE("cpp_lookup_batch");
+
+        if (!IsEnabled()) {
+            return NoriaBatchLookupResult{0, nullptr};
+        }
+        return noria_lookup_batch(handle_, view_id, keys, key_counts, num_keys);
+    }
+
+    // Get a single result from batch lookup
+    static void* BatchGetResult(void* batch_ptr, int index, int* out_found, int* out_row_count) {
+        return noria_batch_get_result(batch_ptr, index, out_found, out_row_count);
+    }
+
+    // Free batch lookup results
+    static void FreeBatchResults(void* batch_ptr) {
+        if (batch_ptr) {
+            noria_free_batch_results(batch_ptr);
         }
     }
 

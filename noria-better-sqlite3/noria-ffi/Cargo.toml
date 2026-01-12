@@ -6,13 +6,26 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = []
+
+[profile.release]
+lto = "fat"           # Full link-time optimization across all crates
+codegen-units = 1     # Single codegen unit for maximum optimization
+panic = "abort"       # Smaller code, no unwinding overhead
+opt-level = 3         # Maximum optimization
+debug = false         # No debug info in release
+
 [dependencies]
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
+bumpalo = "3.14"       # Arena allocator for zero-cost temporary allocations
+arc-swap = "1.6"       # Lock-free atomic Arc swapping for wait-free reads
 
 # Noria dataflow engine
 noria-sqlite = { path = "../../noria-sqlite" }
 noria = { path = "../../noria" }
+noria-core = { path = "../../noria-core" }
 
 # For tracing/logging
 tracing = "0.1"

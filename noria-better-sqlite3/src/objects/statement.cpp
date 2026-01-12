@@ -58,6 +58,7 @@ INIT(Statement::Init) {
 	SetPrototypeMethod(isolate, data, t, "run", JS_run);
 	SetPrototypeMethod(isolate, data, t, "get", JS_get);
 	SetPrototypeMethod(isolate, data, t, "all", JS_all);
+	SetPrototypeMethod(isolate, data, t, "getMany", JS_getMany);
 	SetPrototypeMethod(isolate, data, t, "iterate", JS_iterate);
 	SetPrototypeMethod(isolate, data, t, "bind", JS_bind);
 	SetPrototypeMethod(isolate, data, t, "pluck", JS_pluck);
@@ -599,6 +600,280 @@ bool Statement::TryNoriaAll(v8::Isolate* isolate, const v8::FunctionCallbackInfo
 
 	Noria::FreeRows(result.rows);
 	return true;
+}
+
+// Attempt to serve getMany() from Noria cache - batch lookup for multiple keys
+// Takes an array of keys and returns an array of results, one per key
+bool Statement::TryNoriaGetMany(v8::Isolate* isolate, const v8::FunctionCallbackInfo<v8::Value>& info, bool consistent_read) {
+	if (extras->noria_view_id < 0) return false;  // No view registered
+	if (mode != Data::FLAT) return false;  // Only support FLAT mode for now
+
+	Noria* noria = db->GetNoria();
+	if (!noria || !noria->IsEnabled()) return false;
+
+	// First argument must be an array of keys
+	if (info.Length() < 1 || !info[0]->IsArray()) {
+		return false;
+	}
+
+	v8::Local<v8::Array> keys_array = info[0].As<v8::Array>();
+	int num_keys = keys_array->Length();
+	if (num_keys == 0) {
+		// Return empty array for empty input
+		info.GetReturnValue().Set(v8::Array::New(isolate, 0));
+		return true;
+	}
+
+	// If consistent read requested, flush pending CDC events first
+	if (consistent_read) {
+		noria->Flush();
+	}
+
+	int param_count = sqlite3_bind_parameter_count(handle);
+
+	// Prepare key arrays for batch lookup
+	std::vector<std::vector<NoriaValue>> all_keys(num_keys);
+	std::vector<std::vector<std::string>> all_string_storage(num_keys);  // Keep strings alive
+	std::vector<const NoriaValue*> key_ptrs(num_keys);
+	std::vector<int> key_counts(num_keys, param_count);
+
+	v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+
+	// Convert each key from JavaScript to NoriaValue
+	for (int i = 0; i < num_keys; ++i) {
+		all_keys[i].resize(param_count);
+		all_string_storage[i].resize(param_count);
+
+		v8::Local<v8::Value> key_val = keys_array->Get(ctx, i).ToLocalChecked();
+
+		// Handle array key (multiple columns) or single value key
+		if (key_val->IsArray()) {
+			v8::Local<v8::Array> key_arr = key_val.As<v8::Array>();
+			for (int j = 0; j < param_count && j < (int)key_arr->Length(); ++j) {
+				v8::Local<v8::Value> elem = key_arr->Get(ctx, j).ToLocalChecked();
+				all_keys[i][j] = V8ToNoriaKey(isolate, elem, all_string_storage[i][j]);
+			}
+		} else {
+			// Single value key
+			all_keys[i][0] = V8ToNoriaKey(isolate, key_val, all_string_storage[i][0]);
+		}
+
+		key_ptrs[i] = all_keys[i].data();
+	}
+
+	// Perform batch lookup
+	NoriaBatchLookupResult batch_result = noria->LookupBatch(
+		extras->noria_view_id,
+		key_ptrs.data(),
+		key_counts.data(),
+		num_keys
+	);
+
+	if (batch_result.count == 0 || !batch_result.results) {
+		// Batch lookup failed - fall back to SQLite
+		return false;
+	}
+
+	// Build column names cache
+	std::vector<v8::Local<v8::Name>> col_names;
+	col_names.reserve(extras->column_names.size());
+	for (const auto& global : extras->column_names) {
+		col_names.push_back(global.Get(isolate));
+	}
+
+	// First pass: check if all keys hit the cache
+	// If any key misses, fall back to SQLite (which does upqueries)
+	bool all_found = true;
+	for (int i = 0; i < num_keys; ++i) {
+		int found, row_count;
+		Noria::BatchGetResult(batch_result.results, i, &found, &row_count);
+		if (!found) {
+			all_found = false;
+			break;
+		}
+	}
+
+	if (!all_found) {
+		// Some keys missed - fall back to SQLite for consistent results
+		Noria::FreeBatchResults(batch_result.results);
+		return false;
+	}
+
+	// All keys hit - build result array
+#if defined(NODE_MODULE_VERSION) && NODE_MODULE_VERSION >= 127
+	v8::LocalVector<v8::Value> results(isolate);
+	results.reserve(num_keys);
+
+	for (int i = 0; i < num_keys; ++i) {
+		int found, row_count;
+		void* rows_ptr = Noria::BatchGetResult(batch_result.results, i, &found, &row_count);
+
+		if (row_count == 0) {
+			// Empty result (key exists but no rows)
+			results.emplace_back(v8::Undefined(isolate));
+		} else {
+			// Return first row (like get())
+			results.emplace_back(NoriaRowToJS(isolate, rows_ptr, 0, col_names, safe_ints));
+		}
+	}
+
+	info.GetReturnValue().Set(v8::Array::New(isolate, results.data(), results.size()));
+#else
+	v8::Local<v8::Array> result_array = v8::Array::New(isolate, num_keys);
+
+	for (int i = 0; i < num_keys; ++i) {
+		int found, row_count;
+		void* rows_ptr = Noria::BatchGetResult(batch_result.results, i, &found, &row_count);
+
+		if (row_count == 0) {
+			result_array->Set(ctx, i, v8::Undefined(isolate)).FromJust();
+		} else {
+			result_array->Set(ctx, i, NoriaRowToJS(isolate, rows_ptr, 0, col_names, safe_ints)).FromJust();
+		}
+	}
+
+	info.GetReturnValue().Set(result_array);
+#endif
+
+	Noria::FreeBatchResults(batch_result.results);
+	return true;
+}
+
+// JS method: stmt.getMany([key1, key2, key3, ...]) -> [row1, row2, row3, ...]
+// Performs batch lookup in Noria cache, falling back to SQLite for cache misses
+NODE_METHOD(Statement::JS_getMany) {
+	Statement* stmt = Unwrap<Statement>(info.This());
+	if (!stmt->returns_data) {
+		return ThrowTypeError("This statement does not return data. Use run() instead");
+	}
+	sqlite3_stmt* handle = stmt->handle;
+	Database* db = stmt->db;
+	REQUIRE_DATABASE_OPEN(db->GetState());
+	REQUIRE_DATABASE_NOT_BUSY(db->GetState());
+	REQUIRE_STATEMENT_NOT_LOCKED(stmt);
+	UseIsolate;
+	UseContext;
+
+	// Validate input
+	if (info.Length() < 1 || !info[0]->IsArray()) {
+		return ThrowTypeError("Expected an array of keys");
+	}
+
+	v8::Local<v8::Array> keys_array = info[0].As<v8::Array>();
+	uint32_t num_keys = keys_array->Length();
+
+	if (num_keys == 0) {
+		info.GetReturnValue().Set(v8::Array::New(isolate, 0));
+		return;
+	}
+
+	// Try Noria cache first with batch lookup
+	if (stmt->TryNoriaGetMany(isolate, info, false)) {
+		return;  // TryNoriaGetMany set the return value
+	}
+
+	// Fall back to individual SQLite queries
+	db->GetState()->busy = true;
+
+#if defined(NODE_MODULE_VERSION) && NODE_MODULE_VERSION >= 127
+	v8::LocalVector<v8::Value> results(isolate);
+	results.reserve(num_keys);
+
+	for (uint32_t i = 0; i < num_keys; ++i) {
+		v8::Local<v8::Value> key_val = keys_array->Get(ctx, i).ToLocalChecked();
+
+		// Reset and bind
+		sqlite3_reset(handle);
+		sqlite3_clear_bindings(handle);
+
+		// Bind the key value(s)
+		if (key_val->IsInt32()) {
+			sqlite3_bind_int(handle, 1, key_val.As<v8::Int32>()->Value());
+		} else if (key_val->IsNumber()) {
+			sqlite3_bind_double(handle, 1, key_val.As<v8::Number>()->Value());
+		} else if (key_val->IsString()) {
+			v8::String::Utf8Value str(isolate, key_val);
+			sqlite3_bind_text(handle, 1, *str, str.length(), SQLITE_TRANSIENT);
+		} else if (key_val->IsArray()) {
+			v8::Local<v8::Array> key_arr = key_val.As<v8::Array>();
+			for (uint32_t j = 0; j < key_arr->Length(); ++j) {
+				v8::Local<v8::Value> elem = key_arr->Get(ctx, j).ToLocalChecked();
+				if (elem->IsInt32()) {
+					sqlite3_bind_int(handle, j + 1, elem.As<v8::Int32>()->Value());
+				} else if (elem->IsNumber()) {
+					sqlite3_bind_double(handle, j + 1, elem.As<v8::Number>()->Value());
+				} else if (elem->IsString()) {
+					v8::String::Utf8Value str(isolate, elem);
+					sqlite3_bind_text(handle, j + 1, *str, str.length(), SQLITE_TRANSIENT);
+				} else {
+					sqlite3_bind_null(handle, j + 1);
+				}
+			}
+		} else {
+			sqlite3_bind_null(handle, 1);
+		}
+
+		int status = sqlite3_step(handle);
+		if (status == SQLITE_ROW) {
+			results.emplace_back(Data::GetRowJS(isolate, ctx, handle, stmt->safe_ints, stmt->mode));
+		} else {
+			results.emplace_back(v8::Undefined(isolate));
+		}
+	}
+
+	sqlite3_reset(handle);
+	sqlite3_clear_bindings(handle);
+	db->GetState()->busy = false;
+	info.GetReturnValue().Set(v8::Array::New(isolate, results.data(), results.size()));
+#else
+	v8::Local<v8::Array> result_array = v8::Array::New(isolate, num_keys);
+
+	for (uint32_t i = 0; i < num_keys; ++i) {
+		v8::Local<v8::Value> key_val = keys_array->Get(ctx, i).ToLocalChecked();
+
+		sqlite3_reset(handle);
+		sqlite3_clear_bindings(handle);
+
+		// Bind the key value(s)
+		if (key_val->IsInt32()) {
+			sqlite3_bind_int(handle, 1, key_val.As<v8::Int32>()->Value());
+		} else if (key_val->IsNumber()) {
+			sqlite3_bind_double(handle, 1, key_val.As<v8::Number>()->Value());
+		} else if (key_val->IsString()) {
+			v8::String::Utf8Value str(isolate, key_val);
+			sqlite3_bind_text(handle, 1, *str, str.length(), SQLITE_TRANSIENT);
+		} else if (key_val->IsArray()) {
+			v8::Local<v8::Array> key_arr = key_val.As<v8::Array>();
+			for (uint32_t j = 0; j < key_arr->Length(); ++j) {
+				v8::Local<v8::Value> elem = key_arr->Get(ctx, j).ToLocalChecked();
+				if (elem->IsInt32()) {
+					sqlite3_bind_int(handle, j + 1, elem.As<v8::Int32>()->Value());
+				} else if (elem->IsNumber()) {
+					sqlite3_bind_double(handle, j + 1, elem.As<v8::Number>()->Value());
+				} else if (elem->IsString()) {
+					v8::String::Utf8Value str(isolate, elem);
+					sqlite3_bind_text(handle, j + 1, *str, str.length(), SQLITE_TRANSIENT);
+				} else {
+					sqlite3_bind_null(handle, j + 1);
+				}
+			}
+		} else {
+			sqlite3_bind_null(handle, 1);
+		}
+
+		int status = sqlite3_step(handle);
+		if (status == SQLITE_ROW) {
+			result_array->Set(ctx, i, Data::GetRowJS(isolate, ctx, handle, stmt->safe_ints, stmt->mode)).FromJust();
+		} else {
+			result_array->Set(ctx, i, v8::Undefined(isolate)).FromJust();
+		}
+	}
+
+	sqlite3_reset(handle);
+	sqlite3_clear_bindings(handle);
+	db->GetState()->busy = false;
+	info.GetReturnValue().Set(result_array);
+#endif
 }
 
 NODE_GETTER(Statement::JS_busy) {

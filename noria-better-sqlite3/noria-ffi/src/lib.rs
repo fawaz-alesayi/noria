@@ -13,10 +13,12 @@ use noria::DataType;
 use noria_sqlite::dataflow::{
     LocalExecutor, Record, Records, SqlConverter, ViewHandle,
 };
+use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_double, c_int, c_void, CStr};
 use std::ptr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 #[allow(unused_imports)]
@@ -82,6 +84,20 @@ pub struct NoriaCacheStats {
     pub max_memory_bytes: u64,
     pub eviction_count: u64,
     pub bytes_evicted: u64,
+}
+
+/// Result of a batch cache lookup
+#[repr(C)]
+pub struct NoriaBatchLookupResult {
+    /// Number of results (one per key)
+    pub count: c_int,
+    /// Opaque pointer to result array (caller must free with noria_free_batch_results)
+    pub results: *mut c_void,
+}
+
+/// Container for batch results
+struct BatchResultsContainer {
+    results: Vec<(c_int, c_int, Option<Box<DataRowsContainer>>)>, // (found, row_count, rows)
 }
 
 // ============================================================================
@@ -200,6 +216,46 @@ impl Value {
 
 type Row = Vec<Value>;
 
+/// Convert DataType directly to NoriaValue WITHOUT intermediate Value allocation
+/// This is the zero-copy fast path
+fn datatype_to_noria_value(dt: &DataType, out: &mut NoriaValue) {
+    match dt {
+        DataType::None => {
+            out.value_type = NORIA_NULL;
+        }
+        DataType::Int(i) => {
+            out.value_type = NORIA_INTEGER;
+            out.int_value = *i as i64;
+        }
+        DataType::BigInt(i) => {
+            out.value_type = NORIA_INTEGER;
+            out.int_value = *i;
+        }
+        DataType::UnsignedInt(u) => {
+            out.value_type = NORIA_INTEGER;
+            out.int_value = *u as i64;
+        }
+        DataType::UnsignedBigInt(u) => {
+            out.value_type = NORIA_INTEGER;
+            out.int_value = *u as i64;
+        }
+        DataType::Real(int_part, frac_part) => {
+            out.value_type = NORIA_FLOAT;
+            out.float_value = *int_part as f64 + (*frac_part as f64 / 1_000_000_000.0);
+        }
+        DataType::Text(_) | DataType::TinyText(_) => {
+            // Get pointer directly into the DataType's string storage
+            let s: &str = dt.into();
+            out.value_type = NORIA_TEXT;
+            out.text_ptr = s.as_ptr() as *const c_char;
+            out.text_len = s.len() as c_int;
+        }
+        DataType::Timestamp(_) => {
+            out.value_type = NORIA_NULL;
+        }
+    }
+}
+
 /// Estimate memory size of a row
 fn row_size(row: &[DataType]) -> usize {
     row.iter()
@@ -223,6 +279,7 @@ fn row_size(row: &[DataType]) -> usize {
 // ============================================================================
 
 /// A registered view with its dataflow handle
+#[derive(Clone)]
 struct NoriaViewEntry {
     /// The dataflow view handle
     handle: ViewHandle,
@@ -243,6 +300,13 @@ const DEFAULT_MAX_MEMORY_BYTES: u64 = 100 * 1024 * 1024; // 100MB
 // Noria Handle - Main Engine State
 // ============================================================================
 
+/// Pending write for batch processing
+#[derive(Clone)]
+struct PendingWrite {
+    table: String,
+    record: Record,
+}
+
 /// Opaque handle to Noria engine
 pub struct NoriaHandle {
     /// The dataflow executor (executes the graph)
@@ -251,8 +315,8 @@ pub struct NoriaHandle {
     /// SQL converter (parses SQL to dataflow)
     converter: RwLock<SqlConverter>,
 
-    /// View ID -> NoriaViewEntry mapping
-    views: RwLock<HashMap<i32, NoriaViewEntry>>,
+    /// View ID -> NoriaViewEntry mapping (ArcSwap for lock-free reads)
+    views: ArcSwap<HashMap<i32, NoriaViewEntry>>,
 
     /// SQL (normalized) -> view ID mapping
     sql_to_view_id: RwLock<HashMap<String, i32>>,
@@ -282,15 +346,52 @@ pub struct NoriaHandle {
     /// Upquery callback
     upquery_callback: RwLock<Option<UpqueryCallback>>,
     upquery_user_data: RwLock<*mut c_void>,
+
+    /// Write queue for batch processing (async CDC)
+    write_queue: RwLock<Vec<PendingWrite>>,
 }
 
 // Safety: The raw pointers are only accessed in a single-threaded context
 unsafe impl Send for NoriaHandle {}
 unsafe impl Sync for NoriaHandle {}
 
-/// Container for rows returned to C++
+/// Container type discriminant for FFI
+const CONTAINER_TYPE_VALUES: u8 = 0;  // Legacy RowsContainer
+const CONTAINER_TYPE_DIRECT: u8 = 1;  // Zero-copy DataRowsContainer
+
+/// Container for rows returned to C++ (legacy - uses Value intermediate)
+/// repr(C) ensures container_type is at offset 0 for type detection
+#[repr(C)]
 struct RowsContainer {
+    container_type: u8,  // Always CONTAINER_TYPE_VALUES
     rows: Vec<Row>,
+}
+
+impl RowsContainer {
+    fn new(rows: Vec<Row>) -> Self {
+        Self {
+            container_type: CONTAINER_TYPE_VALUES,
+            rows,
+        }
+    }
+}
+
+/// Zero-copy container - stores DataType directly without intermediate Value allocation
+/// This avoids the intermediate Value allocation and String cloning
+/// repr(C) ensures container_type is at offset 0 for type detection
+#[repr(C)]
+struct DataRowsContainer {
+    container_type: u8,  // Always CONTAINER_TYPE_DIRECT
+    rows: Vec<Vec<DataType>>,
+}
+
+impl DataRowsContainer {
+    fn new(rows: Vec<Vec<DataType>>) -> Self {
+        Self {
+            container_type: CONTAINER_TYPE_DIRECT,
+            rows,
+        }
+    }
 }
 
 // ============================================================================
@@ -387,7 +488,7 @@ pub extern "C" fn noria_create(_sqlite_db: *mut c_void) -> *mut NoriaHandle {
     let handle = Box::new(NoriaHandle {
         executor: RwLock::new(LocalExecutor::new()),
         converter: RwLock::new(SqlConverter::new()),
-        views: RwLock::new(HashMap::new()),
+        views: ArcSwap::from_pointee(HashMap::new()),
         sql_to_view_id: RwLock::new(HashMap::new()),
         table_to_views: RwLock::new(HashMap::new()),
         table_to_id: RwLock::new(HashMap::new()),
@@ -401,6 +502,7 @@ pub extern "C" fn noria_create(_sqlite_db: *mut c_void) -> *mut NoriaHandle {
         dirty_tables: AtomicU64::new(0),
         upquery_callback: RwLock::new(None),
         upquery_user_data: RwLock::new(ptr::null_mut()),
+        write_queue: RwLock::new(Vec::new()),
     });
 
     Box::into_raw(handle)
@@ -494,6 +596,7 @@ pub extern "C" fn noria_register_table_schema(
 /// Register a SELECT query as a view
 #[no_mangle]
 pub extern "C" fn noria_register_view(handle: *mut NoriaHandle, sql: *const c_char) -> c_int {
+
     if handle.is_null() || sql.is_null() {
         return -1;
     }
@@ -531,15 +634,20 @@ pub extern "C" fn noria_register_view(handle: *mut NoriaHandle, sql: *const c_ch
     // Assign view ID
     let view_id = handle.next_view_id.fetch_add(1, Ordering::SeqCst);
 
-    // Store view entry
-    handle.views.write().insert(
-        view_id,
-        NoriaViewEntry {
-            handle: view_handle,
-            sql: sql_str.to_string(),
-            tables: tables.clone(),
-        },
-    );
+    // Store view entry (clone-modify-store for ArcSwap)
+    {
+        // load() returns Guard<Arc<T>>, dereference twice to clone inner HashMap
+        let mut views = (**handle.views.load()).clone();
+        views.insert(
+            view_id,
+            NoriaViewEntry {
+                handle: view_handle,
+                sql: sql_str.to_string(),
+                tables: tables.clone(),
+            },
+        );
+        handle.views.store(Arc::new(views));
+    }
 
     // Register SQL -> view mapping
     handle.sql_to_view_id.write().insert(normalized, view_id);
@@ -598,7 +706,7 @@ pub extern "C" fn noria_has_any_views(handle: *mut NoriaHandle) -> c_int {
     }
 
     let handle = unsafe { &*handle };
-    if handle.views.read().is_empty() {
+    if handle.views.load().is_empty() {
         0
     } else {
         1
@@ -666,6 +774,7 @@ pub extern "C" fn noria_lookup(
     key_values: *const NoriaValue,
     key_count: c_int,
 ) -> NoriaLookupResult {
+
     let not_found = NoriaLookupResult {
         found: 0,
         row_count: 0,
@@ -678,19 +787,28 @@ pub extern "C" fn noria_lookup(
 
     let handle = unsafe { &*handle };
 
-    // Get view
-    let views = handle.views.read();
-    let view_entry = match views.get(&view_id) {
-        Some(v) => v,
-        None => return not_found,
-    };
+    // Get view - instrument RwLock acquisition
+    let view_entry_clone;
+    {
+        let views = handle.views.load();
+        view_entry_clone = match views.get(&view_id) {
+            Some(v) => (v.handle.clone(), v.sql.clone(), v.tables.clone()),
+            None => return not_found,
+        };
+    }
 
     // Convert key
-    let key: Vec<DataType> = convert_values(key_values, key_count);
+    let key: Vec<DataType> = {
+        convert_values(key_values, key_count)
+    };
 
-    // Try cache lookup using executor
-    let executor = handle.executor.read();
-    match executor.lookup(&view_entry.handle, &key) {
+    // Try cache lookup using executor - instrument RwLock acquisition
+    let lookup_result = {
+        let executor = handle.executor.read();
+        executor.lookup(&view_entry_clone.0, &key)
+    };
+
+    match lookup_result {
         Some(rows) => {
             handle.cache_hits.fetch_add(1, Ordering::Relaxed);
             let row_count = rows.len() as c_int;
@@ -702,13 +820,11 @@ pub extern "C" fn noria_lookup(
                 };
             }
 
-            // Convert DataType rows to Value rows for FFI
-            let value_rows: Vec<Row> = rows
-                .iter()
-                .map(|row| row.iter().map(Value::from_datatype).collect())
-                .collect();
-
-            let container = Box::new(RowsContainer { rows: value_rows });
+            // ZERO-COPY: Store DataType rows directly without conversion
+            // The conversion to NoriaValue happens on-demand in noria_get_value
+            let container = {
+                Box::new(DataRowsContainer::new(rows))
+            };
             NoriaLookupResult {
                 found: 1,
                 row_count,
@@ -723,7 +839,7 @@ pub extern "C" fn noria_lookup(
             if let Some(cb) = callback {
                 let user_data = *handle.upquery_user_data.read();
                 let sql_cstr =
-                    std::ffi::CString::new(view_entry.sql.as_str()).unwrap_or_default();
+                    std::ffi::CString::new(view_entry_clone.1.as_str()).unwrap_or_default();
 
                 let mut out_rows: *mut c_void = ptr::null_mut();
                 let mut out_row_count: c_int = 0;
@@ -760,11 +876,10 @@ pub extern "C" fn noria_lookup(
                     // Inject into view cache
                     if !records_to_inject.is_empty() {
                         let records = Records::from(records_to_inject);
-                        drop(executor); // Release read lock before write
                         handle
                             .executor
                             .write()
-                            .inject_into_view(&view_entry.handle, records);
+                            .inject_into_view(&view_entry_clone.0, records);
                     }
 
                     // Return the rows to caller
@@ -792,6 +907,116 @@ pub extern "C" fn noria_lookup_or_upquery(
     noria_lookup(handle, view_id, key_values, key_count)
 }
 
+/// Batch lookup - lookup multiple keys in a single FFI call
+/// This amortizes lock acquisition and FFI crossing overhead
+#[no_mangle]
+pub extern "C" fn noria_lookup_batch(
+    handle: *mut NoriaHandle,
+    view_id: c_int,
+    keys: *const *const NoriaValue,
+    key_counts: *const c_int,
+    num_keys: c_int,
+) -> NoriaBatchLookupResult {
+
+    let empty_result = NoriaBatchLookupResult {
+        count: 0,
+        results: ptr::null_mut(),
+    };
+
+    if handle.is_null() || view_id < 0 || keys.is_null() || num_keys <= 0 {
+        return empty_result;
+    }
+
+    let handle = unsafe { &*handle };
+    let key_ptrs = unsafe { std::slice::from_raw_parts(keys, num_keys as usize) };
+    let counts = unsafe { std::slice::from_raw_parts(key_counts, num_keys as usize) };
+
+    // Get view entry once
+    let view_entry_clone;
+    {
+        let views = handle.views.load();
+        view_entry_clone = match views.get(&view_id) {
+            Some(v) => (v.handle.clone(), v.sql.clone(), v.tables.clone()),
+            None => return empty_result,
+        };
+    }
+
+    // Perform all lookups with single lock acquisition
+    let mut results = Vec::with_capacity(num_keys as usize);
+    {
+        let executor = handle.executor.read();
+
+        for (key_ptr, &key_count) in key_ptrs.iter().zip(counts.iter()) {
+            if key_ptr.is_null() || key_count <= 0 {
+                results.push((0, 0, None));
+                continue;
+            }
+
+            let key = convert_values(*key_ptr, key_count);
+            match executor.lookup(&view_entry_clone.0, &key) {
+                Some(rows) => {
+                    handle.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    let row_count = rows.len() as c_int;
+                    if row_count == 0 {
+                        results.push((1, 0, None));
+                    } else {
+                        let container = Box::new(DataRowsContainer::new(rows));
+                        results.push((1, row_count, Some(container)));
+                    }
+                }
+                None => {
+                    handle.cache_misses.fetch_add(1, Ordering::Relaxed);
+                    results.push((0, 0, None));
+                }
+            }
+        }
+    }
+
+    let container = Box::new(BatchResultsContainer { results });
+    NoriaBatchLookupResult {
+        count: num_keys,
+        results: Box::into_raw(container) as *mut c_void,
+    }
+}
+
+/// Get a single result from batch lookup
+#[no_mangle]
+pub extern "C" fn noria_batch_get_result(
+    batch_ptr: *mut c_void,
+    index: c_int,
+    out_found: *mut c_int,
+    out_row_count: *mut c_int,
+) -> *mut c_void {
+    if batch_ptr.is_null() || out_found.is_null() || out_row_count.is_null() || index < 0 {
+        return ptr::null_mut();
+    }
+
+    let container = unsafe { &*(batch_ptr as *const BatchResultsContainer) };
+
+    if index as usize >= container.results.len() {
+        return ptr::null_mut();
+    }
+
+    let (found, row_count, ref rows) = container.results[index as usize];
+    unsafe {
+        *out_found = found;
+        *out_row_count = row_count;
+    }
+
+    match rows {
+        Some(rows_box) => rows_box.as_ref() as *const DataRowsContainer as *mut c_void,
+        None => ptr::null_mut(),
+    }
+}
+
+/// Free batch lookup results
+#[no_mangle]
+pub extern "C" fn noria_free_batch_results(batch_ptr: *mut c_void) {
+    if !batch_ptr.is_null() {
+        let _ = unsafe { Box::from_raw(batch_ptr as *mut BatchResultsContainer) };
+    }
+}
+
 /// Store rows from upquery (injects into view cache)
 #[no_mangle]
 pub extern "C" fn noria_store_rows(
@@ -809,7 +1034,7 @@ pub extern "C" fn noria_store_rows(
 
     let handle = unsafe { &*handle };
 
-    let views = handle.views.read();
+    let views = handle.views.load();
     let view_entry = match views.get(&view_id) {
         Some(v) => v,
         None => return -1,
@@ -840,7 +1065,7 @@ pub extern "C" fn noria_store_rows(
     0
 }
 
-/// Get value from rows
+/// Get value from rows - handles both container types (zero-copy and legacy)
 #[no_mangle]
 pub extern "C" fn noria_get_value(
     rows_ptr: *mut c_void,
@@ -852,66 +1077,104 @@ pub extern "C" fn noria_get_value(
         return -1;
     }
 
-    let container = unsafe { &*(rows_ptr as *const RowsContainer) };
+    // Read container type from first byte (both structs have it first)
+    let container_type = unsafe { *(rows_ptr as *const u8) };
 
-    if row_index as usize >= container.rows.len() {
-        return -1;
-    }
+    if container_type == CONTAINER_TYPE_DIRECT {
+        // ZERO-COPY PATH: DataRowsContainer with DataType
+        let container = unsafe { &*(rows_ptr as *const DataRowsContainer) };
 
-    let row = &container.rows[row_index as usize];
-    if col_index as usize >= row.len() {
-        return -1;
-    }
+        if row_index as usize >= container.rows.len() {
+            return -1;
+        }
 
-    let value = &row[col_index as usize];
-    unsafe {
-        *out_value = value.to_noria_value();
+        let row = &container.rows[row_index as usize];
+        if col_index as usize >= row.len() {
+            return -1;
+        }
+
+        // Direct conversion without intermediate Value allocation
+        let dt = &row[col_index as usize];
+        unsafe {
+            // Zero the output first
+            *out_value = NoriaValue::default();
+            datatype_to_noria_value(dt, &mut *out_value);
+        }
+        0
+    } else {
+        // LEGACY PATH: RowsContainer with Value (for upquery results)
+        let container = unsafe { &*(rows_ptr as *const RowsContainer) };
+
+        if row_index as usize >= container.rows.len() {
+            return -1;
+        }
+
+        let row = &container.rows[row_index as usize];
+        if col_index as usize >= row.len() {
+            return -1;
+        }
+
+        let value = &row[col_index as usize];
+        unsafe {
+            *out_value = value.to_noria_value();
+        }
+        0
     }
-    0
 }
 
-/// Get column count for a row
+/// Get column count for a row - handles both container types
 #[no_mangle]
 pub extern "C" fn noria_row_column_count(rows_ptr: *mut c_void, row_index: c_int) -> c_int {
     if rows_ptr.is_null() || row_index < 0 {
         return 0;
     }
 
-    let container = unsafe { &*(rows_ptr as *const RowsContainer) };
+    // Read container type from first byte
+    let container_type = unsafe { *(rows_ptr as *const u8) };
 
-    if row_index as usize >= container.rows.len() {
-        return 0;
+    if container_type == CONTAINER_TYPE_DIRECT {
+        let container = unsafe { &*(rows_ptr as *const DataRowsContainer) };
+        if row_index as usize >= container.rows.len() {
+            return 0;
+        }
+        container.rows[row_index as usize].len() as c_int
+    } else {
+        let container = unsafe { &*(rows_ptr as *const RowsContainer) };
+        if row_index as usize >= container.rows.len() {
+            return 0;
+        }
+        container.rows[row_index as usize].len() as c_int
     }
-
-    container.rows[row_index as usize].len() as c_int
 }
 
-/// Free rows container
+/// Free rows container - handles both container types
 #[no_mangle]
 pub extern "C" fn noria_free_rows(rows: *mut c_void) {
-    if !rows.is_null() {
-        let container = unsafe { Box::from_raw(rows as *mut RowsContainer) };
-        // Free any owned strings in the container
-        for row in container.rows.iter() {
-            for val in row.iter() {
-                if let Value::Text(s) = val {
-                    // String is owned by Rust, will be dropped automatically
-                    let _ = s;
-                }
-            }
-        }
-        // Box drops automatically
+    if rows.is_null() {
+        return;
     }
+
+    // Read container type from first byte
+    let container_type = unsafe { *(rows as *const u8) };
+
+    if container_type == CONTAINER_TYPE_DIRECT {
+        // Zero-copy container - just drop the DataType vectors
+        let _ = unsafe { Box::from_raw(rows as *mut DataRowsContainer) };
+    } else {
+        // Legacy container - drop Value vectors
+        let _ = unsafe { Box::from_raw(rows as *mut RowsContainer) };
+    }
+    // Box drops automatically, cleaning up all owned data
 }
 
 // ============================================================================
 // FFI Functions for Building RowsContainer from C++
 // ============================================================================
 
-/// Create an empty rows container for upquery results
+/// Create an empty rows container for upquery results (legacy path)
 #[no_mangle]
 pub extern "C" fn noria_rows_create() -> *mut c_void {
-    let container = Box::new(RowsContainer { rows: Vec::new() });
+    let container = Box::new(RowsContainer::new(Vec::new()));
     Box::into_raw(container) as *mut c_void
 }
 
@@ -974,6 +1237,7 @@ pub extern "C" fn noria_apply_insert(
     values: *const NoriaValue,
     value_count: c_int,
 ) -> c_int {
+
     if handle.is_null() || table.is_null() {
         return -1;
     }
@@ -1002,6 +1266,7 @@ pub extern "C" fn noria_apply_delete(
     old_values: *const NoriaValue,
     value_count: c_int,
 ) -> c_int {
+
     if handle.is_null() || table.is_null() {
         return -1;
     }
@@ -1031,6 +1296,7 @@ pub extern "C" fn noria_apply_update(
     new_values: *const NoriaValue,
     value_count: c_int,
 ) -> c_int {
+
     if handle.is_null() || table.is_null() {
         return -1;
     }
@@ -1054,7 +1320,7 @@ pub extern "C" fn noria_apply_update(
     0
 }
 
-/// Queue INSERT (same as apply)
+/// Queue INSERT for batch processing
 #[no_mangle]
 pub extern "C" fn noria_queue_insert(
     handle: *mut NoriaHandle,
@@ -1062,10 +1328,27 @@ pub extern "C" fn noria_queue_insert(
     values: *const NoriaValue,
     value_count: c_int,
 ) -> c_int {
-    noria_apply_insert(handle, table, values, value_count)
+    if handle.is_null() || table.is_null() {
+        return -1;
+    }
+
+    let handle = unsafe { &*handle };
+    let table_str = match unsafe { CStr::from_ptr(table) }.to_str() {
+        Ok(s) => s.to_lowercase(),
+        Err(_) => return -1,
+    };
+
+    let row = convert_values(values, value_count);
+    let pending = PendingWrite {
+        table: table_str,
+        record: Record::Positive(row),
+    };
+
+    handle.write_queue.write().push(pending);
+    0
 }
 
-/// Queue DELETE (same as apply)
+/// Queue DELETE for batch processing
 #[no_mangle]
 pub extern "C" fn noria_queue_delete(
     handle: *mut NoriaHandle,
@@ -1073,10 +1356,27 @@ pub extern "C" fn noria_queue_delete(
     old_values: *const NoriaValue,
     value_count: c_int,
 ) -> c_int {
-    noria_apply_delete(handle, table, old_values, value_count)
+    if handle.is_null() || table.is_null() {
+        return -1;
+    }
+
+    let handle = unsafe { &*handle };
+    let table_str = match unsafe { CStr::from_ptr(table) }.to_str() {
+        Ok(s) => s.to_lowercase(),
+        Err(_) => return -1,
+    };
+
+    let row = convert_values(old_values, value_count);
+    let pending = PendingWrite {
+        table: table_str,
+        record: Record::Negative(row),
+    };
+
+    handle.write_queue.write().push(pending);
+    0
 }
 
-/// Queue UPDATE (same as apply)
+/// Queue UPDATE for batch processing (DELETE old + INSERT new)
 #[no_mangle]
 pub extern "C" fn noria_queue_update(
     handle: *mut NoriaHandle,
@@ -1085,12 +1385,43 @@ pub extern "C" fn noria_queue_update(
     new_values: *const NoriaValue,
     value_count: c_int,
 ) -> c_int {
-    noria_apply_update(handle, table, old_values, new_values, value_count)
+    if handle.is_null() || table.is_null() {
+        return -1;
+    }
+
+    let handle = unsafe { &*handle };
+    let table_str = match unsafe { CStr::from_ptr(table) }.to_str() {
+        Ok(s) => s.to_lowercase(),
+        Err(_) => return -1,
+    };
+
+    let old_row = convert_values(old_values, value_count);
+    let new_row = convert_values(new_values, value_count);
+
+    let mut queue = handle.write_queue.write();
+    queue.push(PendingWrite {
+        table: table_str.clone(),
+        record: Record::Negative(old_row),
+    });
+    queue.push(PendingWrite {
+        table: table_str,
+        record: Record::Positive(new_row),
+    });
+
+    0
 }
 
-/// Flush pending CDC events (no-op since we're synchronous now)
+/// Flush pending CDC events - batch process all queued writes
+///
+/// This implements the async batch processing from the original Noria paper.
+/// Instead of propagating each write individually, we batch writes by table
+/// and propagate them together. This is more efficient because:
+/// 1. Single lock acquisition per table instead of per-write
+/// 2. Aggregate operators can batch updates for the same group key
+/// 3. Reduces retraction overhead (emit old/new only once per final state)
 #[no_mangle]
 pub extern "C" fn noria_flush(handle: *mut NoriaHandle) -> c_int {
+
     if handle.is_null() {
         return -1;
     }
@@ -1100,7 +1431,36 @@ pub extern "C" fn noria_flush(handle: *mut NoriaHandle) -> c_int {
     // Clear dirty table bitmap (legacy support)
     let _dirty = handle.dirty_tables.swap(0, Ordering::AcqRel);
 
-    // Synchronous mode - nothing to flush
+    // Take all pending writes from the queue
+    let pending: Vec<PendingWrite> = {
+        let mut queue = handle.write_queue.write();
+        std::mem::take(&mut *queue)
+    };
+
+    if pending.is_empty() {
+        return 0;
+    }
+
+    // Group writes by table for batch processing
+    let writes_by_table: HashMap<String, Vec<Record>> = {
+        let mut map: HashMap<String, Vec<Record>> = HashMap::new();
+        for pw in pending {
+            map.entry(pw.table)
+                .or_insert_with(Vec::new)
+                .push(pw.record);
+        }
+        map
+    };
+
+    // Process each table's writes as a batch
+    {
+        let mut executor = handle.executor.write();
+        for (table, records) in writes_by_table {
+            let batch = Records::from(records);
+            executor.apply_write(&table, batch);
+        }
+    }
+
     0
 }
 
@@ -1131,7 +1491,7 @@ pub extern "C" fn noria_get_stats(handle: *mut NoriaHandle) -> NoriaCacheStats {
         cache_hits: handle.cache_hits.load(Ordering::Relaxed),
         cache_misses: handle.cache_misses.load(Ordering::Relaxed),
         total_rows: stats.total_rows as u64,
-        view_count: handle.views.read().len() as c_int,
+        view_count: handle.views.load().len() as c_int,
         node_count: stats.node_count as c_int,
         memory_bytes: (stats.total_rows * 100) as u64, // Rough estimate
         max_memory_bytes: handle.max_memory_bytes.load(Ordering::Relaxed),

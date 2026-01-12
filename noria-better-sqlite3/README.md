@@ -52,14 +52,45 @@ const stats = db.cacheStats();
 
 ## Performance
 
-vs better-sqlite3 (100k iterations):
+Tested on OCI VM.Standard.A1.Flex (4 OCPU ARM, 24GB RAM), Ubuntu 22.04.
 
-| Operation | Difference |
-|-----------|------------|
-| Read single row (cache hit) | +42% |
-| Read 100 rows | +2% |
-| Insert single row | -3% |
-| Bulk insert (100 rows) | -2% |
+### Noria benefit (cache hits)
+
+| Benchmark | better-sqlite3 | noria-better-sqlite3 | Difference |
+|-----------|----------------|----------------------|------------|
+| Hot path (same key) | 322,000 ops/sec | 803,000 ops/sec | **+149%** |
+| Random keys (warm cache) | 301,000 ops/sec | 477,000 ops/sec | **+59%** |
+
+### Parity (operations that bypass cache)
+
+| Benchmark | better-sqlite3 | noria-better-sqlite3 | Difference |
+|-----------|----------------|----------------------|------------|
+| Range query (100 rows) | 16,600 ops/sec | 16,100 ops/sec | -3% |
+| Insert single row | 461,000 ops/sec | 441,000 ops/sec | -4% |
+| Insert 100 rows (txn) | 7,100 ops/sec | 6,800 ops/sec | -4% |
+
+Reads are faster. Writes have ~4% CDC overhead.
+
+### Lobsters benchmark
+
+Simulates a link aggregator (HN/Lobsters style) with stories, users, votes, and comments.
+
+```
+npm run bench:lobsters
+```
+
+- **Reads**: story lookup, vote count (aggregate), user profile, story+author (join)
+- **Writes**: add vote, add comment (triggers aggregate view updates)
+
+| Scenario | better-sqlite3 | noria-better-sqlite3 | Speedup |
+|----------|----------------|----------------------|---------|
+| Single-key read | 325,000 ops/sec | 800,000 ops/sec | **2.5x** |
+| Read-only mixed | 295,000 ops/sec | 510,000 ops/sec | **1.7x** |
+| Read 99% / Write 1% | 200,000 ops/sec | 290,000 ops/sec | **1.4x** |
+| Read 95% / Write 5% | 110,000 ops/sec | 110,000 ops/sec | 1.0x |
+| Read 90% / Write 10% | 63,000 ops/sec | 57,000 ops/sec | 0.9x |
+
+**Trade-offs**: Beneficial for read-heavy workloads (99%+ reads). At 95/5, parity. Write-heavy workloads with aggregate views are slower due to incremental maintenance.
 
 ## What's supported
 

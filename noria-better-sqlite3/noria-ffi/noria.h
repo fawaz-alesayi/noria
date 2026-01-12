@@ -203,6 +203,54 @@ NoriaLookupResult noria_lookup_or_upquery(
     int key_count
 );
 
+/* Batch lookup result */
+typedef struct {
+    int count;      /* Number of results (one per key) */
+    void* results;  /* Opaque pointer to results (caller must free with noria_free_batch_results) */
+} NoriaBatchLookupResult;
+
+/**
+ * Batch lookup - lookup multiple keys in a single FFI call.
+ * This amortizes lock acquisition and FFI crossing overhead.
+ *
+ * @param handle The Noria engine handle
+ * @param view_id The view ID from noria_register_view
+ * @param keys Array of key arrays (pointer to pointers)
+ * @param key_counts Array of key counts for each key array
+ * @param num_keys Number of keys to lookup
+ * @return NoriaBatchLookupResult. Caller must free with noria_free_batch_results.
+ */
+NoriaBatchLookupResult noria_lookup_batch(
+    NoriaHandle* handle,
+    int view_id,
+    const NoriaValue** keys,
+    const int* key_counts,
+    int num_keys
+);
+
+/**
+ * Get a single result from a batch lookup.
+ *
+ * @param batch_ptr The results pointer from NoriaBatchLookupResult
+ * @param index The result index (0 to count-1)
+ * @param out_found Output: 1 if found, 0 if cache miss
+ * @param out_row_count Output: number of rows for this result
+ * @return Pointer to rows data for this result (do NOT free separately), or NULL
+ */
+void* noria_batch_get_result(
+    void* batch_ptr,
+    int index,
+    int* out_found,
+    int* out_row_count
+);
+
+/**
+ * Free batch lookup results.
+ *
+ * @param batch_ptr The results pointer from NoriaBatchLookupResult
+ */
+void noria_free_batch_results(void* batch_ptr);
+
 /**
  * Get a specific column value from a row in the lookup result.
  *

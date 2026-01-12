@@ -58,6 +58,9 @@ private:
 	// Attempt to serve all() from Noria cache
 	bool TryNoriaAll(v8::Isolate* isolate, const v8::FunctionCallbackInfo<v8::Value>& info, bool consistent_read);
 
+	// Attempt to serve getMany() from Noria cache - batch lookup for multiple keys
+	bool TryNoriaGetMany(v8::Isolate* isolate, const v8::FunctionCallbackInfo<v8::Value>& info, bool consistent_read);
+
 	// Detect statement type and extract table name
 	void DetectStatementType();
 
@@ -68,6 +71,7 @@ private:
 	static NODE_METHOD(JS_run);
 	static NODE_METHOD(JS_get);
 	static NODE_METHOD(JS_all);
+	static NODE_METHOD(JS_getMany);
 	static NODE_METHOD(JS_iterate);
 	static NODE_METHOD(JS_bind);
 	static NODE_METHOD(JS_pluck);

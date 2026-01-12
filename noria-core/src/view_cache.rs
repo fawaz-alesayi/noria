@@ -3,12 +3,8 @@
 //! This module provides the core caching infrastructure using evmap,
 //! a lock-free, eventually consistent concurrent map.
 
-use crate::error::Result;
-use crate::worker::Worker;
-use crate::Config;
 use noria::DataType;
 use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -58,96 +54,20 @@ impl CachedRow {
     }
 }
 
-/// Thread-safe view cache using evmap for concurrent access.
-pub struct ViewCache {
-    /// Map from normalized SQL -> view handle
-    views: RwLock<HashMap<String, ViewHandle>>,
+/// Serialized row data for storage in evmap.
+/// We use Vec<u8> because evmap 11.0 requires StableHashEq which is sealed.
+type SerializedRow = Box<[u8]>;
 
-    /// Maximum memory budget
-    max_memory: usize,
+/// Inner state of a view, shared across clones.
+struct ViewInner {
+    /// evmap read handle (String keys, serialized row values)
+    reader: evmap::handles::ReadHandle<String, SerializedRow, (), RandomState>,
 
-    /// Statistics
-    hits: AtomicU64,
-    misses: AtomicU64,
-}
+    /// evmap write handle (wrapped for thread safety)
+    writer: RwLock<evmap::handles::WriteHandle<String, SerializedRow, (), RandomState>>,
 
-impl ViewCache {
-    /// Create a new view cache with the specified memory limit.
-    pub fn new(max_memory: usize) -> Self {
-        Self {
-            views: RwLock::new(HashMap::new()),
-            max_memory,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-        }
-    }
-
-    /// Get or create a view for the given query.
-    pub fn get_or_create_view(
-        &self,
-        normalized_sql: &str,
-        worker: &Worker,
-        config: &Config,
-    ) -> Result<ViewHandle> {
-        // Fast path: check if view already exists
-        {
-            let views = self.views.read();
-            if let Some(handle) = views.get(normalized_sql) {
-                return Ok(handle.clone());
-            }
-        }
-
-        // Slow path: create new view
-        let mut views = self.views.write();
-
-        // Double-check after acquiring write lock
-        if let Some(handle) = views.get(normalized_sql) {
-            return Ok(handle.clone());
-        }
-
-        // Synthesize new view via worker
-        let handle = worker.synthesize_view(normalized_sql, config)?;
-        views.insert(normalized_sql.to_string(), handle.clone());
-
-        Ok(handle)
-    }
-
-    /// Record a cache hit.
-    pub fn record_hit(&self) {
-        self.hits.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Record a cache miss.
-    pub fn record_miss(&self) {
-        self.misses.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Flush all cached views.
-    pub fn flush(&self) {
-        let views = self.views.read();
-        for handle in views.values() {
-            handle.clear();
-        }
-    }
-
-    /// Get the maximum memory budget.
-    #[allow(dead_code)]
-    pub fn max_memory(&self) -> usize {
-        self.max_memory
-    }
-
-    /// Get cache statistics.
-    pub fn stats(&self) -> ViewCacheStats {
-        let views = self.views.read();
-        let memory_bytes = views.values().map(|h| h.memory_estimate()).sum();
-
-        ViewCacheStats {
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            view_count: views.len(),
-            memory_bytes,
-        }
-    }
+    /// Track approximate memory usage
+    memory_bytes: AtomicU64,
 }
 
 /// Handle to a specific materialized view.
@@ -167,22 +87,6 @@ pub struct ViewHandle {
 
     /// Column names in the result (for debugging)
     pub result_columns: Vec<String>,
-}
-
-/// Serialized row data for storage in evmap.
-/// We use Vec<u8> because evmap 11.0 requires StableHashEq which is sealed.
-type SerializedRow = Box<[u8]>;
-
-/// Inner state of a view, shared across clones.
-struct ViewInner {
-    /// evmap read handle (String keys, serialized row values)
-    reader: evmap::handles::ReadHandle<String, SerializedRow, (), RandomState>,
-
-    /// evmap write handle (wrapped for thread safety)
-    writer: RwLock<evmap::handles::WriteHandle<String, SerializedRow, (), RandomState>>,
-
-    /// Track approximate memory usage
-    memory_bytes: AtomicU64,
 }
 
 impl ViewHandle {

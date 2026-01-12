@@ -15,6 +15,7 @@ function isFreshOption(value) {
 function wrapStatement(nativeStmt, db) {
 	const originalGet = nativeStmt.get.bind(nativeStmt);
 	const originalAll = nativeStmt.all.bind(nativeStmt);
+	const originalGetMany = nativeStmt.getMany.bind(nativeStmt);
 	const flushFn = db[cppdb].flushCache.bind(db[cppdb]);
 
 	nativeStmt.get = function get() {
@@ -63,6 +64,16 @@ function wrapStatement(nativeStmt, db) {
 			case 3: return originalAll(arguments[0], arguments[1], arguments[2]);
 			default: return originalAll.apply(null, arguments);
 		}
+	};
+
+	// getMany: batch lookup for multiple keys in a single call
+	// Usage: stmt.getMany([key1, key2, key3]) -> [row1, row2, row3]
+	// With fresh option: stmt.getMany([key1, key2], { fresh: true })
+	nativeStmt.getMany = function getMany(keys, options) {
+		if (options && isFreshOption(options)) {
+			flushFn();
+		}
+		return originalGetMany(keys);
 	};
 
 	return nativeStmt;

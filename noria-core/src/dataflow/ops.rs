@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 use noria::DataType;
-use noria_core::dataflow::{Record, Records};
-use noria_core::dataflow::{State, StateKey, LookupResult};
+use super::{Record, Records};
+use super::state::{State, StateKey, LookupResult};
 
 /// Result of processing records through an operator.
 #[derive(Default)]
@@ -36,9 +36,12 @@ pub trait Operator: Send {
     /// Human-readable description.
     fn description(&self) -> String;
 
-    /// Whether this operator needs state passed to process().
+    /// Whether this operator needs external state passed to process().
+    ///
     /// Operators like Aggregate have internal state and don't need the view's state.
     /// Operators like Join need the other parent's state for lookups.
+    ///
+    /// When this returns false, the executor can skip expensive snapshot() calls.
     fn needs_state(&self) -> bool {
         false // Default: no state needed
     }
@@ -461,67 +464,73 @@ impl Operator for AggregateOp {
         let mut results = Records::new();
         let mut group_changes: HashMap<StateKey, (i64, i64)> = HashMap::new();
 
-        for record in &records {
-            let group_key = StateKey::from_row(record.row(), &self.group_by);
+        // Phase 1: Collect deltas per group
+        {
+            for record in &records {
+                let group_key = StateKey::from_row(record.row(), &self.group_by);
 
-            let delta = if record.is_positive() { 1 } else { -1 };
+                let delta = if record.is_positive() { 1 } else { -1 };
 
-            let value_delta = match &self.func {
-                AggregateFunc::Sum(col) | AggregateFunc::Avg(col) => {
-                    match &record.row()[*col] {
-                        DataType::Int(v) => *v as i64 * delta,
-                        DataType::BigInt(v) => *v * delta,
-                        _ => 0,
+                let value_delta = match &self.func {
+                    AggregateFunc::Sum(col) | AggregateFunc::Avg(col) => {
+                        match &record.row()[*col] {
+                            DataType::Int(v) => *v as i64 * delta,
+                            DataType::BigInt(v) => *v * delta,
+                            _ => 0,
+                        }
                     }
-                }
-                _ => 0,
-            };
+                    _ => 0,
+                };
 
-            let entry = group_changes.entry(group_key).or_insert((0, 0));
-            entry.0 += delta;
-            entry.1 += value_delta;
+                let entry = group_changes.entry(group_key).or_insert((0, 0));
+                entry.0 += delta;
+                entry.1 += value_delta;
+            }
         }
 
-        for (group_key, (count_delta, sum_delta)) in group_changes {
-            let internal = self.internal_state.entry(group_key.clone()).or_default();
-            let old_count = internal.count;
-            let old_sum = internal.sum;
-            let new_count = old_count + count_delta;
-            let new_sum = old_sum + sum_delta;
+        // Phase 2: Update internal state and emit records
+        {
+            for (group_key, (count_delta, sum_delta)) in group_changes {
+                let internal = self.internal_state.entry(group_key.clone()).or_default();
+                let old_count = internal.count;
+                let old_sum = internal.sum;
+                let new_count = old_count + count_delta;
+                let new_sum = old_sum + sum_delta;
 
-            internal.count = new_count;
-            internal.sum = new_sum;
+                internal.count = new_count;
+                internal.sum = new_sum;
 
-            // Extract group values from StateKey for row construction
-            let group_values: Vec<DataType> = match &group_key {
-                StateKey::Single(v) => vec![v.clone()],
-                StateKey::Multi(vs) => vs.clone(),
-            };
+                // Extract group values from StateKey for row construction
+                let group_values: Vec<DataType> = match &group_key {
+                    StateKey::Single(v) => vec![v.clone()],
+                    StateKey::Multi(vs) => vs.clone(),
+                };
 
-            if old_count > 0 {
-                let mut old_row = group_values.clone();
-                match &self.func {
-                    AggregateFunc::Count => old_row.push(DataType::BigInt(old_count)),
-                    AggregateFunc::Sum(_) => old_row.push(DataType::BigInt(old_sum)),
-                    AggregateFunc::Avg(_) => old_row.push(DataType::BigInt(old_sum / old_count)),
-                    AggregateFunc::Min(_) | AggregateFunc::Max(_) => old_row.push(DataType::BigInt(old_sum)),
+                if old_count > 0 {
+                    let mut old_row = group_values.clone();
+                    match &self.func {
+                        AggregateFunc::Count => old_row.push(DataType::BigInt(old_count)),
+                        AggregateFunc::Sum(_) => old_row.push(DataType::BigInt(old_sum)),
+                        AggregateFunc::Avg(_) => old_row.push(DataType::BigInt(old_sum / old_count)),
+                        AggregateFunc::Min(_) | AggregateFunc::Max(_) => old_row.push(DataType::BigInt(old_sum)),
+                    }
+                    results.push(Record::Negative(old_row));
                 }
-                results.push(Record::Negative(old_row));
-            }
 
-            if new_count > 0 {
-                let mut new_row = group_values;
-                match &self.func {
-                    AggregateFunc::Count => new_row.push(DataType::BigInt(new_count)),
-                    AggregateFunc::Sum(_) => new_row.push(DataType::BigInt(new_sum)),
-                    AggregateFunc::Avg(_) => new_row.push(DataType::BigInt(new_sum / new_count)),
-                    AggregateFunc::Min(_) | AggregateFunc::Max(_) => new_row.push(DataType::BigInt(new_sum)),
+                if new_count > 0 {
+                    let mut new_row = group_values;
+                    match &self.func {
+                        AggregateFunc::Count => new_row.push(DataType::BigInt(new_count)),
+                        AggregateFunc::Sum(_) => new_row.push(DataType::BigInt(new_sum)),
+                        AggregateFunc::Avg(_) => new_row.push(DataType::BigInt(new_sum / new_count)),
+                        AggregateFunc::Min(_) | AggregateFunc::Max(_) => new_row.push(DataType::BigInt(new_sum)),
+                    }
+                    results.push(Record::Positive(new_row));
                 }
-                results.push(Record::Positive(new_row));
-            }
 
-            if new_count <= 0 {
-                self.internal_state.remove(&group_key);
+                if new_count <= 0 {
+                    self.internal_state.remove(&group_key);
+                }
             }
         }
 
