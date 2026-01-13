@@ -21,9 +21,9 @@ parking_lot = "0.12"
 crossbeam-channel = "0.5"
 bumpalo = "3.14"       # Arena allocator for zero-cost temporary allocations
 arc-swap = "1.6"       # Lock-free atomic Arc swapping for wait-free reads
+smallvec = "1.11"      # Inline storage for small keys (avoids heap allocation)
 
 # Noria dataflow engine
-noria-sqlite = { path = "../../noria-sqlite" }
 noria = { path = "../../noria" }
 noria-core = { path = "../../noria-core" }
 

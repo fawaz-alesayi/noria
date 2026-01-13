@@ -59,7 +59,7 @@ Embed Noria's differential dataflow engine as a transparent, in-process caching 
 ├─────────────────────────────────────────────────────────────────────────┤
 │                    Database (Source of Truth)                           │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  SQLite: Session Extension captures INSERT/UPDATE/DELETE        │   │
+│  │  SQLite: Preupdate hook captures INSERT/UPDATE/DELETE (in C++)  │   │
 │  │  Postgres (future): Logical replication / pg_notify             │   │
 │  │  MySQL (future): Binlog replication                             │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
@@ -102,31 +102,23 @@ noria/
 │       │   ├── mod.rs             # Record, Records types
 │       │   ├── executor.rs        # LocalExecutor (DAG propagation)
 │       │   ├── ops.rs             # Filter, Project, Join, Aggregate
-│       │   └── state.rs           # MemoryState, StateKey
+│       │   └── state.rs           # MemoryState, StateKey, IntegerArrayState
 │       └── sql/
-│           ├── mod.rs             # SqlConverter
-│           └── parser.rs          # sqlparser-rs integration
-│
-├── noria-sqlite/                  # SQLite-specific adapter
-│   ├── Cargo.toml                 # depends on noria-core
-│   └── src/
-│       ├── lib.rs                 # Re-exports + SQLite API
-│       ├── database.rs            # NoriaDatabase wrapper
-│       ├── statement.rs           # Prepared statements
-│       └── adapter/
-│           ├── mod.rs             # SqliteAdapter impl
-│           └── session.rs         # CDC via session extension
+│           └── mod.rs             # SqlConverter (sqlparser-rs, multi-dialect)
 │
 ├── noria-better-sqlite3/          # Node.js bindings (C++ FFI)
 │   ├── noria-ffi/                 # Rust FFI layer
-│   │   └── src/lib.rs             # Write queue, batch flush
+│   │   └── src/lib.rs             # Write queue, batch flush, imports noria-core
 │   ├── src/
-│   │   ├── util/noria.cpp         # C++ wrapper
+│   │   ├── util/noria.cpp         # C++ wrapper, preupdate hook CDC
 │   │   └── objects/               # Database/Statement integration
 │   └── lib/                       # JavaScript API
 │
 └── noria/                         # Original Noria DataType crate
 ```
+
+**Note**: The `noria-sqlite` crate was removed as it duplicated `noria-core` functionality.
+CDC is handled directly in C++ via SQLite's preupdate hook, not the session extension.
 
 ---
 
@@ -162,14 +154,13 @@ pub enum CdcEvent {
 }
 ```
 
-### Future Database Support
+### Database Support
 
-| Database | Adapter | CDC Mechanism | Status |
-|----------|---------|---------------|--------|
-| SQLite | `SqliteAdapter` | Session extension | **Implemented** |
-| PostgreSQL | `PostgresAdapter` | Logical replication / LISTEN/NOTIFY | Planned |
-| MySQL | `MySqlAdapter` | Binlog replication | Planned |
-| Generic | `GenericAdapter` | Polling (fallback) | Planned |
+| Database | CDC Mechanism | Status |
+|----------|---------------|--------|
+| SQLite | Preupdate hook (C++) | **Implemented** |
+| PostgreSQL | Logical replication / LISTEN/NOTIFY | Planned |
+| MySQL | Binlog replication | Planned |
 
 ---
 
@@ -177,12 +168,12 @@ pub enum CdcEvent {
 
 | File | Purpose | Key Functions |
 |------|---------|---------------|
-| `noria-core/src/adapter.rs` | Database adapter traits | `DatabaseAdapter`, `CdcSource`, `CdcEvent` |
 | `noria-core/src/dataflow/executor.rs` | Graph execution | `propagate()`, `apply_write()`, `lookup()` |
-| `noria-core/src/dataflow/ops.rs` | Operators | `FilterOp`, `JoinOp`, `AggregateOp`, `needs_state()` |
+| `noria-core/src/dataflow/ops.rs` | Operators | `FilterOp`, `JoinOp`, `AggregateOp` |
+| `noria-core/src/dataflow/state.rs` | State storage | `MemoryState`, `IntegerArrayState`, `Row` (Arc-wrapped) |
 | `noria-core/src/sql/mod.rs` | SQL parsing | `SqlConverter`, `SqlDialect` |
 | `noria-ffi/src/lib.rs` | Rust FFI layer | `noria_queue_*()`, `noria_flush()`, write queue |
-| `noria.cpp` | C++ wrapper | `RegisterView()`, `LookupOrUpquery()`, `ProcessSessionChangeset()` |
+| `noria.cpp` | C++ wrapper | `RegisterView()`, `LookupOrUpquery()`, preupdate hook CDC |
 
 ---
 
@@ -230,20 +221,20 @@ Simulates a link aggregator (HN/Lobsters) with stories, users, votes, comments.
 
 | Scenario | better-sqlite3 | noria | Speedup |
 |----------|----------------|-------|---------|
-| Single-key read | 325,000 ops/sec | 800,000 ops/sec | **2.5x** |
-| Read-only mixed | 295,000 ops/sec | 510,000 ops/sec | **1.7x** |
-| Read 99% / Write 1% | 200,000 ops/sec | 290,000 ops/sec | **1.4x** |
-| Read 95% / Write 5% | 110,000 ops/sec | 110,000 ops/sec | 1.0x |
-| Read 90% / Write 10% | 63,000 ops/sec | 57,000 ops/sec | 0.9x |
+| Single-key read | 323,500 ops/sec | 995,975 ops/sec | **3.1x** |
+| Read-only mixed | 301,825 ops/sec | 577,805 ops/sec | **1.9x** |
+| Read 99% / Write 1% | 205,988 ops/sec | 372,488 ops/sec | **1.8x** |
+| Read 95% / Write 5% | 114,400 ops/sec | 146,647 ops/sec | **1.3x** |
+| Read 90% / Write 10% | 67,492 ops/sec | 53,390 ops/sec | 0.8x |
 
-**Trade-offs**: Beneficial for read-heavy workloads (95%+ reads). At 95/5, parity. Write-heavy workloads with aggregate views are slower due to incremental maintenance.
+**Trade-offs**: Beneficial for read-heavy workloads (95%+ reads). At 90/10, write overhead dominates. Cache throughput approaches **~1M ops/sec** for single-key lookups.
 
 ### Alignment with Original Noria Paper
 
 | Metric | Original Noria | Noria-SQLite | Notes |
 |--------|---------------|--------------|-------|
 | Target workload | 95%+ reads | 95%+ reads | Same |
-| Speedup vs baseline | 5-7x vs MySQL | 1.7-2.5x vs SQLite | SQLite baseline is faster |
+| Speedup vs baseline | 5-7x vs MySQL | 1.9-3.1x vs SQLite | SQLite baseline is faster |
 | Design | Distributed | In-process | Simpler, lower latency |
 
 ---
@@ -262,9 +253,7 @@ npm test
 npm run bench:lobsters
 
 # Rust tests
-cd noria-core && cargo test
-cd noria-sqlite && cargo test
-cd noria-better-sqlite3/noria-ffi && cargo test
+cargo test --package noria-core --package noria-ffi
 ```
 
 ---
@@ -336,24 +325,22 @@ const stats = db.cacheStats();
 ## Current Status (January 2026)
 
 ### Completed
-- **noria-core separation**: Database-agnostic dataflow engine
-- **Adapter traits**: `DatabaseAdapter`, `CdcSource` for pluggable backends
+- **Simplified architecture**: Two Rust crates (`noria-core`, `noria`) + C++ FFI
+- **noria-core**: Database-agnostic dataflow engine with multi-dialect SQL parser
+- **Preupdate hook CDC**: Efficient change capture directly in C++ (replaced session extension)
 - **Async batch processing**: Write queue + flush (from Noria paper)
-- **`needs_state()` optimization**: Skip snapshot for operators that don't need it
 - **Core operators**: Filter, Project, Join, Aggregate with incremental maintenance
-- **SQLite integration**: Session extension CDC, transaction-aware
+- **Optimized state**: `IntegerArrayState` for O(1) integer key lookups, Arc-wrapped rows
 - **better-sqlite3 compatibility**: Full API compatibility via C++ FFI
 
 ### Test Results
 - **Node.js Tests**: 348 passing
-- **Rust Tests**: 127 passing
-- **FFI Tests**: 4 passing
+- **Rust Tests**: 44 passing (noria-core + noria-ffi)
 
 ### Not Yet Implemented
 - Subqueries and window functions
 - PostgreSQL adapter (logical replication)
 - MySQL adapter (binlog)
-- Named parameter CDC optimization
 
 ---
 
@@ -374,15 +361,15 @@ const stats = db.cacheStats();
 - **Rationale**: Integrates with existing better-sqlite3 codebase; simpler build
 - **Trade-off**: More complex FFI boundary; manual memory management
 
-### 4. Session Extension for SQLite CDC
-- **Decision**: Use `sqlite3session` for change capture
-- **Rationale**: Transaction-aware; captures old values; efficient
-- **Requirement**: SQLite compiled with `-DSQLITE_ENABLE_SESSION`
+### 4. Preupdate Hook for SQLite CDC
+- **Decision**: Use SQLite's `sqlite3_preupdate_hook` for change capture in C++
+- **Rationale**: Simpler than session extension; captures old/new values; no extra compile flags
+- **Benefit**: No need for `SQLITE_ENABLE_SESSION`; works with stock SQLite
 
-### 5. `needs_state()` Operator Trait
-- **Decision**: Add method to skip snapshot creation for operators that don't need it
-- **Rationale**: Aggregates maintain internal state; no need for expensive view snapshots
-- **Impact**: Significant performance improvement for aggregate-heavy workloads
+### 5. Arc-Wrapped Rows for Zero-Copy Lookups
+- **Decision**: State stores `Arc<Vec<DataType>>` rows; lookups return Arc clones
+- **Rationale**: O(1) cloning on lookup (ref count increment only); no data copying
+- **Impact**: Significant performance improvement for read-heavy workloads
 
 ---
 
@@ -397,10 +384,10 @@ const stats = db.cacheStats();
 ### Storage Architecture
 | Layer | Original Noria | Noria-SQLite |
 |-------|---------------|--------------|
-| Materialized Views | evmap | evmap (same) |
+| Materialized Views | evmap | HashMap with Arc rows |
 | Base Table Storage | RocksDB | SQLite (or Postgres/MySQL) |
-| Upquery Source | RocksDB | Database via adapter |
-| CDC | Custom | Database-specific (session/binlog/replication) |
+| Upquery Source | RocksDB | Database via callback |
+| CDC | Custom | Preupdate hook (SQLite) |
 
 ---
 

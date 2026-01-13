@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use noria::DataType;
 use super::{Record, Records};
 use super::ops::{Operator, OperatorType, ProcessingResult};
-use super::state::{State, DynamicState, LookupResult};
+use super::state::{State, DynamicState, LookupResult, Row};
 
 /// Index into the node array.
 pub type NodeIndex = usize;
@@ -138,13 +138,12 @@ impl LocalExecutor {
     }
 
     /// Look up rows from a materialized view.
-    pub fn lookup(&self, view: &ViewHandle, key: &[DataType]) -> Option<Vec<Vec<DataType>>> {
+    /// Returns Arc-wrapped rows for O(1) cloning (zero-copy).
+    pub fn lookup(&self, view: &ViewHandle, key: &[DataType]) -> Option<Vec<Row>> {
         let node = &self.nodes[view.node];
         match &node.state {
             Some(state) => match state.lookup(key) {
-                LookupResult::Some(rows) => {
-                    Some(rows.into_iter().map(|r| r.to_vec()).collect())
-                }
+                LookupResult::Some(rows) => Some(rows),
                 LookupResult::Empty => Some(vec![]),
                 LookupResult::Missing => None,
             },

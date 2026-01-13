@@ -1,7 +1,7 @@
 //! C FFI bridge for Noria dataflow engine integration with better-sqlite3
 //!
 //! This module provides a transparent caching layer for better-sqlite3 using
-//! noria-sqlite's real dataflow engine with incremental view maintenance.
+//! noria-core's dataflow engine with incremental view maintenance.
 //!
 //! Key features:
 //! - Incremental CDC propagation (not just invalidation)
@@ -10,9 +10,11 @@
 //! - Memory management with random eviction
 
 use noria::DataType;
-use noria_sqlite::dataflow::{
-    LocalExecutor, Record, Records, SqlConverter, ViewHandle,
+use noria_core::dataflow::{
+    LocalExecutor, Record, Records, ViewHandle,
+    Row as ArcRow,  // Arc<Vec<DataType>> for O(1) cloning
 };
+use noria_core::SqlConverter;
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -93,6 +95,29 @@ pub struct NoriaBatchLookupResult {
     pub count: c_int,
     /// Opaque pointer to result array (caller must free with noria_free_batch_results)
     pub results: *mut c_void,
+}
+
+/// Maximum columns supported by NoriaRowData fixed-size array
+pub const NORIA_MAX_ROW_COLUMNS: usize = 32;
+
+/// Row data returned by noria_get_row - all values in a single FFI call
+/// Uses fixed-size array to avoid heap allocation for common cases (≤32 columns)
+#[repr(C)]
+pub struct NoriaRowData {
+    /// Number of columns in this row
+    pub col_count: c_int,
+    /// Fixed-size array of values (only first col_count entries are valid)
+    pub values: [NoriaValue; NORIA_MAX_ROW_COLUMNS],
+}
+
+impl Default for NoriaRowData {
+    fn default() -> Self {
+        // Safe initialization with zeroed memory for the array
+        NoriaRowData {
+            col_count: 0,
+            values: unsafe { std::mem::zeroed() },
+        }
+    }
 }
 
 /// Container for batch results
@@ -376,17 +401,17 @@ impl RowsContainer {
     }
 }
 
-/// Zero-copy container - stores DataType directly without intermediate Value allocation
-/// This avoids the intermediate Value allocation and String cloning
+/// Zero-copy container - stores Arc<Vec<DataType>> for O(1) cloning
+/// This avoids intermediate Value allocation and deep copying on lookup
 /// repr(C) ensures container_type is at offset 0 for type detection
 #[repr(C)]
 struct DataRowsContainer {
     container_type: u8,  // Always CONTAINER_TYPE_DIRECT
-    rows: Vec<Vec<DataType>>,
+    rows: Vec<ArcRow>,   // Vec<Arc<Vec<DataType>>> - just Arc clones, no deep copy
 }
 
 impl DataRowsContainer {
-    fn new(rows: Vec<Vec<DataType>>) -> Self {
+    fn new(rows: Vec<ArcRow>) -> Self {
         Self {
             container_type: CONTAINER_TYPE_DIRECT,
             rows,
@@ -787,25 +812,24 @@ pub extern "C" fn noria_lookup(
 
     let handle = unsafe { &*handle };
 
-    // Get view - instrument RwLock acquisition
-    let view_entry_clone;
-    {
+    // Get view handle only - avoid cloning sql/tables on hot path (only needed for upquery)
+    let view_handle = {
         let views = handle.views.load();
-        view_entry_clone = match views.get(&view_id) {
-            Some(v) => (v.handle.clone(), v.sql.clone(), v.tables.clone()),
+        match views.get(&view_id) {
+            Some(v) => v.handle.clone(),
             None => return not_found,
-        };
-    }
+        }
+    };
 
     // Convert key
     let key: Vec<DataType> = {
         convert_values(key_values, key_count)
     };
 
-    // Try cache lookup using executor - instrument RwLock acquisition
+    // Try cache lookup using executor
     let lookup_result = {
         let executor = handle.executor.read();
-        executor.lookup(&view_entry_clone.0, &key)
+        executor.lookup(&view_handle, &key)
     };
 
     match lookup_result {
@@ -838,8 +862,16 @@ pub extern "C" fn noria_lookup(
             let callback = *handle.upquery_callback.read();
             if let Some(cb) = callback {
                 let user_data = *handle.upquery_user_data.read();
-                let sql_cstr =
-                    std::ffi::CString::new(view_entry_clone.1.as_str()).unwrap_or_default();
+
+                // Only clone sql now (on cache miss path) - not on hot cache hit path
+                let sql = {
+                    let views = handle.views.load();
+                    match views.get(&view_id) {
+                        Some(v) => v.sql.clone(),
+                        None => return not_found,
+                    }
+                };
+                let sql_cstr = std::ffi::CString::new(sql.as_str()).unwrap_or_default();
 
                 let mut out_rows: *mut c_void = ptr::null_mut();
                 let mut out_row_count: c_int = 0;
@@ -879,7 +911,7 @@ pub extern "C" fn noria_lookup(
                         handle
                             .executor
                             .write()
-                            .inject_into_view(&view_entry_clone.0, records);
+                            .inject_into_view(&view_handle, records);
                     }
 
                     // Return the rows to caller
@@ -907,6 +939,77 @@ pub extern "C" fn noria_lookup_or_upquery(
     noria_lookup(handle, view_id, key_values, key_count)
 }
 
+/// Fast path lookup for single integer key - skips NoriaValue conversion overhead
+///
+/// This is an optimization for the common case where the key is a single integer
+/// (e.g., primary key lookup). By taking an i64 directly, we avoid:
+/// - NoriaValue struct construction in C++
+/// - noria_value_to_datatype conversion in Rust
+/// - Vec allocation for the key
+#[no_mangle]
+pub extern "C" fn noria_lookup_int_key(
+    handle: *mut NoriaHandle,
+    view_id: c_int,
+    key: i64,
+) -> NoriaLookupResult {
+    let not_found = NoriaLookupResult {
+        found: 0,
+        row_count: 0,
+        rows: ptr::null_mut(),
+    };
+
+    if handle.is_null() || view_id < 0 {
+        return not_found;
+    }
+
+    let handle = unsafe { &*handle };
+
+    // Get view handle only - avoid cloning sql/tables on hot path
+    let view_handle = {
+        let views = handle.views.load();
+        match views.get(&view_id) {
+            Some(v) => v.handle.clone(),
+            None => return not_found,
+        }
+    };
+
+    // Create key directly - no NoriaValue conversion needed
+    let key_dt = [DataType::BigInt(key)];
+
+    // Try cache lookup using executor
+    let lookup_result = {
+        let executor = handle.executor.read();
+        executor.lookup(&view_handle, &key_dt)
+    };
+
+    match lookup_result {
+        Some(rows) => {
+            handle.cache_hits.fetch_add(1, Ordering::Relaxed);
+            let row_count = rows.len() as c_int;
+            if row_count == 0 {
+                return NoriaLookupResult {
+                    found: 1,
+                    row_count: 0,
+                    rows: ptr::null_mut(),
+                };
+            }
+
+            // ZERO-COPY: Store DataType rows directly
+            let container = Box::new(DataRowsContainer::new(rows));
+            NoriaLookupResult {
+                found: 1,
+                row_count,
+                rows: Box::into_raw(container) as *mut c_void,
+            }
+        }
+        None => {
+            // DON'T count miss here - the caller will fall back to regular lookup
+            // which will count the miss there if needed. This avoids double-counting.
+            not_found
+        }
+    }
+}
+
 /// Batch lookup - lookup multiple keys in a single FFI call
 /// This amortizes lock acquisition and FFI crossing overhead
 #[no_mangle]
@@ -931,15 +1034,14 @@ pub extern "C" fn noria_lookup_batch(
     let key_ptrs = unsafe { std::slice::from_raw_parts(keys, num_keys as usize) };
     let counts = unsafe { std::slice::from_raw_parts(key_counts, num_keys as usize) };
 
-    // Get view entry once
-    let view_entry_clone;
-    {
+    // Get view handle only - no need for sql/tables in batch lookup (no upquery)
+    let view_handle = {
         let views = handle.views.load();
-        view_entry_clone = match views.get(&view_id) {
-            Some(v) => (v.handle.clone(), v.sql.clone(), v.tables.clone()),
+        match views.get(&view_id) {
+            Some(v) => v.handle.clone(),
             None => return empty_result,
-        };
-    }
+        }
+    };
 
     // Perform all lookups with single lock acquisition
     let mut results = Vec::with_capacity(num_keys as usize);
@@ -953,7 +1055,7 @@ pub extern "C" fn noria_lookup_batch(
             }
 
             let key = convert_values(*key_ptr, key_count);
-            match executor.lookup(&view_entry_clone.0, &key) {
+            match executor.lookup(&view_handle, &key) {
                 Some(rows) => {
                     handle.cache_hits.fetch_add(1, Ordering::Relaxed);
                     let row_count = rows.len() as c_int;
@@ -1117,6 +1219,75 @@ pub extern "C" fn noria_get_value(
         let value = &row[col_index as usize];
         unsafe {
             *out_value = value.to_noria_value();
+        }
+        0
+    }
+}
+
+/// Get all values for a row in a single FFI call - batch optimization
+/// This eliminates N FFI calls (one per column) with a single call that fills
+/// a fixed-size array. For rows with ≤32 columns, this avoids all heap allocation.
+///
+/// Returns: 0 on success, -1 on error, -2 if row has more columns than NORIA_MAX_ROW_COLUMNS
+#[no_mangle]
+pub extern "C" fn noria_get_row(
+    rows_ptr: *mut c_void,
+    row_index: c_int,
+    out_data: *mut NoriaRowData,
+) -> c_int {
+    if rows_ptr.is_null() || out_data.is_null() || row_index < 0 {
+        return -1;
+    }
+
+    // Read container type from first byte
+    let container_type = unsafe { *(rows_ptr as *const u8) };
+
+    if container_type == CONTAINER_TYPE_DIRECT {
+        // ZERO-COPY PATH: DataRowsContainer with DataType
+        let container = unsafe { &*(rows_ptr as *const DataRowsContainer) };
+
+        if row_index as usize >= container.rows.len() {
+            return -1;
+        }
+
+        let row = &container.rows[row_index as usize];
+        let col_count = row.len();
+
+        // Check if row fits in fixed-size array
+        if col_count > NORIA_MAX_ROW_COLUMNS {
+            return -2; // Too many columns - caller should fall back to noria_get_value
+        }
+
+        unsafe {
+            (*out_data).col_count = col_count as c_int;
+
+            // Convert all columns in one pass
+            for (i, dt) in row.iter().enumerate() {
+                datatype_to_noria_value(dt, &mut (*out_data).values[i]);
+            }
+        }
+        0
+    } else {
+        // LEGACY PATH: RowsContainer with Value (for upquery results)
+        let container = unsafe { &*(rows_ptr as *const RowsContainer) };
+
+        if row_index as usize >= container.rows.len() {
+            return -1;
+        }
+
+        let row = &container.rows[row_index as usize];
+        let col_count = row.len();
+
+        if col_count > NORIA_MAX_ROW_COLUMNS {
+            return -2;
+        }
+
+        unsafe {
+            (*out_data).col_count = col_count as c_int;
+
+            for (i, value) in row.iter().enumerate() {
+                (*out_data).values[i] = value.to_noria_value();
+            }
         }
         0
     }
@@ -1462,6 +1633,23 @@ pub extern "C" fn noria_flush(handle: *mut NoriaHandle) -> c_int {
     }
 
     0
+}
+
+/// Clear the write queue (used on transaction rollback to discard pending CDC events)
+#[no_mangle]
+pub extern "C" fn noria_clear_queue(handle: *mut NoriaHandle) {
+    if handle.is_null() {
+        return;
+    }
+
+    let handle = unsafe { &*handle };
+
+    // Clear dirty table bitmap
+    handle.dirty_tables.swap(0, Ordering::AcqRel);
+
+    // Clear pending writes without processing them
+    let mut queue = handle.write_queue.write();
+    queue.clear();
 }
 
 /// Get cache statistics
