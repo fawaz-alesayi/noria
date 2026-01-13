@@ -1,7 +1,66 @@
-//! Dataflow operators.
+//! # Dataflow Operators
 //!
-//! Each operator transforms input records into output records according to
-//! its specific logic (filter, project, join, aggregate, etc.).
+//! Operators are the building blocks of Noria's dataflow graphs. Each operator
+//! transforms input records into output records according to relational algebra
+//! semantics, preserving the differential (positive/negative) nature of records.
+//!
+//! ## Operator Types
+//!
+//! | Symbol | Operator | Description |
+//! |--------|----------|-------------|
+//! | σ | [`FilterOp`] | Selection - keeps rows matching a condition |
+//! | π | [`ProjectOp`] | Projection - selects/reorders columns |
+//! | ⋈ | [`JoinOp`] | Join - combines rows from two inputs |
+//! | γ | [`AggregateOp`] | Aggregation - COUNT, SUM, AVG, MIN, MAX |
+//! | ≡ | [`IdentityOp`] | Passthrough - used for base tables |
+//!
+//! ## Differential Processing
+//!
+//! All operators preserve the positive/negative semantics of records:
+//!
+//! ```text
+//! Input: +{id:1, name:"Alice"}, -{id:2, name:"Bob"}
+//!                    │
+//!                    ▼
+//!              FilterOp(id > 0)
+//!                    │
+//!                    ▼
+//! Output: +{id:1, name:"Alice"}, -{id:2, name:"Bob"}
+//!         (both pass filter, polarity preserved)
+//! ```
+//!
+//! ## The `needs_state()` Optimization
+//!
+//! The [`Operator`] trait includes a `needs_state()` method that enables an
+//! important performance optimization. Some operators (like [`AggregateOp`])
+//! maintain their own internal state and don't need the view's state passed
+//! to them. When `needs_state()` returns `false`, the executor can skip
+//! expensive snapshot operations.
+//!
+//! ```text
+//! FilterOp:     needs_state() = false  → No snapshot needed
+//! ProjectOp:    needs_state() = false  → No snapshot needed
+//! JoinOp:       needs_state() = true   → Needs other parent's state
+//! AggregateOp:  needs_state() = false  → Has internal state
+//! ```
+//!
+//! This optimization is significant because snapshot creation involves
+//! cloning HashMap state, which can be expensive for large views.
+//!
+//! ## Aggregate Incremental Updates
+//!
+//! The [`AggregateOp`] demonstrates incremental computation. Rather than
+//! recomputing aggregates from scratch, it processes deltas in two phases:
+//!
+//! 1. **Phase 1**: Collect deltas per group key (+1, -1, etc.)
+//! 2. **Phase 2**: Update internal state, emit old (negative) and new (positive)
+//!
+//! This matches the Noria paper's approach to efficient aggregate maintenance.
+//!
+//! ## Paper Reference
+//!
+//! See Section 4 "Operators" in the Noria paper:
+//! <https://pdos.csail.mit.edu/papers/noria:osdi18.pdf>
 
 use std::collections::HashMap;
 use noria::DataType;
@@ -17,9 +76,20 @@ pub struct ProcessingResult {
     pub lookups_needed: Vec<Vec<DataType>>,
 }
 
-/// Trait that all operators implement.
+/// Core trait that all dataflow operators implement.
+///
+/// Operators transform records according to relational algebra semantics.
+/// They must preserve the differential nature of records (positive/negative).
 pub trait Operator: Send {
     /// Process incoming records and produce output records.
+    ///
+    /// # Arguments
+    /// - `from_parent`: Index of the parent node these records came from (for joins)
+    /// - `records`: The batch of records to process
+    /// - `state`: Optional state from another node (only passed if `needs_state()` is true)
+    ///
+    /// # Returns
+    /// [`ProcessingResult`] containing output records and any needed lookups
     fn process(
         &mut self,
         from_parent: usize,
@@ -27,21 +97,23 @@ pub trait Operator: Send {
         state: Option<&dyn State>,
     ) -> ProcessingResult;
 
-    /// Get the key columns for this operator's output.
+    /// Key columns used for indexing this operator's output.
     fn key_columns(&self) -> &[usize];
 
-    /// Get the number of output columns.
+    /// Number of columns in this operator's output rows.
     fn output_columns(&self) -> usize;
 
-    /// Human-readable description.
+    /// Human-readable description (uses relational algebra symbols).
     fn description(&self) -> String;
 
-    /// Whether this operator needs external state passed to process().
+    /// Whether this operator needs external state passed to `process()`.
     ///
-    /// Operators like Aggregate have internal state and don't need the view's state.
-    /// Operators like Join need the other parent's state for lookups.
+    /// **This is a critical optimization.** When `false`, the executor skips
+    /// creating expensive state snapshots.
     ///
-    /// When this returns false, the executor can skip expensive snapshot() calls.
+    /// - `FilterOp`, `ProjectOp`: `false` - stateless, just transform records
+    /// - `AggregateOp`: `false` - has internal state, doesn't need external
+    /// - `JoinOp`: `true` - needs the other parent's state for lookups
     fn needs_state(&self) -> bool {
         false // Default: no state needed
     }
@@ -418,29 +490,75 @@ impl Operator for JoinOp {
 }
 
 // ============================================================================
-// Aggregate Operator
+// Aggregate Operator (γ) - Incremental GROUP BY
 // ============================================================================
 
+/// Aggregate function to compute over grouped rows.
 #[derive(Debug, Clone)]
 pub enum AggregateFunc {
+    /// COUNT(*) - counts rows per group
     Count,
-    Sum(usize), // column to sum
+    /// SUM(column) - sums values in the specified column
+    Sum(usize),
+    /// AVG(column) - averages values (computed as sum/count)
     Avg(usize),
+    /// MIN(column) - minimum value (simplified: tracks via sum)
     Min(usize),
+    /// MAX(column) - maximum value (simplified: tracks via sum)
     Max(usize),
 }
 
+/// Internal per-group state for incremental aggregate computation.
 #[derive(Debug, Clone, Default)]
 struct AggregateGroupState {
     count: i64,
     sum: i64,
 }
 
+/// Aggregate operator implementing incremental GROUP BY computation.
+///
+/// Unlike traditional databases that recompute aggregates from scratch,
+/// this operator maintains internal state and updates it incrementally
+/// as deltas (positive/negative records) arrive.
+///
+/// ## Two-Phase Processing
+///
+/// Processing happens in two phases to correctly handle batched updates:
+///
+/// ```text
+/// Phase 1: Collect deltas per group
+/// ┌─────────────────────────────────────────┐
+/// │ Input: +{user:1}, +{user:1}, -{user:2}  │
+/// │                 ↓                        │
+/// │ group_changes: {1: (+2, 0), 2: (-1, 0)} │
+/// └─────────────────────────────────────────┘
+///
+/// Phase 2: Update state and emit
+/// ┌─────────────────────────────────────────┐
+/// │ For each changed group:                 │
+/// │   1. Emit -{old_count} (retract)        │
+/// │   2. Update internal state              │
+/// │   3. Emit +{new_count} (insert)         │
+/// └─────────────────────────────────────────┘
+/// ```
+///
+/// This two-phase approach ensures correct results even when a batch
+/// contains multiple changes to the same group.
+///
+/// ## Why Internal State?
+///
+/// This operator maintains its own `internal_state` HashMap rather than
+/// relying on the view's state. This means `needs_state()` returns `false`,
+/// allowing the executor to skip expensive snapshot operations.
 #[derive(Debug, Clone)]
 pub struct AggregateOp {
+    /// Columns to group by (the GROUP BY clause)
     group_by: Vec<usize>,
+    /// Aggregate function to apply
     func: AggregateFunc,
+    /// Key columns for output indexing
     key_cols: Vec<usize>,
+    /// Per-group state: tracks count and sum for incremental updates
     internal_state: HashMap<StateKey, AggregateGroupState>,
 }
 

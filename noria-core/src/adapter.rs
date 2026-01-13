@@ -1,7 +1,70 @@
-//! Database adapter traits for pluggable backends.
+//! # Database Adapter Traits
 //!
-//! This module defines the traits that database-specific implementations
-//! must provide to integrate with the noria-core dataflow engine.
+//! This module defines the traits for integrating database backends with
+//! the noria-core dataflow engine. The design enables Noria to work with
+//! any database that can provide:
+//!
+//! 1. **Schema information** (for SQL-to-dataflow conversion)
+//! 2. **Upquery capability** (for filling partial state holes)
+//! 3. **CDC events** (for propagating changes)
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────┐
+//! │                    Application Layer                        │
+//! └─────────────────────────────────────────────────────────────┘
+//!                              │
+//!                              ▼
+//! ┌─────────────────────────────────────────────────────────────┐
+//! │                    noria-core Engine                        │
+//! │  ┌──────────────────┐  ┌─────────────────────────────────┐ │
+//! │  │  LocalExecutor   │  │  SqlConverter                    │ │
+//! │  │  (dataflow DAG)  │  │  (SQL → operators)               │ │
+//! │  └────────┬─────────┘  └─────────────────────────────────┘ │
+//! │           │                                                 │
+//! │           │ DatabaseAdapter trait                           │
+//! │           │ CdcSource trait                                 │
+//! │           ▼                                                 │
+//! │  ┌──────────────────────────────────────────────────────┐  │
+//! │  │              Adapter Implementation                   │  │
+//! │  │  (SqliteAdapter, PostgresAdapter, MySqlAdapter, ...) │  │
+//! │  └──────────────────────────────────────────────────────┘  │
+//! └─────────────────────────────────────────────────────────────┘
+//!                              │
+//!                              ▼
+//! ┌─────────────────────────────────────────────────────────────┐
+//! │                    Database Layer                           │
+//! │  SQLite / PostgreSQL / MySQL / ...                          │
+//! └─────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Supported Backends
+//!
+//! | Database   | CDC Mechanism       | Status |
+//! |------------|---------------------|--------|
+//! | SQLite     | Preupdate hook      | **Implemented** |
+//! | PostgreSQL | Logical replication | Planned |
+//! | MySQL      | Binlog              | Planned |
+//!
+//! ## Key Traits
+//!
+//! - [`DatabaseAdapter`]: Schema discovery and upqueries
+//! - [`CdcSource`]: Change Data Capture event stream
+//! - [`TableSchema`]: Table metadata
+//! - [`CdcEvent`]: Individual change events (insert/update/delete)
+//!
+//! ## Thread Safety Note
+//!
+//! The [`DatabaseAdapter`] trait does **not** require `Send + Sync` because
+//! some database connections (e.g., SQLite) are not thread-safe. Adapters
+//! should be accessed from a single thread, with external synchronization
+//! if needed.
+//!
+//! ## Paper Reference
+//!
+//! See Section 5 "Implementation" of the Noria paper for CDC integration:
+//! <https://pdos.csail.mit.edu/papers/noria:osdi18.pdf>
 
 use noria::DataType;
 

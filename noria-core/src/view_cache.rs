@@ -1,7 +1,60 @@
-//! View cache backed by evmap for lock-free reads
+//! # View Cache with Lock-Free Reads
 //!
-//! This module provides the core caching infrastructure using evmap,
-//! a lock-free, eventually consistent concurrent map.
+//! This module provides an alternative caching infrastructure using
+//! [evmap](https://crates.io/crates/evmap) for lock-free concurrent reads.
+//!
+//! ## Why evmap?
+//!
+//! evmap is a "left-right" concurrent map that provides:
+//! - **Lock-free reads**: Multiple readers can access data without blocking
+//! - **Serializable writes**: Writers batch updates and swap atomically
+//! - **Eventually consistent**: Readers see a consistent snapshot
+//!
+//! This is ideal for read-heavy workloads where reads vastly outnumber writes.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────┐
+//! │                     evmap                                │
+//! │  ┌─────────────────┐    ┌─────────────────────────────┐ │
+//! │  │  Read Handle    │    │  Write Handle               │ │
+//! │  │  (lock-free)    │    │  (mutex-protected)          │ │
+//! │  │                 │    │                             │ │
+//! │  │  reader.get()   │    │  writer.insert()            │ │
+//! │  │  O(1) lookup    │    │  writer.refresh() → swap    │ │
+//! │  └─────────────────┘    └─────────────────────────────┘ │
+//! │           │                         │                   │
+//! │           │                         │                   │
+//! │           ▼                         ▼                   │
+//! │  ┌─────────────────────────────────────────────────────┐│
+//! │  │           Two Internal HashMaps                      ││
+//! │  │  (readers see one, writer modifies other)           ││
+//! │  └─────────────────────────────────────────────────────┘│
+//! └─────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Relationship to LocalExecutor State
+//!
+//! This module is an **alternative** to the state management in
+//! [`dataflow::state`]. The LocalExecutor uses its own state implementation
+//! for the hot path (with optimizations like IntegerArrayState), while
+//! this module provides evmap-backed caching for use cases requiring
+//! cross-thread read access.
+//!
+//! ## Serialization Note
+//!
+//! evmap 11.0 requires values to implement `StableHashEq` (a sealed trait).
+//! We work around this by serializing rows to `Box<[u8]>` and deserializing
+//! on read.
+//!
+//! ## Key Types
+//!
+//! - [`ViewHandle`]: Handle to a specific materialized view
+//! - [`CachedRow`]: A single cached row (deserialized from evmap)
+//! - [`ViewCacheStats`]: Statistics about cache performance
+//!
+//! [`dataflow::state`]: crate::dataflow::state
 
 use noria::DataType;
 use parking_lot::RwLock;

@@ -1,6 +1,85 @@
-//! Local single-threaded dataflow executor.
+//! # Local Dataflow Executor
 //!
-//! The executor manages a graph of operators and propagates records through them.
+//! The executor is the heart of Noria's dataflow engine. It manages a directed
+//! acyclic graph (DAG) of operators and propagates records through them using
+//! **push-based** evaluation (writes push deltas downstream, reads are O(1)).
+//!
+//! ## Graph Structure
+//!
+//! ```text
+//! ┌─────────────┐    ┌─────────────┐
+//! │ Base Table  │    │ Base Table  │
+//! │  (users)    │    │  (votes)    │
+//! └──────┬──────┘    └──────┬──────┘
+//!        │                  │
+//!        ▼                  ▼
+//! ┌─────────────┐    ┌─────────────┐
+//! │  FilterOp   │    │ AggregateOp │
+//! │ (WHERE ...)│    │ (COUNT)     │
+//! └──────┬──────┘    └──────┬──────┘
+//!        │                  │
+//!        └────────┬─────────┘
+//!                 ▼
+//!          ┌─────────────┐
+//!          │   JoinOp    │
+//!          │ (user ⋈ ct) │
+//!          └──────┬──────┘
+//!                 │
+//!                 ▼
+//!          ┌─────────────┐
+//!          │    View     │
+//!          │ (materialized)
+//!          └─────────────┘
+//! ```
+//!
+//! Nodes are one of:
+//! - **Base tables**: Entry points for CDC events
+//! - **Operators**: Transform records (σ, π, ⋈, γ)
+//! - **Views**: Materialized state with O(1) lookup
+//!
+//! ## Propagation Algorithm
+//!
+//! When a write arrives via `apply_write()`:
+//!
+//! 1. Records enter at a base table node
+//! 2. `propagate()` pushes them to all child nodes
+//! 3. Each operator transforms records and passes results downstream
+//! 4. Views (nodes with state) update their materialized data
+//!
+//! This is the core of Noria's push-based model: writes do the work,
+//! reads are just state lookups.
+//!
+//! ## Key Optimizations
+//!
+//! ### `needs_state()` Skip
+//!
+//! Before calling an operator's `process()`, we check if it needs state
+//! via `needs_state()`. If not, we skip creating an expensive state
+//! snapshot. This is significant for aggregates which maintain their
+//! own internal state.
+//!
+//! ### DynamicState Auto-Selection
+//!
+//! When materializing a view, we use [`DynamicState`] which automatically
+//! selects [`IntegerArrayState`] (O(1) direct indexing) for integer keys
+//! or [`MemoryState`] (HashMap) otherwise. See `OPTIMIZATIONS.md` #4.
+//!
+//! ## Upqueries (Partial State)
+//!
+//! When a lookup returns [`LookupResult::Missing`], the caller can perform
+//! an **upquery** - fetching the missing data from the database and
+//! injecting it into state. This implements partial materialization from
+//! Section 3.2 of the Noria paper.
+//!
+//! ## Paper Reference
+//!
+//! See Section 3 "Dataflow" and Section 4 "Operators" in the Noria paper:
+//! <https://pdos.csail.mit.edu/papers/noria:osdi18.pdf>
+//!
+//! [`DynamicState`]: super::state::DynamicState
+//! [`IntegerArrayState`]: super::state::IntegerArrayState
+//! [`MemoryState`]: super::state::MemoryState
+//! [`LookupResult::Missing`]: super::state::LookupResult::Missing
 
 use std::collections::HashMap;
 use noria::DataType;

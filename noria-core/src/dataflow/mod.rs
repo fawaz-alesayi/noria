@@ -1,7 +1,60 @@
-//! Database-agnostic dataflow execution engine.
+//! # Dataflow Execution Engine
 //!
-//! This module provides a single-threaded dataflow execution engine
-//! that can be used with any database backend through the adapter traits.
+//! This module implements the core dataflow execution model from the Noria paper,
+//! providing incremental view maintenance through differential updates.
+//!
+//! ## Differential Dataflow Model
+//!
+//! Unlike traditional caches that invalidate on write, Noria propagates *changes*
+//! (deltas) through a graph of operators. Each change is represented as either:
+//!
+//! - **Positive record** (`Record::Positive`): An insertion or the "new" side of an update
+//! - **Negative record** (`Record::Negative`): A deletion or the "old" side of an update
+//!
+//! For example, updating a row from `{id: 1, name: "Alice"}` to `{id: 1, name: "Bob"}`
+//! produces two records:
+//!
+//! ```text
+//! - {id: 1, name: "Alice"}   // Retract old value
+//! + {id: 1, name: "Bob"}     // Insert new value
+//! ```
+//!
+//! This delta representation enables **incremental computation**: aggregate operators
+//! can update their state (e.g., increment/decrement a count) rather than recomputing
+//! from scratch.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+//! │ Base Table  │────▶│  Operator   │────▶│    View     │
+//! │   (node)    │     │   (node)    │     │   (node)    │
+//! └─────────────┘     └─────────────┘     └─────────────┘
+//!       │                   │                   │
+//!       │ Records           │ Records           │ State
+//!       │ (deltas)          │ (transformed)     │ (materialized)
+//!       ▼                   ▼                   ▼
+//! ```
+//!
+//! The [`LocalExecutor`] manages a directed acyclic graph (DAG) of nodes:
+//! - **Base tables**: Entry points for CDC events from the database
+//! - **Operators**: Transform records (filter, project, join, aggregate)
+//! - **Views**: Materialized state that can be queried via O(1) lookups
+//!
+//! ## Key Types
+//!
+//! - [`Record`]: A single positive or negative data row
+//! - [`Records`]: A collection of deltas to propagate through the graph
+//! - [`LocalExecutor`]: The dataflow graph engine
+//! - [`ViewHandle`]: Reference to a materialized view for lookups
+//!
+//! ## Paper Reference
+//!
+//! See Section 3 of the Noria paper for the full dataflow semantics:
+//! <https://pdos.csail.mit.edu/papers/noria:osdi18.pdf>
+//!
+//! [`LocalExecutor`]: executor::LocalExecutor
+//! [`ViewHandle`]: executor::ViewHandle
 
 pub mod executor;
 pub mod ops;
@@ -19,10 +72,35 @@ pub use state::{
 
 use noria::DataType;
 
-/// A record is a single positive or negative data record.
+/// A single data record in the differential dataflow model.
+///
+/// Records are the fundamental unit of data propagation in Noria. Each record
+/// represents either an insertion (`Positive`) or a retraction (`Negative`).
+///
+/// ## Differential Semantics
+///
+/// - **INSERT**: Emits one `Positive` record with the new row
+/// - **DELETE**: Emits one `Negative` record with the old row
+/// - **UPDATE**: Emits a `Negative` (old) followed by a `Positive` (new)
+///
+/// This representation allows operators to process changes incrementally.
+/// For example, a COUNT aggregate can simply increment/decrement rather
+/// than recomputing the full count.
+///
+/// ## Example
+///
+/// ```ignore
+/// // An insert becomes a positive record
+/// let insert = Record::Positive(vec![DataType::Int(1), DataType::from("Alice")]);
+///
+/// // A delete becomes a negative record
+/// let delete = Record::Negative(vec![DataType::Int(1), DataType::from("Alice")]);
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Record {
+    /// An insertion - this row should be added to downstream state
     Positive(Vec<DataType>),
+    /// A retraction - this row should be removed from downstream state
     Negative(Vec<DataType>),
 }
 
@@ -50,7 +128,36 @@ impl From<Vec<DataType>> for Record {
     }
 }
 
-/// A collection of records (deltas).
+/// A batch of records (deltas) to propagate through the dataflow graph.
+///
+/// `Records` is the primary container for passing changes between operators.
+/// Batching multiple records together enables important optimizations:
+///
+/// ## Batch Processing Benefits
+///
+/// 1. **Reduced lock contention**: One lock acquisition per batch, not per record
+/// 2. **Aggregate optimization**: Multiple changes to the same group key can be
+///    combined before emitting (e.g., +5, -3 → net +2)
+/// 3. **Reduced retraction overhead**: Intermediate states don't need to be
+///    materialized between records in the same batch
+///
+/// This matches the "async batch processing" optimization from Section 4.3 of
+/// the Noria paper. See `OPTIMIZATIONS.md` for benchmarks.
+///
+/// ## Example
+///
+/// ```ignore
+/// // Create from raw row data (all become positive records)
+/// let records: Records = vec![
+///     vec![DataType::Int(1), DataType::from("Alice")],
+///     vec![DataType::Int(2), DataType::from("Bob")],
+/// ].into();
+///
+/// // Or build incrementally
+/// let mut records = Records::new();
+/// records.push(Record::Positive(vec![DataType::Int(1)]));
+/// records.push(Record::Negative(vec![DataType::Int(2)]));
+/// ```
 #[derive(Clone, Default, Debug)]
 pub struct Records(Vec<Record>);
 

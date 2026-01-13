@@ -1,10 +1,86 @@
-//! SQL to dataflow conversion.
+//! # SQL to Dataflow Conversion
 //!
-//! This module parses SQL queries using sqlparser-rs and converts them into
-//! dataflow operator graphs. It supports:
-//! - SELECT with WHERE, GROUP BY, and projections
-//! - JOINs (INNER, LEFT, RIGHT, CROSS)
-//! - Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
+//! This module parses SQL queries and converts them into dataflow operator
+//! graphs. It uses [sqlparser-rs](https://crates.io/crates/sqlparser) for
+//! multi-dialect SQL parsing.
+//!
+//! ## Conversion Process
+//!
+//! ```text
+//! SQL Query                         Dataflow Graph
+//! ──────────────────────────────    ────────────────────────
+//!
+//! SELECT u.name, COUNT(*)           base_table("users")
+//! FROM users u                           │
+//! JOIN votes v ON u.id = v.user_id       ├── base_table("votes")
+//! WHERE u.active = 1                     │         │
+//! GROUP BY u.id                          │         │
+//!                                        ▼         ▼
+//!                                   FilterOp   IdentityOp
+//!                                   (active=1)     │
+//!                                        │         │
+//!                                        └────┬────┘
+//!                                             │
+//!                                             ▼
+//!                                         JoinOp
+//!                                        (u.id = v.user_id)
+//!                                             │
+//!                                             ▼
+//!                                       AggregateOp
+//!                                       (GROUP BY u.id, COUNT)
+//!                                             │
+//!                                             ▼
+//!                                        ProjectOp
+//!                                       (u.name, count)
+//! ```
+//!
+//! ## Supported SQL Features
+//!
+//! | Feature | Support | Notes |
+//! |---------|---------|-------|
+//! | SELECT | ✅ | Column selection and aliasing |
+//! | WHERE | ✅ | Equality, comparison, AND/OR |
+//! | JOIN | ✅ | INNER, LEFT, RIGHT, CROSS |
+//! | GROUP BY | ✅ | Single/multi-column grouping |
+//! | COUNT/SUM/AVG/MIN/MAX | ✅ | Basic aggregates |
+//! | ORDER BY | ❌ | Not supported (views are unordered) |
+//! | LIMIT/OFFSET | ❌ | Not supported |
+//! | Subqueries | ❌ | Not supported |
+//! | Window functions | ❌ | Not supported |
+//! | CTEs (WITH) | ❌ | Not supported |
+//!
+//! ## Key Column Detection
+//!
+//! The converter automatically detects key columns from WHERE clauses:
+//!
+//! ```text
+//! SELECT * FROM users WHERE id = ?
+//!                          ^^^^^
+//!                      Key column detected: "id"
+//! ```
+//!
+//! Parameterized conditions (`= ?`) are converted to `FilterCondition::AlwaysTrue`
+//! during dataflow execution (they don't filter, but mark the key column).
+//!
+//! ## Multi-Dialect Support
+//!
+//! The [`SqlDialect`] enum supports database-specific SQL parsing:
+//!
+//! - `SqlDialect::SQLite` - SQLite-specific syntax
+//! - `SqlDialect::PostgreSQL` - PostgreSQL syntax
+//! - `SqlDialect::MySQL` - MySQL syntax
+//! - `SqlDialect::Generic` - Standard SQL
+//!
+//! ## Error Handling
+//!
+//! Unsupported queries return [`SqlError::UnsupportedQuery`] with a description.
+//! The caller can fall back to direct database execution for these cases.
+//!
+//! ## Paper Reference
+//!
+//! The original Noria paper uses a custom SQL parser. This implementation
+//! uses sqlparser-rs for broader compatibility. See Section 4.1 for query
+//! compilation: <https://pdos.csail.mit.edu/papers/noria:osdi18.pdf>
 
 use noria::DataType;
 use sqlparser::ast::{

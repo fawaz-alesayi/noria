@@ -1,13 +1,99 @@
-//! C FFI bridge for Noria dataflow engine integration with better-sqlite3
+//! # C FFI Bridge for Noria Dataflow Engine
 //!
-//! This module provides a transparent caching layer for better-sqlite3 using
-//! noria-core's dataflow engine with incremental view maintenance.
+//! This module provides the FFI layer between C++ (better-sqlite3) and Rust
+//! (noria-core), enabling transparent query caching with incremental view
+//! maintenance.
 //!
-//! Key features:
-//! - Incremental CDC propagation (not just invalidation)
-//! - Dataflow operators: Filter, Project, Join, Aggregate
-//! - Upquery via callback to C++
-//! - Memory management with random eviction
+//! ## Architecture Overview
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                     JavaScript (Node.js)                        │
+//! │                   stmt.get(1), db.prepare()                     │
+//! └─────────────────────────────────────────────────────────────────┘
+//!                                │
+//!                                ▼
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                    C++ (better-sqlite3)                         │
+//! │   Statement::TryNoriaGet() ──▶ noria->LookupOrUpquery()        │
+//! │   Database::Exec()         ──▶ preupdate hook ──▶ CDC queue    │
+//! └─────────────────────────────────────────────────────────────────┘
+//!                                │
+//!                                ▼ FFI boundary (this module)
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                    Rust FFI Layer (noria-ffi)                   │
+//! │  ┌──────────────┐ ┌──────────────┐ ┌────────────────────────┐  │
+//! │  │ noria_lookup │ │ noria_queue_ │ │ noria_lookup_int_key   │  │
+//! │  │ _or_upquery  │ │ insert/del/up│ │ (integer fast path)    │  │
+//! │  └──────────────┘ └──────────────┘ └────────────────────────┘  │
+//! │                          │                                      │
+//! │                          ▼                                      │
+//! │  ┌──────────────────────────────────────────────────────────┐  │
+//! │  │                    NoriaHandle                            │  │
+//! │  │  - executor: LocalExecutor (dataflow DAG)                 │  │
+//! │  │  - views: ArcSwap<HashMap> (lock-free view registry)      │  │
+//! │  │  - write_queue: Vec<PendingWrite> (async CDC batch)       │  │
+//! │  └──────────────────────────────────────────────────────────┘  │
+//! └─────────────────────────────────────────────────────────────────┘
+//!                                │
+//!                                ▼
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                    noria-core (Rust)                            │
+//! │  LocalExecutor, DynamicState, SqlConverter, etc.                │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Hot Path vs Cold Path
+//!
+//! The FFI layer distinguishes between:
+//!
+//! **Hot Path (Cache Hit)** - Optimized for speed:
+//! 1. `noria_lookup_int_key()` - Direct integer key lookup (no NoriaValue conversion)
+//! 2. ArcSwap load (lock-free) to get view entry
+//! 3. State lookup returns `Arc<Vec<DataType>>` (O(1) clone)
+//! 4. DataRowsContainer stores Arcs directly (zero-copy)
+//!
+//! **Cold Path (Cache Miss)** - Calls back to C++:
+//! 1. `noria_lookup_or_upquery()` detects miss via `LookupResult::Missing`
+//! 2. Invokes upquery callback to execute SQL in SQLite
+//! 3. Results injected into cache for future hits
+//!
+//! ## Key Optimizations
+//!
+//! See `OPTIMIZATIONS.md` for benchmarks and detailed analysis.
+//!
+//! | Optimization | Function | Impact |
+//! |--------------|----------|--------|
+//! | Integer key fast path | `noria_lookup_int_key()` | +12% single-key reads |
+//! | Zero-copy rows | `DataRowsContainer` | +10-21% reads |
+//! | Batch value extraction | `noria_get_row()` | Reduces FFI calls |
+//! | ArcSwap views | `views` field | Lock-free reads |
+//! | Async batch CDC | `noria_flush()` | 4x faster writes |
+//!
+//! ## Async Batch Processing
+//!
+//! Implements the async batch processing from the Noria paper (Section 4.3):
+//!
+//! ```text
+//! INSERT/UPDATE/DELETE → noria_queue_*() → write_queue
+//!                                              │
+//!                        Transaction COMMIT ───┘
+//!                                              │
+//!                        noria_flush() ───────▶ Batch propagate
+//! ```
+//!
+//! Benefits: Single lock acquisition per table, aggregate batching,
+//! reduced retraction overhead.
+//!
+//! ## Memory Management
+//!
+//! - Result containers are heap-allocated and must be freed via `noria_free_rows()`
+//! - Views support random eviction when memory exceeds `max_memory_bytes`
+//! - String data in upquery results is copied (C++ data may be transient)
+//!
+//! ## Paper Reference
+//!
+//! <https://pdos.csail.mit.edu/papers/noria:osdi18.pdf>
 
 use noria::DataType;
 use noria_core::dataflow::{
@@ -332,63 +418,96 @@ struct PendingWrite {
     record: Record,
 }
 
-/// Opaque handle to Noria engine
+/// Main Noria engine state, managing the dataflow graph and view registry.
+///
+/// ## Thread Safety
+///
+/// This struct is designed for safe concurrent access:
+/// - `views`: Uses `ArcSwap` for lock-free read access (OPTIMIZATIONS.md #7)
+/// - `executor`, `converter`: Protected by `RwLock` (writes are rare)
+/// - `upquery_callback`: Protected by `RwLock`, only modified during setup
+/// - Atomic counters for statistics
+///
+/// ## Key Fields
+///
+/// - `executor`: The dataflow graph engine (processes CDC events)
+/// - `views`: Lock-free registry mapping view IDs to handles
+/// - `write_queue`: Batches CDC events for async propagation (Noria paper §4.3)
 pub struct NoriaHandle {
-    /// The dataflow executor (executes the graph)
+    /// Dataflow executor - propagates CDC events through operator DAG
     executor: RwLock<LocalExecutor>,
 
-    /// SQL converter (parses SQL to dataflow)
+    /// SQL-to-dataflow converter
     converter: RwLock<SqlConverter>,
 
-    /// View ID -> NoriaViewEntry mapping (ArcSwap for lock-free reads)
+    /// View registry: ID → entry. Uses ArcSwap for lock-free reads.
+    /// OPTIMIZATION: Avoids RwLock overhead on hot read path (see OPTIMIZATIONS.md #7)
     views: ArcSwap<HashMap<i32, NoriaViewEntry>>,
 
-    /// SQL (normalized) -> view ID mapping
+    /// Reverse lookup: normalized SQL → view ID
     sql_to_view_id: RwLock<HashMap<String, i32>>,
 
-    /// Table name -> list of view IDs that depend on it
+    /// Table dependencies: table name → dependent view IDs
     table_to_views: RwLock<HashMap<String, Vec<i32>>>,
 
-    /// Table name -> table ID (for fast bitmap invalidation)
+    /// Table ID mapping (for bitmap operations)
     table_to_id: RwLock<HashMap<String, usize>>,
-
-    /// Table ID -> table name
     id_to_table: RwLock<Vec<String>>,
 
-    /// Next view ID
+    /// Auto-incrementing view ID
     next_view_id: AtomicI32,
 
-    /// Statistics
+    /// Performance statistics (atomic for lock-free updates)
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     max_memory_bytes: AtomicU64,
     eviction_count: AtomicU64,
     bytes_evicted: AtomicU64,
 
-    /// Dirty table bitmap for deferred invalidation (legacy support)
+    /// Legacy: dirty table bitmap for deferred invalidation
     dirty_tables: AtomicU64,
 
-    /// Upquery callback
+    /// Upquery callback: invoked on cache miss to fetch from SQLite
     upquery_callback: RwLock<Option<UpqueryCallback>>,
     upquery_user_data: RwLock<*mut c_void>,
 
-    /// Write queue for batch processing (async CDC)
+    /// CDC event queue for batch processing (from Noria paper)
     write_queue: RwLock<Vec<PendingWrite>>,
 }
 
-// Safety: The raw pointers are only accessed in a single-threaded context
+// SAFETY: All fields are either:
+// - Atomic types (inherently thread-safe)
+// - Protected by RwLock (synchronized access)
+// - ArcSwap (designed for concurrent access)
+// The raw pointer `upquery_user_data` is only accessed while holding the
+// `upquery_callback` lock, preventing data races.
 unsafe impl Send for NoriaHandle {}
 unsafe impl Sync for NoriaHandle {}
 
-/// Container type discriminant for FFI
-const CONTAINER_TYPE_VALUES: u8 = 0;  // Legacy RowsContainer
-const CONTAINER_TYPE_DIRECT: u8 = 1;  // Zero-copy DataRowsContainer
+// ============================================================================
+// Container Types for FFI Result Returns
+//
+// Two container types support different result sources:
+// - DataRowsContainer: Cache hits (zero-copy, Arc-wrapped rows)
+// - RowsContainer: Upquery results (converted from C++ data)
+//
+// Both use #[repr(C)] with container_type at offset 0 so C++ can detect
+// which type to use via noria_get_value() / noria_get_row().
+// ============================================================================
 
-/// Container for rows returned to C++ (legacy - uses Value intermediate)
-/// repr(C) ensures container_type is at offset 0 for type detection
+/// Type discriminant at offset 0 of both container types
+const CONTAINER_TYPE_VALUES: u8 = 0;  // Legacy RowsContainer (upquery results)
+const CONTAINER_TYPE_DIRECT: u8 = 1;  // Zero-copy DataRowsContainer (cache hits)
+
+/// Container for upquery results (rows from C++ callback).
+///
+/// Used when cache misses require fetching from SQLite. The `Value` type
+/// holds owned string data (copied from C++ since that data may be transient).
 #[repr(C)]
 struct RowsContainer {
-    container_type: u8,  // Always CONTAINER_TYPE_VALUES
+    /// Discriminant for C++ type detection (always CONTAINER_TYPE_VALUES)
+    container_type: u8,
+    /// Rows with owned data
     rows: Vec<Row>,
 }
 
@@ -401,13 +520,22 @@ impl RowsContainer {
     }
 }
 
-/// Zero-copy container - stores Arc<Vec<DataType>> for O(1) cloning
-/// This avoids intermediate Value allocation and deep copying on lookup
-/// repr(C) ensures container_type is at offset 0 for type detection
+/// Zero-copy container for cache hit results (OPTIMIZATIONS.md #9).
+///
+/// Stores `Arc<Vec<DataType>>` directly - lookups just clone Arc references
+/// (O(1) ref count increment) rather than deep-copying row data.
+///
+/// ## Why Two Container Types?
+///
+/// Cache hits return Arc-wrapped rows from state, avoiding allocation.
+/// Upquery results come from C++ and need owned storage.
+/// The discriminant at offset 0 lets `noria_get_value()` handle both.
 #[repr(C)]
 struct DataRowsContainer {
-    container_type: u8,  // Always CONTAINER_TYPE_DIRECT
-    rows: Vec<ArcRow>,   // Vec<Arc<Vec<DataType>>> - just Arc clones, no deep copy
+    /// Discriminant for C++ type detection (always CONTAINER_TYPE_DIRECT)
+    container_type: u8,
+    /// Arc-wrapped rows - cloning is O(1), no data copying
+    rows: Vec<ArcRow>,
 }
 
 impl DataRowsContainer {

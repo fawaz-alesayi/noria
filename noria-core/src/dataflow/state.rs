@@ -1,20 +1,105 @@
-//! State management for materialized views.
+//! # State Management for Materialized Views
 //!
 //! This module provides in-memory state storage for dataflow operators,
-//! supporting indexed lookups by key columns.
+//! supporting indexed lookups by key columns. State is where the "materialized"
+//! part of materialized views lives.
+//!
+//! ## Partially-Stateful Model
+//!
+//! In the Noria paper (Section 3.2), views can be **partially materialized**:
+//! not all possible key values need to be present in state. When a lookup
+//! encounters a "hole" (missing key), the system can perform an **upquery**
+//! to fetch the data from upstream and fill in the hole.
+//!
+//! This module implements the state-side of that model through [`LookupResult`]:
+//! - `Some(rows)`: Key exists and has data (cache hit)
+//! - `Empty`: Key exists but maps to empty result
+//! - `Missing`: Key not in state (cache miss, triggers upquery)
+//!
+//! ## Performance Optimizations
+//!
+//! Several optimizations make lookups fast (see `OPTIMIZATIONS.md` for benchmarks):
+//!
+//! ### 1. Arc-Wrapped Rows (OPTIMIZATIONS.md #9)
+//!
+//! Rows are stored as `Arc<Vec<DataType>>` so lookups can return references
+//! without deep copying. Cloning an Arc is O(1) - just a reference count
+//! increment.
+//!
+//! ```text
+//! Lookup returns: Vec<Arc<Vec<DataType>>>
+//!                      └── Just increment refcount, no data copy
+//! ```
+//!
+//! **Impact**: +10-21% speedup on read-heavy workloads.
+//!
+//! ### 2. IntegerArrayState (OPTIMIZATIONS.md #3)
+//!
+//! For single-column integer primary keys (the common case), we use direct
+//! array indexing instead of a HashMap:
+//!
+//! ```text
+//! HashMap lookup:  hash(key) → bucket → linear search → O(1) average
+//! Array lookup:    data[key - offset] → O(1) guaranteed, no hash
+//! ```
+//!
+//! **Impact**: +12% speedup for integer key lookups.
+//!
+//! ### 3. DynamicState Auto-Detection (OPTIMIZATIONS.md #4)
+//!
+//! [`DynamicState`] automatically selects the optimal implementation on first
+//! insert. Single-column integer keys get `IntegerArrayState`, everything else
+//! gets `MemoryState` (HashMap).
+//!
+//! ### 4. StateKey Single-Column Optimization
+//!
+//! [`StateKey`] avoids Vec allocation for single-column keys (the common case)
+//! by using an enum:
+//!
+//! ```text
+//! StateKey::Single(DataType)       // No Vec allocation
+//! StateKey::Multi(Vec<DataType>)   // Only for composite keys
+//! ```
+//!
+//! ## Key Types
+//!
+//! - [`Row`]: `Arc<Vec<DataType>>` - shared ownership for O(1) cloning
+//! - [`State`]: Trait for all state implementations
+//! - [`MemoryState`]: HashMap-backed state (general purpose)
+//! - [`IntegerArrayState`]: Array-backed state for integer keys (O(1))
+//! - [`DynamicState`]: Auto-selecting wrapper
+//!
+//! ## Paper Reference
+//!
+//! See Section 3.2 "Partial State" in the Noria paper:
+//! <https://pdos.csail.mit.edu/papers/noria:osdi18.pdf>
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use noria::DataType;
 use super::{Record, Records};
 
-/// A row stored in state - Arc-wrapped for cheap cloning on lookup.
+/// A row stored in state, wrapped in Arc for O(1) cloning on lookup.
+///
+/// This is a critical optimization: instead of deep-copying row data on every
+/// lookup, we return Arc references. Cloning an Arc is just a reference count
+/// increment - O(1) regardless of row size.
+///
+/// See `OPTIMIZATIONS.md` #9 for benchmark data (+10-21% speedup).
 pub type Row = Arc<Vec<DataType>>;
 
-/// Key storage - specialized for common single-column case to avoid Vec overhead.
+/// Key storage optimized for the common single-column case.
+///
+/// Most database tables have single-column primary keys (e.g., `id`). This enum
+/// avoids the Vec allocation overhead for that case:
+///
+/// - `Single`: No heap allocation, DataType stored inline
+/// - `Multi`: Only used for composite keys (e.g., `(user_id, post_id)`)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StateKey {
+    /// Single-column key (common case, no Vec allocation)
     Single(DataType),
+    /// Composite key (rare, requires Vec)
     Multi(Vec<DataType>),
 }
 
@@ -38,15 +123,25 @@ impl StateKey {
     }
 }
 
-/// Result of a state lookup.
-/// Uses Arc<Vec<DataType>> for O(1) cloning on lookup (just ref count increment).
+/// Result of a state lookup, implementing the partial-state model.
+///
+/// The three variants correspond to the possible states of a key in
+/// partially-materialized views (Noria paper Section 3.2):
+///
+/// - `Some`: Key is materialized and has data
+/// - `Empty`: Key is materialized but maps to empty (e.g., COUNT returned 0)
+/// - `Missing`: Key is NOT materialized (a "hole" that triggers upquery)
+///
+/// The distinction between `Empty` and `Missing` is important:
+/// - `Empty` means "we know there's no data" (no upquery needed)
+/// - `Missing` means "we don't know" (upquery to fill the hole)
 #[derive(Debug)]
 pub enum LookupResult {
-    /// Found matching rows (Arc clones - cheap).
+    /// Key found with matching rows. Rows are Arc-wrapped for O(1) cloning.
     Some(Vec<Row>),
-    /// Key exists but has no rows (empty result).
+    /// Key exists but has no rows (known empty, not a hole).
     Empty,
-    /// Key not found (hole in partial state).
+    /// Key not in state - this is a "hole" that may trigger an upquery.
     Missing,
 }
 
@@ -236,14 +331,37 @@ impl State for MemoryState {
 }
 
 // ============================================================================
-// IntegerArrayState - O(1) direct indexing for integer keys
+// IntegerArrayState - O(1) Direct Indexing (OPTIMIZATIONS.md #3)
 // ============================================================================
 
-/// Maximum array size for integer key state (to prevent OOM)
+/// Maximum array size to prevent out-of-memory on sparse keys.
 const MAX_INTEGER_ARRAY_SIZE: usize = 10_000_000; // 10M entries
 
-/// In-memory state with direct array indexing for single integer keys.
-/// Provides O(1) lookup without hash computation for integer primary keys.
+/// State with O(1) direct array indexing for single-column integer keys.
+///
+/// Most database tables use sequential integer primary keys (auto-increment).
+/// This implementation exploits that pattern for faster lookups:
+///
+/// ```text
+/// HashMap:  key → hash(key) → bucket scan → O(1) average, O(n) worst
+/// Array:    key → data[key - offset] → O(1) guaranteed
+/// ```
+///
+/// ## How It Works
+///
+/// The array is indexed by `key_value - key_offset`:
+/// - If keys are 1,2,3,4,5 with offset=1: indices are 0,1,2,3,4
+/// - If keys are 100,101,102 with offset=100: indices are 0,1,2
+/// - Gaps in keys (e.g., 1,3,5) result in `None` entries in the array
+///
+/// ## Safety Limits
+///
+/// To prevent OOM on sparse key ranges, the array is capped at 10M entries.
+/// Keys outside this range fall back to HashMap behavior in DynamicState.
+///
+/// ## Performance Impact
+///
+/// See `OPTIMIZATIONS.md` #3: +12% speedup for single-key integer lookups.
 pub struct IntegerArrayState {
     /// The key column index (must be a single column).
     key_column: usize,
@@ -498,23 +616,46 @@ pub fn create_optimal_state(key_columns: Vec<usize>, sample_key: Option<&[DataTy
 }
 
 // ============================================================================
-// DynamicState - Auto-detecting state implementation
+// DynamicState - Auto-Detecting Wrapper (OPTIMIZATIONS.md #4)
 // ============================================================================
 
-/// State that auto-detects key type and uses optimal implementation.
-/// Starts optimistic (IntegerArrayState) for single-column keys,
-/// falls back to MemoryState if non-integer keys are encountered.
+/// State wrapper that auto-detects key type and selects optimal storage.
+///
+/// At view creation time, we don't always know what types the keys will be.
+/// `DynamicState` solves this by deferring the choice until the first record:
+///
+/// ```text
+/// DynamicState::new()       → Uninitialized
+///     │
+///     ▼ first record arrives
+///     │
+/// ┌───┴────────────────────────────────┐
+/// │ Is key single-column integer?      │
+/// └───┬────────────────────────────────┘
+///     │
+///     ├─ Yes → IntegerArrayState (O(1) direct indexing)
+///     │
+///     └─ No  → MemoryState (HashMap, handles any key type)
+/// ```
+///
+/// This is transparent to callers - they just use the `State` trait.
+///
+/// ## Why Not Always Use HashMap?
+///
+/// For integer primary keys (the common case), `IntegerArrayState` is ~12%
+/// faster due to direct array indexing without hash computation.
+/// See `OPTIMIZATIONS.md` #4 for details.
 pub struct DynamicState {
     key_columns: Vec<usize>,
     inner: DynamicStateInner,
 }
 
 enum DynamicStateInner {
-    /// Not yet determined - waiting for first record
+    /// Waiting for first record to determine key type
     Uninitialized,
-    /// Using integer array (detected integer keys)
+    /// Integer primary key detected - using O(1) array indexing
     IntegerArray(IntegerArrayState),
-    /// Using hash map (detected non-integer keys or multi-column)
+    /// Non-integer or composite key - using HashMap
     HashMap(MemoryState),
 }
 
