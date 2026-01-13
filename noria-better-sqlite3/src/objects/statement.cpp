@@ -494,8 +494,56 @@ bool Statement::TryNoriaGet(v8::Isolate* isolate, const v8::FunctionCallbackInfo
 		noria->Flush();
 	}
 
-	// Extract parameters from info args as Noria keys
 	int param_count = sqlite3_bind_parameter_count(handle);
+
+	// === INTEGER KEY FAST PATH ===
+	// For single integer key (most common case), skip NoriaValue overhead entirely
+	if (param_count == 1 && info.Length() >= 1) {
+		v8::Local<v8::Value> arg = info[0];
+
+		// Check if it's an integer (Int32, Uint32, or Number that is integral)
+		int64_t int_key = 0;
+		bool is_integer = false;
+
+		if (arg->IsInt32()) {
+			int_key = arg.As<v8::Int32>()->Value();
+			is_integer = true;
+		} else if (arg->IsUint32()) {
+			int_key = arg.As<v8::Uint32>()->Value();
+			is_integer = true;
+		} else if (arg->IsNumber()) {
+			double d = arg.As<v8::Number>()->Value();
+			// Check if it's an integer value
+			if (d >= -9007199254740992.0 && d <= 9007199254740992.0 && d == static_cast<double>(static_cast<int64_t>(d))) {
+				int_key = static_cast<int64_t>(d);
+				is_integer = true;
+			}
+		}
+
+		if (is_integer) {
+			// Use fast path - no NoriaValue construction needed
+			NoriaLookupResult result = noria->LookupIntKey(extras->noria_view_id, int_key);
+
+			if (result.found) {
+				// Cache hit via fast path
+				if (result.row_count == 0) {
+					info.GetReturnValue().Set(v8::Undefined(isolate));
+					Noria::FreeRows(result.rows);
+					return true;
+				}
+
+				// Build JS row from first result
+				v8::Local<v8::Value> row = NoriaRowToJS(isolate, result.rows, 0, extras->column_names, safe_ints);
+				info.GetReturnValue().Set(row);
+				Noria::FreeRows(result.rows);
+				return true;
+			}
+			// Cache miss on fast path - fall through to regular path for upquery
+		}
+	}
+
+	// === REGULAR PATH ===
+	// Extract parameters from info args as Noria keys
 	std::vector<NoriaValue> keys(param_count);
 	std::vector<std::string> string_storage(param_count);  // Keep strings alive
 
@@ -533,14 +581,8 @@ bool Statement::TryNoriaGet(v8::Isolate* isolate, const v8::FunctionCallbackInfo
 		return true;
 	}
 
-	// Build JS row from first result
-	std::vector<v8::Local<v8::Name>> col_names;
-	col_names.reserve(extras->column_names.size());
-	for (const auto& global : extras->column_names) {
-		col_names.push_back(global.Get(isolate));
-	}
-
-	v8::Local<v8::Value> row = NoriaRowToJS(isolate, result.rows, 0, col_names, safe_ints);
+	// Build JS row from first result - pass Global handles directly (optimized)
+	v8::Local<v8::Value> row = NoriaRowToJS(isolate, result.rows, 0, extras->column_names, safe_ints);
 	info.GetReturnValue().Set(row);
 	Noria::FreeRows(result.rows);
 	return true;
@@ -571,19 +613,13 @@ bool Statement::TryNoriaAll(v8::Isolate* isolate, const v8::FunctionCallbackInfo
 		return false;
 	}
 
-	// Build JS array from results
-	std::vector<v8::Local<v8::Name>> col_names;
-	col_names.reserve(extras->column_names.size());
-	for (const auto& global : extras->column_names) {
-		col_names.push_back(global.Get(isolate));
-	}
-
+	// Build JS array from results - pass Global handles directly (optimized)
 #if defined(NODE_MODULE_VERSION) && NODE_MODULE_VERSION >= 127
 	v8::LocalVector<v8::Value> rows(isolate);
 	rows.reserve(result.row_count);
 
 	for (int i = 0; i < result.row_count; ++i) {
-		rows.emplace_back(NoriaRowToJS(isolate, result.rows, i, col_names, safe_ints));
+		rows.emplace_back(NoriaRowToJS(isolate, result.rows, i, extras->column_names, safe_ints));
 	}
 
 	info.GetReturnValue().Set(v8::Array::New(isolate, rows.data(), rows.size()));
@@ -592,7 +628,7 @@ bool Statement::TryNoriaAll(v8::Isolate* isolate, const v8::FunctionCallbackInfo
 	v8::Local<v8::Array> array = v8::Array::New(isolate, result.row_count);
 
 	for (int i = 0; i < result.row_count; ++i) {
-		array->Set(ctx, i, NoriaRowToJS(isolate, result.rows, i, col_names, safe_ints)).FromJust();
+		array->Set(ctx, i, NoriaRowToJS(isolate, result.rows, i, extras->column_names, safe_ints)).FromJust();
 	}
 
 	info.GetReturnValue().Set(array);
@@ -674,13 +710,6 @@ bool Statement::TryNoriaGetMany(v8::Isolate* isolate, const v8::FunctionCallback
 		return false;
 	}
 
-	// Build column names cache
-	std::vector<v8::Local<v8::Name>> col_names;
-	col_names.reserve(extras->column_names.size());
-	for (const auto& global : extras->column_names) {
-		col_names.push_back(global.Get(isolate));
-	}
-
 	// First pass: check if all keys hit the cache
 	// If any key misses, fall back to SQLite (which does upqueries)
 	bool all_found = true;
@@ -712,8 +741,8 @@ bool Statement::TryNoriaGetMany(v8::Isolate* isolate, const v8::FunctionCallback
 			// Empty result (key exists but no rows)
 			results.emplace_back(v8::Undefined(isolate));
 		} else {
-			// Return first row (like get())
-			results.emplace_back(NoriaRowToJS(isolate, rows_ptr, 0, col_names, safe_ints));
+			// Return first row (like get()) - pass Global handles directly (optimized)
+			results.emplace_back(NoriaRowToJS(isolate, rows_ptr, 0, extras->column_names, safe_ints));
 		}
 	}
 
@@ -728,7 +757,7 @@ bool Statement::TryNoriaGetMany(v8::Isolate* isolate, const v8::FunctionCallback
 		if (row_count == 0) {
 			result_array->Set(ctx, i, v8::Undefined(isolate)).FromJust();
 		} else {
-			result_array->Set(ctx, i, NoriaRowToJS(isolate, rows_ptr, 0, col_names, safe_ints)).FromJust();
+			result_array->Set(ctx, i, NoriaRowToJS(isolate, rows_ptr, 0, extras->column_names, safe_ints)).FromJust();
 		}
 	}
 

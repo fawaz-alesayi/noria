@@ -13,7 +13,7 @@ pub use ops::{
     JoinOp, JoinType, Operator, OperatorType, ProcessingResult, ProjectOp,
 };
 pub use state::{
-    LookupResult, MemoryState, State, StateKey, StateSnapshot,
+    LookupResult, MemoryState, State, StateKey, StateSnapshot, Row,
     IntegerArrayState, DynamicState, is_integer_key, create_optimal_state,
 };
 

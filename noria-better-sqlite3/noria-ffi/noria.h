@@ -203,6 +203,22 @@ NoriaLookupResult noria_lookup_or_upquery(
     int key_count
 );
 
+/**
+ * Fast path lookup for single integer key.
+ * Skips NoriaValue conversion overhead for the common case of integer PK lookup.
+ * Cache-only lookup - returns not_found on miss (caller should fall back to regular lookup).
+ *
+ * @param handle The Noria engine handle
+ * @param view_id The view ID from noria_register_view
+ * @param key The integer key value
+ * @return NoriaLookupResult. Caller must free rows with noria_free_rows.
+ */
+NoriaLookupResult noria_lookup_int_key(
+    NoriaHandle* handle,
+    int view_id,
+    int64_t key
+);
+
 /* Batch lookup result */
 typedef struct {
     int count;      /* Number of results (one per key) */
@@ -265,6 +281,31 @@ int noria_get_value(
     int row_index,
     int col_index,
     NoriaValue* out_value
+);
+
+/* Maximum columns supported by NoriaRowData */
+#define NORIA_MAX_ROW_COLUMNS 32
+
+/* Row data for batch extraction - all values in single FFI call */
+typedef struct {
+    int col_count;
+    NoriaValue values[NORIA_MAX_ROW_COLUMNS];
+} NoriaRowData;
+
+/**
+ * Get all values for a row in a single FFI call - batch optimization.
+ * This eliminates N FFI calls (one per column) with a single call.
+ * For rows with ≤32 columns, this avoids repeated FFI crossing overhead.
+ *
+ * @param rows_ptr The rows pointer from NoriaLookupResult
+ * @param row_index The row index
+ * @param out_data Output parameter for all row values
+ * @return 0 on success, -1 on error, -2 if row has >32 columns (use noria_get_value fallback)
+ */
+int noria_get_row(
+    void* rows_ptr,
+    int row_index,
+    NoriaRowData* out_data
 );
 
 /**
@@ -393,6 +434,16 @@ int noria_queue_update(
  * @return 0 on success, -1 on error
  */
 int noria_flush(NoriaHandle* handle);
+
+/**
+ * Clear the write queue without processing (used on transaction rollback).
+ *
+ * When a transaction is rolled back, pending CDC events should be discarded
+ * since the database changes did not persist.
+ *
+ * @param handle The Noria engine handle
+ */
+void noria_clear_queue(NoriaHandle* handle);
 
 /**
  * Get cache statistics.

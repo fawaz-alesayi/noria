@@ -5,9 +5,9 @@
  * enabling transparent cache lookups and CDC capture.
  *
  * Incremental CDC Architecture:
- * - SQLite's session extension accumulates INSERT/UPDATE/DELETE changes
- * - ProcessSessionChangeset() extracts full row data and applies to dataflow
+ * - Pre-update hook captures INSERT/UPDATE/DELETE changes directly
  * - Changes propagate incrementally through the dataflow graph
+ * - Rollback hook clears pending changes on transaction rollback
  * - Use { fresh: true } option to call Flush() before reads when consistency is needed
  */
 
@@ -16,8 +16,6 @@
 #include <string>
 #include <cstring>
 #include <cctype>
-#include <map>
-#include <utility>
 // ============================================================================
 // C++ Profiling Infrastructure
 // ============================================================================
@@ -174,16 +172,6 @@ private:
 // Forward declaration of Noria class for callback
 class Noria;
 
-// Buffered row data captured by pre-update hook
-struct BufferedOldRow {
-    std::string table_name;
-    sqlite3_int64 rowid;
-    int op;  // SQLITE_DELETE or SQLITE_UPDATE
-    std::vector<NoriaValue> values;
-    std::vector<std::string> text_storage;  // Keep string data alive
-    std::vector<std::vector<uint8_t>> blob_storage;  // Keep blob data alive
-};
-
 // Forward declaration of pre-update hook
 extern "C" void PreUpdateHookCallback(
     void* user_data,
@@ -194,6 +182,9 @@ extern "C" void PreUpdateHookCallback(
     sqlite3_int64 rowid1,
     sqlite3_int64 rowid2
 );
+
+// Forward declaration of rollback hook (clears CDC queue on rollback)
+extern "C" void RollbackHookCallback(void* user_data);
 
 // Bind NoriaValue to sqlite3_stmt parameter
 static void BindNoriaValue(sqlite3_stmt* stmt, int idx, const NoriaValue& nv) {
@@ -251,12 +242,8 @@ static NoriaValue SqliteColumnToNoriaValue(sqlite3_stmt* stmt, int col) {
     return nv;
 }
 
-#ifdef SQLITE_ENABLE_SESSION
-// Session extension is available - use it for CDC
-#define USE_SESSION_CDC 1
-#else
-#define USE_SESSION_CDC 0
-#endif
+// Pre-update hook CDC: Direct change capture without session extension overhead
+// The pre-update hook provides values directly without SQL parsing
 
 // Forward declaration of upquery callback
 static int UpqueryCallbackImpl(
@@ -271,98 +258,231 @@ static int UpqueryCallbackImpl(
 // Noria wrapper class that manages engine lifetime and provides convenient methods
 class Noria {
 public:
-    Noria(sqlite3* db) : handle_(nullptr), db_(db), session_(nullptr), enabled_(true), has_any_views_(false) {
+    Noria(sqlite3* db) : handle_(nullptr), db_(db), enabled_(true), has_any_views_(false), preupdate_hook_enabled_(false) {
         handle_ = noria_create(db);
         if (!handle_) {
             enabled_ = false;
         } else {
             // Register upquery callback so Rust can call back to execute SQLite queries
             noria_set_upquery_callback(handle_, UpqueryCallbackImpl, this);
-            // NOTE: Pre-update hook is registered lazily in EnsureSession() AFTER
-            // the session is created to avoid conflicts with session extension
+            // Pre-update hook is registered lazily when first view is registered
         }
     }
 
-    // Capture old row values from pre-update hook (called before DELETE/UPDATE)
-    // NOTE: Currently unused because pre-update hook conflicts with session extension.
-    // Kept for potential future use with alternative CDC approach.
-    void CaptureOldRow(const char* table_name, sqlite3_int64 rowid, int op) {
+    // Process CDC directly in pre-update hook (no session extension overhead)
+    // This is called BEFORE the actual database change occurs
+    void ProcessPreUpdateChange(const char* table_name, int op) {
         if (!db_ || !table_name || !has_any_views_) return;
-        if (op != SQLITE_DELETE && op != SQLITE_UPDATE) return;
 
-        // Only capture for tables that have views
+        // Only process for tables that have views
         if (noria_table_has_views(handle_, table_name) == 0) return;
 
         int n_cols = sqlite3_preupdate_count(db_);
         if (n_cols <= 0) return;
 
-        BufferedOldRow row;
-        row.table_name = table_name;
-        row.rowid = rowid;
-        row.op = op;
-        row.values.resize(n_cols);
-        row.text_storage.resize(n_cols);
-        row.blob_storage.resize(n_cols);
+        // Temporary storage for values (text/blob need to stay alive during queue call)
+        std::vector<NoriaValue> values(n_cols);
+        std::vector<std::string> text_storage(n_cols);
+        std::vector<std::vector<uint8_t>> blob_storage(n_cols);
 
-        for (int i = 0; i < n_cols; i++) {
-            sqlite3_value* val = nullptr;
-            if (sqlite3_preupdate_old(db_, i, &val) == SQLITE_OK && val) {
-                int type = sqlite3_value_type(val);
-                switch (type) {
-                    case SQLITE_NULL:
-                        row.values[i].value_type = NORIA_NULL;
-                        break;
-                    case SQLITE_INTEGER:
-                        row.values[i].value_type = NORIA_INTEGER;
-                        row.values[i].int_value = sqlite3_value_int64(val);
-                        break;
-                    case SQLITE_FLOAT:
-                        row.values[i].value_type = NORIA_FLOAT;
-                        row.values[i].float_value = sqlite3_value_double(val);
-                        break;
-                    case SQLITE_TEXT: {
-                        const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
-                        int len = sqlite3_value_bytes(val);
-                        row.text_storage[i] = std::string(text, len);
-                        row.values[i].value_type = NORIA_TEXT;
-                        row.values[i].text_ptr = row.text_storage[i].c_str();
-                        row.values[i].text_len = len;
-                        break;
+        switch (op) {
+            case SQLITE_INSERT: {
+                // Get new values for INSERT
+                for (int i = 0; i < n_cols; i++) {
+                    sqlite3_value* val = nullptr;
+                    if (sqlite3_preupdate_new(db_, i, &val) == SQLITE_OK && val) {
+                        int type = sqlite3_value_type(val);
+                        switch (type) {
+                            case SQLITE_INTEGER:
+                                values[i].value_type = NORIA_INTEGER;
+                                values[i].int_value = sqlite3_value_int64(val);
+                                break;
+                            case SQLITE_FLOAT:
+                                values[i].value_type = NORIA_FLOAT;
+                                values[i].float_value = sqlite3_value_double(val);
+                                break;
+                            case SQLITE_TEXT: {
+                                const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
+                                int len = sqlite3_value_bytes(val);
+                                text_storage[i] = std::string(text, len);
+                                values[i].value_type = NORIA_TEXT;
+                                values[i].text_ptr = text_storage[i].c_str();
+                                values[i].text_len = len;
+                                break;
+                            }
+                            case SQLITE_BLOB: {
+                                const uint8_t* blob = reinterpret_cast<const uint8_t*>(sqlite3_value_blob(val));
+                                int len = sqlite3_value_bytes(val);
+                                blob_storage[i].assign(blob, blob + len);
+                                values[i].value_type = NORIA_BLOB;
+                                values[i].blob_ptr = blob_storage[i].data();
+                                values[i].blob_len = len;
+                                break;
+                            }
+                            default:
+                                values[i].value_type = NORIA_NULL;
+                        }
+                    } else {
+                        values[i].value_type = NORIA_NULL;
                     }
-                    case SQLITE_BLOB: {
-                        const uint8_t* blob = reinterpret_cast<const uint8_t*>(sqlite3_value_blob(val));
-                        int len = sqlite3_value_bytes(val);
-                        row.blob_storage[i].assign(blob, blob + len);
-                        row.values[i].value_type = NORIA_BLOB;
-                        row.values[i].blob_ptr = row.blob_storage[i].data();
-                        row.values[i].blob_len = len;
-                        break;
-                    }
-                    default:
-                        row.values[i].value_type = NORIA_NULL;
                 }
-            } else {
-                row.values[i].value_type = NORIA_NULL;
+                noria_queue_insert(handle_, table_name, values.data(), n_cols);
+                break;
+            }
+
+            case SQLITE_DELETE: {
+                // Get old values for DELETE
+                for (int i = 0; i < n_cols; i++) {
+                    sqlite3_value* val = nullptr;
+                    if (sqlite3_preupdate_old(db_, i, &val) == SQLITE_OK && val) {
+                        int type = sqlite3_value_type(val);
+                        switch (type) {
+                            case SQLITE_INTEGER:
+                                values[i].value_type = NORIA_INTEGER;
+                                values[i].int_value = sqlite3_value_int64(val);
+                                break;
+                            case SQLITE_FLOAT:
+                                values[i].value_type = NORIA_FLOAT;
+                                values[i].float_value = sqlite3_value_double(val);
+                                break;
+                            case SQLITE_TEXT: {
+                                const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
+                                int len = sqlite3_value_bytes(val);
+                                text_storage[i] = std::string(text, len);
+                                values[i].value_type = NORIA_TEXT;
+                                values[i].text_ptr = text_storage[i].c_str();
+                                values[i].text_len = len;
+                                break;
+                            }
+                            case SQLITE_BLOB: {
+                                const uint8_t* blob = reinterpret_cast<const uint8_t*>(sqlite3_value_blob(val));
+                                int len = sqlite3_value_bytes(val);
+                                blob_storage[i].assign(blob, blob + len);
+                                values[i].value_type = NORIA_BLOB;
+                                values[i].blob_ptr = blob_storage[i].data();
+                                values[i].blob_len = len;
+                                break;
+                            }
+                            default:
+                                values[i].value_type = NORIA_NULL;
+                        }
+                    } else {
+                        values[i].value_type = NORIA_NULL;
+                    }
+                }
+                noria_queue_delete(handle_, table_name, values.data(), n_cols);
+                break;
+            }
+
+            case SQLITE_UPDATE: {
+                // Get old and new values for UPDATE
+                std::vector<NoriaValue> old_values(n_cols);
+                std::vector<std::string> old_text_storage(n_cols);
+                std::vector<std::vector<uint8_t>> old_blob_storage(n_cols);
+
+                // Get old values
+                for (int i = 0; i < n_cols; i++) {
+                    sqlite3_value* val = nullptr;
+                    if (sqlite3_preupdate_old(db_, i, &val) == SQLITE_OK && val) {
+                        int type = sqlite3_value_type(val);
+                        switch (type) {
+                            case SQLITE_INTEGER:
+                                old_values[i].value_type = NORIA_INTEGER;
+                                old_values[i].int_value = sqlite3_value_int64(val);
+                                break;
+                            case SQLITE_FLOAT:
+                                old_values[i].value_type = NORIA_FLOAT;
+                                old_values[i].float_value = sqlite3_value_double(val);
+                                break;
+                            case SQLITE_TEXT: {
+                                const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
+                                int len = sqlite3_value_bytes(val);
+                                old_text_storage[i] = std::string(text, len);
+                                old_values[i].value_type = NORIA_TEXT;
+                                old_values[i].text_ptr = old_text_storage[i].c_str();
+                                old_values[i].text_len = len;
+                                break;
+                            }
+                            case SQLITE_BLOB: {
+                                const uint8_t* blob = reinterpret_cast<const uint8_t*>(sqlite3_value_blob(val));
+                                int len = sqlite3_value_bytes(val);
+                                old_blob_storage[i].assign(blob, blob + len);
+                                old_values[i].value_type = NORIA_BLOB;
+                                old_values[i].blob_ptr = old_blob_storage[i].data();
+                                old_values[i].blob_len = len;
+                                break;
+                            }
+                            default:
+                                old_values[i].value_type = NORIA_NULL;
+                        }
+                    } else {
+                        old_values[i].value_type = NORIA_NULL;
+                    }
+                }
+
+                // Get new values
+                for (int i = 0; i < n_cols; i++) {
+                    sqlite3_value* val = nullptr;
+                    if (sqlite3_preupdate_new(db_, i, &val) == SQLITE_OK && val) {
+                        int type = sqlite3_value_type(val);
+                        switch (type) {
+                            case SQLITE_INTEGER:
+                                values[i].value_type = NORIA_INTEGER;
+                                values[i].int_value = sqlite3_value_int64(val);
+                                break;
+                            case SQLITE_FLOAT:
+                                values[i].value_type = NORIA_FLOAT;
+                                values[i].float_value = sqlite3_value_double(val);
+                                break;
+                            case SQLITE_TEXT: {
+                                const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
+                                int len = sqlite3_value_bytes(val);
+                                text_storage[i] = std::string(text, len);
+                                values[i].value_type = NORIA_TEXT;
+                                values[i].text_ptr = text_storage[i].c_str();
+                                values[i].text_len = len;
+                                break;
+                            }
+                            case SQLITE_BLOB: {
+                                const uint8_t* blob = reinterpret_cast<const uint8_t*>(sqlite3_value_blob(val));
+                                int len = sqlite3_value_bytes(val);
+                                blob_storage[i].assign(blob, blob + len);
+                                values[i].value_type = NORIA_BLOB;
+                                values[i].blob_ptr = blob_storage[i].data();
+                                values[i].blob_len = len;
+                                break;
+                            }
+                            default:
+                                values[i].value_type = NORIA_NULL;
+                        }
+                    } else {
+                        values[i].value_type = NORIA_NULL;
+                    }
+                }
+
+                // Queue as delete + insert
+                noria_queue_delete(handle_, table_name, old_values.data(), n_cols);
+                noria_queue_insert(handle_, table_name, values.data(), n_cols);
+                break;
             }
         }
-
-        // Store using table+rowid as key
-        buffered_old_rows_[std::make_pair(std::string(table_name), rowid)] = std::move(row);
     }
 
-    // Get buffered old row if available
-    BufferedOldRow* GetBufferedOldRow(const char* table_name, sqlite3_int64 rowid) {
-        auto key = std::make_pair(std::string(table_name), rowid);
-        auto it = buffered_old_rows_.find(key);
-        if (it != buffered_old_rows_.end()) {
-            return &it->second;
+    // Enable pre-update hook for CDC (called when first view is registered)
+    void EnablePreUpdateHook() {
+        if (db_ && !preupdate_hook_enabled_) {
+            sqlite3_preupdate_hook(db_, PreUpdateHookCallback, this);
+            // Also register rollback hook to clear pending events on rollback
+            sqlite3_rollback_hook(db_, RollbackHookCallback, this);
+            preupdate_hook_enabled_ = true;
         }
-        return nullptr;
     }
 
-    // Clear buffered old rows after processing
-    void ClearBufferedOldRows() {
-        buffered_old_rows_.clear();
+    // Clear pending CDC events (called on rollback)
+    void ClearPendingCdc() {
+        if (handle_) {
+            noria_clear_queue(handle_);
+        }
     }
 
     // Execute an upquery - called by Rust via callback when cache miss occurs
@@ -430,17 +550,11 @@ public:
     }
 
     ~Noria() {
-#if USE_SESSION_CDC
-        // Unregister pre-update hook first (only if session was created)
-        // The hook is registered in EnsureSession() after session creation
-        if (session_ && db_) {
+        // Unregister hooks if they were registered
+        if (preupdate_hook_enabled_ && db_) {
             sqlite3_preupdate_hook(db_, nullptr, nullptr);
+            sqlite3_rollback_hook(db_, nullptr, nullptr);
         }
-        if (session_) {
-            sqlite3session_delete(session_);
-            session_ = nullptr;
-        }
-#endif
         if (handle_) {
             noria_destroy(handle_);
             handle_ = nullptr;
@@ -474,10 +588,8 @@ public:
 
         if (result >= 0) {
             has_any_views_ = true;  // Update cached state
-#if USE_SESSION_CDC
-            // Ensure session is created and attach all tables
-            EnsureSession();
-#endif
+            // Enable pre-update hook for direct CDC
+            EnablePreUpdateHook();
         }
         return result;
     }
@@ -578,233 +690,6 @@ public:
         }
     }
 
-#if USE_SESSION_CDC
-    // Ensure session exists for CDC tracking
-    void EnsureSession() {
-        if (!session_ && db_) {
-            // Create session attached to "main" database
-            if (sqlite3session_create(db_, "main", &session_) != SQLITE_OK) {
-                session_ = nullptr;
-                return;
-            }
-            // Attach all tables (NULL = track all tables)
-            sqlite3session_attach(session_, nullptr);
-
-            // NOTE: Pre-update hook conflicts with session extension's ability to record changes.
-            // SQLite only allows one pre-update hook, and the session extension uses it internally.
-            // For now, rely on session extension alone and accept partial old values for DELETE/UPDATE.
-            // This is acceptable because:
-            // 1. For simple views (no aggregates), any old value triggers proper cache eviction
-            // 2. For aggregate views, we may need to fall back to full table re-scan
-            // sqlite3_preupdate_hook(db_, PreUpdateHookCallback, this);
-        }
-    }
-
-    // Extract CDC events from session changeset and apply incremental updates
-    void ProcessSessionChangeset() {
-        CPP_PROFILE("cpp_process_changeset");
-
-        if (!session_ || !has_any_views_) return;
-
-        // Only process changeset when NOT in a transaction.
-        // SQLite's autocommit mode is 1 when not in a transaction.
-        // This ensures rolled-back changes don't affect the cache.
-        if (!sqlite3_get_autocommit(db_)) {
-            // Inside a transaction - defer processing until commit
-            return;
-        }
-
-        void* changeset = nullptr;
-        int changeset_size = 0;
-
-        // Get changeset (this clears recorded changes)
-        {
-            CPP_PROFILE("cpp_changeset_extract");
-            if (sqlite3session_changeset(session_, &changeset_size, &changeset) != SQLITE_OK) {
-                ClearBufferedOldRows();
-                return;
-            }
-        }
-
-        if (changeset_size == 0 || !changeset) {
-            ClearBufferedOldRows();
-            return;
-        }
-
-        // Iterate through changeset to extract row data
-        sqlite3_changeset_iter* iter = nullptr;
-        if (sqlite3changeset_start(&iter, changeset_size, changeset) != SQLITE_OK) {
-            sqlite3_free(changeset);
-            ClearBufferedOldRows();
-            return;
-        }
-
-        // Process each change
-        while (sqlite3changeset_next(iter) == SQLITE_ROW) {
-            const char* table_name = nullptr;
-            int n_cols = 0;
-            int op = 0;
-            int indirect = 0;
-
-            if (sqlite3changeset_op(iter, &table_name, &n_cols, &op, &indirect) != SQLITE_OK) {
-                continue;
-            }
-            if (!table_name || n_cols <= 0) continue;
-
-            // Check if this table has views (skip if not)
-            if (noria_table_has_views(handle_, table_name) == 0) continue;
-
-            // Extract row values based on operation type
-            std::vector<NoriaValue> old_values(n_cols);
-            std::vector<NoriaValue> new_values(n_cols);
-
-            switch (op) {
-                case SQLITE_INSERT: {
-                    // INSERT: extract new values
-                    for (int i = 0; i < n_cols; i++) {
-                        sqlite3_value* val = nullptr;
-                        if (sqlite3changeset_new(iter, i, &val) == SQLITE_OK && val) {
-                            new_values[i] = SqliteValueToNoria(val);
-                        } else {
-                            new_values[i].value_type = NORIA_NULL;
-                        }
-                    }
-                    noria_queue_insert(handle_, table_name, new_values.data(), n_cols);
-                    break;
-                }
-                case SQLITE_DELETE: {
-                    // DELETE: Try to get full old values from pre-update hook buffer
-                    // First, extract the PK (first column for INTEGER PRIMARY KEY tables)
-                    sqlite3_int64 rowid = 0;
-                    sqlite3_value* pk_val = nullptr;
-                    if (sqlite3changeset_old(iter, 0, &pk_val) == SQLITE_OK && pk_val) {
-                        if (sqlite3_value_type(pk_val) == SQLITE_INTEGER) {
-                            rowid = sqlite3_value_int64(pk_val);
-                        }
-                    }
-
-                    // Check for buffered old row with full values
-                    BufferedOldRow* buffered = GetBufferedOldRow(table_name, rowid);
-                    if (buffered && buffered->values.size() == static_cast<size_t>(n_cols)) {
-                        // Use buffered full row values
-                        noria_queue_delete(handle_, table_name, buffered->values.data(), n_cols);
-                    } else {
-                        // Fallback to session values (may be partial)
-                        for (int i = 0; i < n_cols; i++) {
-                            sqlite3_value* val = nullptr;
-                            if (sqlite3changeset_old(iter, i, &val) == SQLITE_OK && val) {
-                                old_values[i] = SqliteValueToNoria(val);
-                            } else {
-                                old_values[i].value_type = NORIA_NULL;
-                            }
-                        }
-                        noria_queue_delete(handle_, table_name, old_values.data(), n_cols);
-                    }
-                    break;
-                }
-                case SQLITE_UPDATE: {
-                    // UPDATE: Try to get full old values from pre-update hook buffer
-                    // First, extract the PK (first column for INTEGER PRIMARY KEY tables)
-                    sqlite3_int64 rowid = 0;
-                    sqlite3_value* pk_val = nullptr;
-                    if (sqlite3changeset_old(iter, 0, &pk_val) == SQLITE_OK && pk_val) {
-                        if (sqlite3_value_type(pk_val) == SQLITE_INTEGER) {
-                            rowid = sqlite3_value_int64(pk_val);
-                        }
-                    }
-
-                    // Check for buffered old row with full values
-                    BufferedOldRow* buffered = GetBufferedOldRow(table_name, rowid);
-                    if (buffered && buffered->values.size() == static_cast<size_t>(n_cols)) {
-                        // Use buffered full old row values
-                        old_values = buffered->values;
-                    } else {
-                        // Fallback to session values (may be partial)
-                        for (int i = 0; i < n_cols; i++) {
-                            sqlite3_value* old_val = nullptr;
-                            if (sqlite3changeset_old(iter, i, &old_val) == SQLITE_OK && old_val) {
-                                old_values[i] = SqliteValueToNoria(old_val);
-                            } else {
-                                old_values[i].value_type = NORIA_NULL;
-                            }
-                        }
-                    }
-
-                    // Extract new values - use session values, filling in from old if not changed
-                    for (int i = 0; i < n_cols; i++) {
-                        sqlite3_value* new_val = nullptr;
-                        if (sqlite3changeset_new(iter, i, &new_val) == SQLITE_OK && new_val) {
-                            new_values[i] = SqliteValueToNoria(new_val);
-                        } else {
-                            // Unchanged column - copy from old value
-                            new_values[i] = old_values[i];
-                        }
-                    }
-                    noria_queue_update(handle_, table_name, old_values.data(), new_values.data(), n_cols);
-                    break;
-                }
-            }
-        }
-
-        sqlite3changeset_finalize(iter);
-        sqlite3_free(changeset);
-        ClearBufferedOldRows();  // Clear buffer after processing
-
-        // Batch process all queued changes through the dataflow graph.
-        // This implements async batch processing from the original Noria paper:
-        // - All changes from this transaction are processed together
-        // - Reduces lock contention and aggregate operator overhead
-        noria_flush(handle_);
-
-        // After sqlite3session_changeset(), the session needs to be recreated
-        // to continue recording changes. Delete the old session and create a new one.
-        sqlite3session_delete(session_);
-        session_ = nullptr;
-        if (sqlite3session_create(db_, "main", &session_) == SQLITE_OK) {
-            sqlite3session_attach(session_, nullptr);
-        }
-    }
-
-    // Helper to convert sqlite3_value to NoriaValue
-    static NoriaValue SqliteValueToNoria(sqlite3_value* val) {
-        NoriaValue nv;
-        memset(&nv, 0, sizeof(nv));
-
-        if (!val) {
-            nv.value_type = NORIA_NULL;
-            return nv;
-        }
-
-        int type = sqlite3_value_type(val);
-        switch (type) {
-            case SQLITE_NULL:
-                nv.value_type = NORIA_NULL;
-                break;
-            case SQLITE_INTEGER:
-                nv.value_type = NORIA_INTEGER;
-                nv.int_value = sqlite3_value_int64(val);
-                break;
-            case SQLITE_FLOAT:
-                nv.value_type = NORIA_FLOAT;
-                nv.float_value = sqlite3_value_double(val);
-                break;
-            case SQLITE_TEXT:
-                nv.value_type = NORIA_TEXT;
-                nv.text_ptr = reinterpret_cast<const char*>(sqlite3_value_text(val));
-                nv.text_len = sqlite3_value_bytes(val);
-                break;
-            case SQLITE_BLOB:
-                nv.value_type = NORIA_BLOB;
-                nv.blob_ptr = reinterpret_cast<const uint8_t*>(sqlite3_value_blob(val));
-                nv.blob_len = sqlite3_value_bytes(val);
-                break;
-            default:
-                nv.value_type = NORIA_NULL;
-        }
-        return nv;
-    }
-#endif
-
     // Check if a view exists for the given SQL
     bool HasView(const char* sql) {
         if (!IsEnabled()) return false;
@@ -849,9 +734,26 @@ public:
         return noria_lookup_or_upquery(handle_, view_id, keys, key_count);
     }
 
+    // Fast path lookup for single integer key - skips NoriaValue overhead
+    // Returns not_found on cache miss (caller should fall back to regular lookup)
+    NoriaLookupResult LookupIntKey(int view_id, int64_t key) {
+        CPP_PROFILE("cpp_lookup_int_key");
+
+        if (!IsEnabled()) {
+            return NoriaLookupResult{0, 0, nullptr};
+        }
+        return noria_lookup_int_key(handle_, view_id, key);
+    }
+
     // Get value from lookup result
     static int GetValue(void* rows_ptr, int row_index, int col_index, NoriaValue* out_value) {
         return noria_get_value(rows_ptr, row_index, col_index, out_value);
+    }
+
+    // Get all values for a row in a single FFI call - batch optimization
+    // Returns 0 on success, -1 on error, -2 if row has >32 columns
+    static int GetRow(void* rows_ptr, int row_index, NoriaRowData* out_data) {
+        return noria_get_row(rows_ptr, row_index, out_data);
     }
 
     // Get column count for a row
@@ -910,20 +812,18 @@ public:
     // Flush pending CDC events (for consistent reads)
     int Flush() {
         if (!IsEnabled()) return 0;
-#if USE_SESSION_CDC
-        // Process any pending session changes first
-        ProcessSessionChangeset();
-#endif
         return noria_flush(handle_);
     }
 
     // Notify CDC of changes (called after write operations)
-    // Process session changeset synchronously to enable incremental view updates.
+    // Flush events to propagate through the dataflow
     void NotifyChange() {
-#if USE_SESSION_CDC
-        // Synchronous CDC: Process changes immediately after write
-        ProcessSessionChangeset();
-#endif
+        // In pre-update hook mode, events are already queued.
+        // Flush them now to propagate through the dataflow.
+        // Only flush if not in a transaction (transaction will flush on commit)
+        if (has_any_views_ && sqlite3_get_autocommit(db_)) {
+            noria_flush(handle_);
+        }
     }
 
     // Get cache statistics
@@ -942,17 +842,10 @@ public:
 
 private:
     NoriaHandle* handle_;
-    sqlite3* db_;               // SQLite database handle (for session)
-#if USE_SESSION_CDC
-    sqlite3_session* session_;  // Session for CDC tracking
-#else
-    void* session_;             // Placeholder when session not available
-#endif
+    sqlite3* db_;               // SQLite database handle
     bool enabled_;
-    bool has_any_views_;  // Cached to avoid FFI calls
-
-    // Buffered old row values from pre-update hook (for DELETE/UPDATE)
-    std::map<std::pair<std::string, sqlite3_int64>, BufferedOldRow> buffered_old_rows_;
+    bool has_any_views_;        // Cached to avoid FFI calls
+    bool preupdate_hook_enabled_;  // Whether pre-update hook is registered
 
     // Non-copyable
     Noria(const Noria&) = delete;
@@ -975,9 +868,8 @@ static int UpqueryCallbackImpl(
     return noria->ExecuteUpquery(sql, params, param_count, out_rows, out_row_count);
 }
 
-// Pre-update hook callback - captures full old row values before DELETE/UPDATE
+// Pre-update hook callback - captures changes for CDC
 // Note: Must use extern "C" for compatibility with SQLite's C API
-// NOTE: Currently unused because pre-update hook conflicts with session extension.
 extern "C" void PreUpdateHookCallback(
     void* user_data,
     sqlite3* db,
@@ -989,15 +881,23 @@ extern "C" void PreUpdateHookCallback(
 ) {
     (void)db;       // Unused (we use noria->db_ instead)
     (void)db_name;  // Unused
+    (void)rowid1;   // Unused (old rowid, we use values instead)
     (void)rowid2;   // Unused (new rowid for UPDATE)
 
     Noria* noria = static_cast<Noria*>(user_data);
     if (!noria) return;
 
-    // Capture old row for DELETE and UPDATE operations
-    if (op == SQLITE_DELETE || op == SQLITE_UPDATE) {
-        noria->CaptureOldRow(table_name, rowid1, op);
-    }
+    // Process CDC directly in pre-update hook (no session overhead)
+    noria->ProcessPreUpdateChange(table_name, op);
+}
+
+// Rollback hook callback - clears pending CDC events when transaction is rolled back
+extern "C" void RollbackHookCallback(void* user_data) {
+    Noria* noria = static_cast<Noria*>(user_data);
+    if (!noria) return;
+
+    // Clear pending CDC events that were queued during the rolled-back transaction
+    noria->ClearPendingCdc();
 }
 
 // Helper to convert V8 value to NoriaValue
@@ -1062,49 +962,101 @@ static v8::Local<v8::Value> NoriaValueToV8(v8::Isolate* isolate, const NoriaValu
 }
 
 // Build a flat JS row object from Noria lookup result
+// Optimized: uses batch GetRow to fetch all values in single FFI call
 static v8::Local<v8::Value> NoriaRowToJS(
     v8::Isolate* isolate,
     void* rows_ptr,
     int row_index,
-    const std::vector<v8::Local<v8::Name>>& column_names,
+    const std::vector<v8::Global<v8::Name>>& column_names_global,
     bool safe_ints
 ) {
-    int col_count = Noria::RowColumnCount(rows_ptr, row_index);
-    if (col_count <= 0) {
+    // Use batch GetRow - single FFI call instead of N calls
+    NoriaRowData row_data;
+    int result = Noria::GetRow(rows_ptr, row_index, &row_data);
+
+    if (result == -1) {
+        // Error or invalid row
+        return v8::Null(isolate);
+    }
+
+    if (result == -2) {
+        // Row has >32 columns - fall back to per-column GetValue
+        // This is rare in practice
+        int col_count = Noria::RowColumnCount(rows_ptr, row_index);
+        if (col_count <= 0) {
+            return v8::Null(isolate);
+        }
+
+        size_t num_cols = std::min(static_cast<size_t>(col_count), column_names_global.size());
+
+#if defined(NODE_MODULE_VERSION) && NODE_MODULE_VERSION >= 127
+        v8::LocalVector<v8::Name> keys(isolate);
+        v8::LocalVector<v8::Value> values(isolate);
+        keys.reserve(num_cols);
+        values.reserve(num_cols);
+
+        for (size_t i = 0; i < num_cols; ++i) {
+            keys.push_back(column_names_global[i].Get(isolate));
+            NoriaValue nv;
+            if (Noria::GetValue(rows_ptr, row_index, static_cast<int>(i), &nv) == 0) {
+                values.push_back(NoriaValueToV8(isolate, nv, safe_ints));
+            } else {
+                values.push_back(v8::Null(isolate));
+            }
+        }
+
+        return v8::Object::New(
+            isolate,
+            v8::Null(isolate),
+            keys.data(),
+            values.data(),
+            num_cols
+        );
+#else
+        v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+        v8::Local<v8::Object> row = v8::Object::New(isolate);
+
+        for (size_t i = 0; i < num_cols; ++i) {
+            NoriaValue nv;
+            if (Noria::GetValue(rows_ptr, row_index, static_cast<int>(i), &nv) == 0) {
+                row->Set(ctx, column_names_global[i].Get(isolate), NoriaValueToV8(isolate, nv, safe_ints)).FromJust();
+            }
+        }
+
+        return row;
+#endif
+    }
+
+    // Fast path: row_data contains all values from single FFI call
+    size_t num_cols = std::min(static_cast<size_t>(row_data.col_count), column_names_global.size());
+
+    if (num_cols == 0) {
         return v8::Null(isolate);
     }
 
 #if defined(NODE_MODULE_VERSION) && NODE_MODULE_VERSION >= 127
-    v8::LocalVector<v8::Value> values(isolate);
-    values.reserve(col_count);
+    // Stack-allocate for ≤32 columns (guaranteed by NORIA_MAX_ROW_COLUMNS)
+    v8::Local<v8::Name> keys_stack[NORIA_MAX_ROW_COLUMNS];
+    v8::Local<v8::Value> values_stack[NORIA_MAX_ROW_COLUMNS];
 
-    for (int i = 0; i < col_count; ++i) {
-        NoriaValue nv;
-        if (Noria::GetValue(rows_ptr, row_index, i, &nv) == 0) {
-            values.emplace_back(NoriaValueToV8(isolate, nv, safe_ints));
-        } else {
-            values.emplace_back(v8::Null(isolate));
-        }
+    for (size_t i = 0; i < num_cols; ++i) {
+        keys_stack[i] = column_names_global[i].Get(isolate);
+        values_stack[i] = NoriaValueToV8(isolate, row_data.values[i], safe_ints);
     }
 
-    // Use fast object construction
-    v8::Local<v8::Name>* keys_ptr = const_cast<v8::Local<v8::Name>*>(column_names.data());
     return v8::Object::New(
         isolate,
-        GET_PROTOTYPE(v8::Object::New(isolate)),
-        keys_ptr,
-        values.data(),
-        std::min(static_cast<size_t>(col_count), column_names.size())
+        v8::Null(isolate),
+        keys_stack,
+        values_stack,
+        num_cols
     );
 #else
     v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
     v8::Local<v8::Object> row = v8::Object::New(isolate);
 
-    for (int i = 0; i < col_count && i < static_cast<int>(column_names.size()); ++i) {
-        NoriaValue nv;
-        if (Noria::GetValue(rows_ptr, row_index, i, &nv) == 0) {
-            row->Set(ctx, column_names[i], NoriaValueToV8(isolate, nv, safe_ints)).FromJust();
-        }
+    for (size_t i = 0; i < num_cols; ++i) {
+        row->Set(ctx, column_names_global[i].Get(isolate), NoriaValueToV8(isolate, row_data.values[i], safe_ints)).FromJust();
     }
 
     return row;

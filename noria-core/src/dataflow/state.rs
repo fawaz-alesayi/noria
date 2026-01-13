@@ -4,8 +4,12 @@
 //! supporting indexed lookups by key columns.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use noria::DataType;
 use super::{Record, Records};
+
+/// A row stored in state - Arc-wrapped for cheap cloning on lookup.
+pub type Row = Arc<Vec<DataType>>;
 
 /// Key storage - specialized for common single-column case to avoid Vec overhead.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -35,10 +39,11 @@ impl StateKey {
 }
 
 /// Result of a state lookup.
+/// Uses Arc<Vec<DataType>> for O(1) cloning on lookup (just ref count increment).
 #[derive(Debug)]
-pub enum LookupResult<'a> {
-    /// Found matching rows.
-    Some(Vec<&'a [DataType]>),
+pub enum LookupResult {
+    /// Found matching rows (Arc clones - cheap).
+    Some(Vec<Row>),
     /// Key exists but has no rows (empty result).
     Empty,
     /// Key not found (hole in partial state).
@@ -53,7 +58,7 @@ pub trait State: Send {
     /// Insert or remove records into state.
     fn process_records(&mut self, records: &mut Records);
 
-    /// Look up rows by key.
+    /// Look up rows by key. Returns Arc-wrapped rows for O(1) cloning.
     fn lookup(&self, key: &[DataType]) -> LookupResult;
 
     /// Get the number of rows.
@@ -76,8 +81,8 @@ pub trait State: Send {
 pub struct MemoryState {
     /// The key columns for the primary index.
     key_columns: Vec<usize>,
-    /// Data stored by key.
-    data: HashMap<StateKey, Vec<Vec<DataType>>>,
+    /// Data stored by key. Rows are Arc-wrapped for O(1) cloning on lookup.
+    data: HashMap<StateKey, Vec<Row>>,
     /// Total row count.
     row_count: usize,
 }
@@ -86,7 +91,7 @@ pub struct MemoryState {
 /// This owns its data so it can be passed across borrow boundaries.
 pub struct StateSnapshot {
     key_columns: Vec<usize>,
-    data: HashMap<StateKey, Vec<Vec<DataType>>>,
+    data: HashMap<StateKey, Vec<Row>>,
 }
 
 impl StateSnapshot {
@@ -112,7 +117,8 @@ impl State for StateSnapshot {
         let state_key = StateKey::from_slice(key);
         match self.data.get(&state_key) {
             Some(rows) if rows.is_empty() => LookupResult::Empty,
-            Some(rows) => LookupResult::Some(rows.iter().map(|r| r.as_slice()).collect()),
+            // Clone Arcs - O(1) per row (just ref count increment)
+            Some(rows) => LookupResult::Some(rows.iter().cloned().collect()),
             None => LookupResult::Missing,
         }
     }
@@ -171,12 +177,13 @@ impl State for MemoryState {
 
             if is_positive {
                 let entry = self.data.entry(key).or_insert_with(Vec::new);
-                entry.push(row);
+                // Wrap in Arc for cheap cloning on lookup
+                entry.push(Arc::new(row));
                 self.row_count += 1;
             } else {
                 if let Some(rows) = self.data.get_mut(&key) {
                     // Try exact match first
-                    if let Some(pos) = rows.iter().position(|r| r == &row) {
+                    if let Some(pos) = rows.iter().position(|r| r.as_slice() == &row[..]) {
                         rows.remove(pos);
                         self.row_count -= 1;
                     } else {
@@ -205,7 +212,8 @@ impl State for MemoryState {
         let state_key = StateKey::from_slice(key);
         match self.data.get(&state_key) {
             Some(rows) if rows.is_empty() => LookupResult::Empty,
-            Some(rows) => LookupResult::Some(rows.iter().map(|r| r.as_slice()).collect()),
+            // Clone Arcs - O(1) per row (just ref count increment)
+            Some(rows) => LookupResult::Some(rows.iter().cloned().collect()),
             None => LookupResult::Missing,
         }
     }
@@ -241,8 +249,8 @@ pub struct IntegerArrayState {
     key_column: usize,
     /// Offset to handle non-zero starting keys (key_value - offset = array_index)
     key_offset: i64,
-    /// Data stored by direct index: data[key - offset] = rows
-    data: Vec<Option<Vec<Vec<DataType>>>>,
+    /// Data stored by direct index: data[key - offset] = rows (Arc-wrapped for O(1) clone)
+    data: Vec<Option<Vec<Row>>>,
     /// Total row count.
     row_count: usize,
     /// Track min/max for efficient bounds
@@ -363,17 +371,18 @@ impl State for IntegerArrayState {
             if is_positive {
                 match &mut self.data[idx] {
                     Some(rows) => {
-                        rows.push(row);
+                        // Wrap in Arc for cheap cloning on lookup
+                        rows.push(Arc::new(row));
                     }
                     None => {
-                        self.data[idx] = Some(vec![row]);
+                        self.data[idx] = Some(vec![Arc::new(row)]);
                     }
                 }
                 self.row_count += 1;
             } else {
                 if let Some(rows) = &mut self.data[idx] {
                     // Try exact match first
-                    if let Some(pos) = rows.iter().position(|r| r == &row) {
+                    if let Some(pos) = rows.iter().position(|r| r.as_slice() == &row[..]) {
                         rows.remove(pos);
                         self.row_count -= 1;
                     } else {
@@ -419,7 +428,8 @@ impl State for IntegerArrayState {
 
         match &self.data[idx as usize] {
             Some(rows) if rows.is_empty() => LookupResult::Empty,
-            Some(rows) => LookupResult::Some(rows.iter().map(|r| r.as_slice()).collect()),
+            // Clone Arcs - O(1) per row (just ref count increment)
+            Some(rows) => LookupResult::Some(rows.iter().cloned().collect()),
             None => LookupResult::Missing,
         }
     }

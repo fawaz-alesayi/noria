@@ -58,8 +58,8 @@ Tested on OCI VM.Standard.A1.Flex (4 OCPU ARM, 24GB RAM), Ubuntu 22.04.
 
 | Benchmark | better-sqlite3 | noria-better-sqlite3 | Difference |
 |-----------|----------------|----------------------|------------|
-| Hot path (same key) | 322,000 ops/sec | 803,000 ops/sec | **+149%** |
-| Random keys (warm cache) | 301,000 ops/sec | 477,000 ops/sec | **+59%** |
+| Hot path (same key) | 323,000 ops/sec | 996,000 ops/sec | **+208%** |
+| Random keys (warm cache) | 302,000 ops/sec | 578,000 ops/sec | **+91%** |
 
 ### Parity (operations that bypass cache)
 
@@ -84,13 +84,13 @@ npm run bench:lobsters
 
 | Scenario | better-sqlite3 | noria-better-sqlite3 | Speedup |
 |----------|----------------|----------------------|---------|
-| Single-key read | 325,000 ops/sec | 800,000 ops/sec | **2.5x** |
-| Read-only mixed | 295,000 ops/sec | 510,000 ops/sec | **1.7x** |
-| Read 99% / Write 1% | 200,000 ops/sec | 290,000 ops/sec | **1.4x** |
-| Read 95% / Write 5% | 110,000 ops/sec | 110,000 ops/sec | 1.0x |
-| Read 90% / Write 10% | 63,000 ops/sec | 57,000 ops/sec | 0.9x |
+| Single-key read | 323,500 ops/sec | 995,975 ops/sec | **3.1x** |
+| Read-only mixed | 301,825 ops/sec | 577,805 ops/sec | **1.9x** |
+| Read 99% / Write 1% | 205,988 ops/sec | 372,488 ops/sec | **1.8x** |
+| Read 95% / Write 5% | 114,400 ops/sec | 146,647 ops/sec | **1.3x** |
+| Read 90% / Write 10% | 67,492 ops/sec | 53,390 ops/sec | 0.8x |
 
-**Trade-offs**: Beneficial for read-heavy workloads (99%+ reads). At 95/5, parity. Write-heavy workloads with aggregate views are slower due to incremental maintenance.
+**Trade-offs**: Beneficial for read-heavy workloads (95%+ reads). At 90/10, write overhead dominates. Cache throughput approaches **1M ops/sec** for single-key lookups.
 
 ## What's supported
 

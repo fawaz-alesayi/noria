@@ -345,11 +345,12 @@ impl Operator for JoinOp {
             match state.lookup(&key) {
                 LookupResult::Some(other_rows) => {
                     for other_row in other_rows {
-                        // Combine rows
-                        let (left, right) = if from_parent == 0 {
-                            (record.row(), other_row)
+                        // Combine rows - other_row is Arc<Vec<DataType>>, deref to slice
+                        let other_slice: &[DataType] = &other_row;
+                        let (left, right): (&[DataType], &[DataType]) = if from_parent == 0 {
+                            (record.row(), other_slice)
                         } else {
-                            (other_row, record.row())
+                            (other_slice, record.row())
                         };
 
                         let combined: Vec<DataType> = self.emit
